@@ -20,6 +20,7 @@ if [ ! -f "pyproject.toml" ]; then
 fi
 
 BUILD_VENV="${ROOT_DIR}/.build-venv"
+TIKTOKEN_CACHE_DIR="${AISH_BUILD_TIKTOKEN_CACHE_DIR:-build/tiktoken_cache}"
 USE_UV=0
 if command -v uv >/dev/null 2>&1; then
     USE_UV=1
@@ -50,11 +51,11 @@ rm -rf dist/ build/ *.spec.backup
 
 if [ "${AISH_CLEAN_TIKTOKEN_CACHE:-0}" = "1" ]; then
     echo -e "${YELLOW}🧹 Removing cached tiktoken data...${NC}"
-    rm -rf prefetched_data/tiktoken_cache/
+    rm -rf "$TIKTOKEN_CACHE_DIR"
 fi
 
 echo -e "${BLUE}🧠 Prefetching tiktoken cache...${NC}"
-"${PYTHON_RUN[@]}" packaging/prefetch_tiktoken_cache.py --cache-dir prefetched_data/tiktoken_cache
+"${PYTHON_RUN[@]}" packaging/prefetch_tiktoken_cache.py --cache-dir "$TIKTOKEN_CACHE_DIR"
 
 # Build using PyInstaller spec file
 echo -e "${BLUE}🔨 Building binary with PyInstaller...${NC}"

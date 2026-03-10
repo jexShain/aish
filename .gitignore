@@ -82,8 +82,6 @@ venv/
 .DS_Store
 Thumbs.db
 
-prefetched_data/
-
 .claude-trace/
 
 # github copilot

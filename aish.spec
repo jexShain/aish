@@ -70,7 +70,10 @@ def _filter_linux_toolchain_libs(binaries):
     return filtered
 
 # Collect tiktoken data files from the build-time cache.
-tiktoken_cache_root = os.path.join("prefetched_data", "tiktoken_cache")
+tiktoken_cache_root = os.environ.get(
+    "AISH_BUILD_TIKTOKEN_CACHE_DIR",
+    os.path.join("build", "tiktoken_cache"),
+)
 if not os.path.isdir(tiktoken_cache_root):
     raise SystemExit(
         "Missing build-time tiktoken cache. Run packaging/prefetch_tiktoken_cache.py before PyInstaller."

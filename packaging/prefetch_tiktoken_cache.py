@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--cache-dir",
-        default="prefetched_data/tiktoken_cache",
+        default="build/tiktoken_cache",
         help="Directory where the tiktoken cache should be written.",
     )
     parser.add_argument(

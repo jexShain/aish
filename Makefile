@@ -80,7 +80,7 @@ install:
 
 clean:
 	@echo "🧹 Cleaning build artifacts..."
-	rm -rf dist/ build/ .build-venv/ *.spec.backup __pycache__/ .pytest_cache/ prefetched_data/tiktoken_cache/
+	rm -rf dist/ build/ .build-venv/ *.spec.backup __pycache__/ .pytest_cache/
 	find . -name "*.pyc" -delete
 	find . -name "*.pyo" -delete
 	find . -name "*.egg-info" -exec rm -rf {} +

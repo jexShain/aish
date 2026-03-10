@@ -96,7 +96,6 @@ jobs:
           path: |
             dist/aish
             dist/aish-sandbox
-            prefetched_data/tiktoken_cache/*
           if-no-files-found: error
 
   package-deb:
@@ -132,9 +131,6 @@ jobs:
 
       - name: Build Debian package
         run: |
-          # CI currently validates Debian packaging on GitHub-hosted runners.
-          # Release-grade binaries that must support older glibc baselines should
-          # later be produced in a dedicated old-glibc build environment.
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             packaging/build_deb.sh --release
           else
