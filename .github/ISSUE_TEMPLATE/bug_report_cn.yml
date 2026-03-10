@@ -1,5 +1,5 @@
-name: Bug report
-description: Report defects, crashes, or unexpected behavior
+name: Bug 反馈
+description: 报告程序错误、崩溃或异常行为
 title: "[Bug]: "
 labels:
   - bug
@@ -7,76 +7,76 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting! Please provide concise, reproducible information.
+        感谢反馈问题！请提供简洁、可复现的信息。
   - type: textarea
     id: summary
     attributes:
-      label: Summary
-      description: One sentence describing the issue
-      placeholder: When running X command, error Y occurs...
+      label: 问题描述
+      description: 一句话描述遇到了什么问题
+      placeholder: 执行某命令时出现错误...
     validations:
       required: true
   - type: textarea
     id: repro
     attributes:
-      label: Steps to reproduce
+      label: 复现步骤
       placeholder: |
-        1. Install aish
-        2. Run `aish run`
-        3. Enter `; your prompt`
-        4. Observe error
+        1. 安装 aish
+        2. 执行命令 `aish run`
+        3. 输入 `; 你的提示`
+        4. 观察到错误
     validations:
       required: true
   - type: textarea
     id: expected
     attributes:
-      label: Expected behavior
+      label: 期望行为
     validations:
       required: true
   - type: textarea
     id: actual
     attributes:
-      label: Actual behavior
+      label: 实际行为
     validations:
       required: true
   - type: input
     id: version
     attributes:
-      label: AISH version
+      label: AISH 版本
       placeholder: "0.1.0"
     validations:
       required: true
   - type: input
     id: os
     attributes:
-      label: Operating system
+      label: 操作系统
       placeholder: "Ubuntu 24.04 / Debian 12 / macOS"
     validations:
       required: true
   - type: dropdown
     id: install_method
     attributes:
-      label: Install method
+      label: 安装方式
       options:
-        - deb package
-        - built from source
+        - deb 包
+        - 源码编译
         - uv run
         - pip install
-        - Other
+        - 其他
     validations:
       required: true
   - type: input
     id: model
     attributes:
-      label: AI Model / Provider
+      label: AI 模型 / 提供商
       placeholder: "gpt-4o / deepseek-chat / claude-3-sonnet"
   - type: textarea
     id: logs
     attributes:
-      label: Logs
-      description: Relevant logs (~/.config/aish/logs/aish.log), remove sensitive info
+      label: 日志信息
+      description: 相关日志（~/.config/aish/logs/aish.log），请移除敏感信息
       render: shell
   - type: textarea
     id: additional
     attributes:
-      label: Additional information
+      label: 补充信息
