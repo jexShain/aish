@@ -15,8 +15,8 @@ from aish.context_manager import MemoryType
 from aish.llm import LLMCallbackResult, LLMEventType
 from aish.security.security_manager import SecurityDecision
 from aish.security.security_policy import RiskLevel
-from aish.shell import (AIShell, CommandResult, CommandStatus,
-                        QuotedPathCompleter, make_shell_completer)
+from aish.shell import AIShell, CommandResult, CommandStatus, make_shell_completer
+from aish.shell_enhanced.shell_completion import QuotedPathCompleter
 from aish.skills import SkillManager
 
 

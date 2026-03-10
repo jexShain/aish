@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 from prompt_toolkit.document import Document
 
-from aish.shell import QuotedPathCompleter
+from aish.shell_enhanced.shell_completion import QuotedPathCompleter
 
 
 class TestQuotedPathCompleter:
