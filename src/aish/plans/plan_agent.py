@@ -364,7 +364,7 @@ Note: Interactive confirmation not available. Plan saved for manual execution.""
                 {"value": "cancel", "label": "Discard"},
             ],
             "default": "execute",
-            "title": f"Execute Plan?",
+            "title": "Execute Plan?",
             "allow_cancel": True,
         }
 
@@ -442,7 +442,7 @@ To pause/stop: Use Ctrl+C or close the application."""
         try:
             # Run the async execution in the thread
             anyio.run(self._execute_plan_async, plan_id)
-        except Exception as e:
+        except Exception:
             # Log error and update plan status
             plan = self.plan_manager.load_plan(plan_id)
             if plan:
@@ -615,7 +615,6 @@ To pause/stop: Use Ctrl+C or close the application."""
     def _show_plan_in_tui(self, plan: Plan) -> None:
         """Show plan in TUI status bar."""
         if self.shell and hasattr(self.shell, "_tui_app"):
-            from aish.tui.types import StepStatus as TUIStepStatus
 
             self.shell._tui_app.set_mode("PLAN")
 

@@ -4,13 +4,6 @@ import asyncio
 from typing import TYPE_CHECKING, Optional
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application import Application
-from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Layout
-from prompt_toolkit.layout.containers import Window
-from prompt_toolkit.layout.controls import BufferControl
-from prompt_toolkit.styles import Style
 from rich.console import RenderableType
 from rich.text import Text
 
@@ -83,10 +76,7 @@ class InputBar:
                 self._session = PromptSession()
 
             # Get input using prompt_toolkit
-            result = await self._session.prompt_async(
-                prompt,
-                history=None,  # History is managed separately
-            )
+                result = await self._session.prompt_async(prompt)
 
             # Add to history
             if result.strip():

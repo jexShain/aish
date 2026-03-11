@@ -1,9 +1,8 @@
 """Tools for Plan mode operations."""
 
-import json
 from typing import Any
 
-from aish.plans.models import Plan, PlanStatus, PlanStep, StepStatus
+from aish.plans.models import Plan, PlanStep, StepStatus
 from aish.tools.base import ToolBase
 from aish.tools.result import ToolResult
 
@@ -80,7 +79,6 @@ class FinalizePlanTool(ToolBase):
         Returns:
             ToolResult with the finalized plan
         """
-        from aish.plans.models import Plan
 
         # Create plan object (without saving - that happens in PlanAgent)
         plan = Plan.create(

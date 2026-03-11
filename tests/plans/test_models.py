@@ -1,6 +1,5 @@
 """Tests for Plan models."""
 
-import pytest
 
 from aish.plans.models import Plan, PlanStatus, PlanStep, StepStatus
 

@@ -1,7 +1,5 @@
 """Tests for TUIApp main class."""
 
-import pytest
-from unittest.mock import Mock, patch, AsyncMock
 
 from aish.tui.app import TUIApp
 from aish.tui.types import (

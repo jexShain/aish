@@ -1,6 +1,5 @@
 """PTY output adapter for TUI."""
 
-import os
 import sys
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Generator, Optional, Set

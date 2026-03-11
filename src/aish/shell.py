@@ -3255,7 +3255,7 @@ class AIShell:
                 data=data,
                 timestamp=time.time(),
             )
-            result = self.handle_ask_user_required(event)
+            self.handle_ask_user_required(event)
 
             # Check if user made a selection
             selected_value = data.get("selected_value")

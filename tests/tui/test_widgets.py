@@ -1,8 +1,6 @@
 """Tests for TUI widgets."""
 
-import pytest
 import time
-from unittest.mock import Mock, patch, AsyncMock
 
 from aish.tui.types import (
     ContentLine,

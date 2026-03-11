@@ -1,7 +1,5 @@
 """Tests for TUI adapters."""
 
-import pytest
-from unittest.mock import Mock, patch, MagicMock
 
 from aish.tui.adapters.pty_adapter import (
     PTYOutputAdapter,

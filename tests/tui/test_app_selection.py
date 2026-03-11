@@ -4,7 +4,7 @@ import pytest
 
 from aish.config import ConfigModel
 from aish.tui.app import TUIApp
-from aish.tui.types import SelectionState, TUIEvent
+from aish.tui.types import SelectionState
 
 
 class TestTUIAppSelection:

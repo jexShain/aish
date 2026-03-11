@@ -1,6 +1,6 @@
 """Event adapter for LLM events to TUI updates."""
 
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable
 
 from aish.llm import LLMEvent, LLMEventType
 from aish.tui.types import ContentLineType

@@ -1,7 +1,5 @@
 """Tests for PlanManager and PlanStorage."""
 
-import json
-import sqlite3
 import tempfile
 from pathlib import Path
 

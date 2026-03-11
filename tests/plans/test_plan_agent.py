@@ -1,15 +1,10 @@
 """Tests for PlanAgent integration."""
 
-import json
 
 import pytest
 
-from aish.llm import LLMEvent, LLMEventType
-from aish.plans.manager import PlanManager
 from aish.plans.models import Plan, PlanStatus
-from aish.plans.plan_agent import PlanAgent
 from aish.plans.storage import PlanStorage
-from aish.tools.result import ToolResult
 from aish.tools.plan_tools import FinalizePlanTool
 
 

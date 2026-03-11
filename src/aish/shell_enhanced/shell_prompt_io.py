@@ -95,7 +95,7 @@ async def get_user_input(
 
     # Create bottom toolbar for TUI mode - shows status bar at bottom
     from prompt_toolkit.application import get_app_or_none
-    from prompt_toolkit.formatted_text import HTML, merge_formatted_text, to_formatted_text
+    from prompt_toolkit.formatted_text import HTML, merge_formatted_text
 
     def get_bottom_toolbar():
         """Get bottom toolbar content for prompt.
@@ -373,6 +373,17 @@ async def get_user_input(
                 raise KeyboardInterrupt()
             elif interrupt_action == InterruptAction.REQUEST_EXIT:
                 return await self.get_user_input(prompt_text, _recursion_depth + 1)
+
+        # If action is None (unexpected EOFError), re-raise to handle properly
+        if action is None:
+            raise
+
+        return await self.get_user_input(prompt_text, _recursion_depth + 1)
+    except KeyboardInterrupt:
+        raise
+    finally:
+        # Stop the background refresh thread before leaving the prompt.
+        refresh_stop_event.set()
 
 
 def handle_tool_confirmation_required(shell: Any, event: LLMEvent) -> LLMCallbackResult:

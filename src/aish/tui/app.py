@@ -94,7 +94,7 @@ class TUIApp:
         self.status_bar = StatusBar(self.tui_settings)
         self._widgets_loaded = True
 
-    def _render_status_bar(self, hint: str = "") -> Text:
+    def _render_status_bar(self, hint: str = "") -> object:
         """Render status bar line.
 
         Args:

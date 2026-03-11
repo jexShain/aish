@@ -1,16 +1,15 @@
 """Tests for BuildAgent TUI integration."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from aish.config import ConfigModel
 from aish.plans.build_agent import BuildAgent
 from aish.plans.manager import PlanManager
-from aish.plans.models import Plan, PlanStatus
 from aish.skills import SkillManager
 from aish.tui.app import TUIApp
-from aish.tui.types import PlanQueueState, StepStatus
+from aish.tui.types import StepStatus
 
 
 class TestBuildAgentTUIIntegration:

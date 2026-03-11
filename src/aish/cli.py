@@ -403,7 +403,6 @@ def plan_list(
     ),
 ):
     """List all plans with optional status filtering."""
-    from .config import get_default_aish_data_dir
     from .plans.manager import PlanManager
     from .plans.models import PlanStatus
     from rich.table import Table
@@ -471,7 +470,6 @@ def plan_show(
     plan_id: str = typer.Argument(..., help="Plan ID"),
 ):
     """Show detailed information about a plan."""
-    from .config import get_default_aish_data_dir
     from .plans.manager import PlanManager
 
     plan_manager = PlanManager()
@@ -481,8 +479,6 @@ def plan_show(
         console.print(f"Plan not found: {plan_id}", style="red")
         raise typer.Exit(1)
 
-    from rich.panel import Panel
-    from rich.syntax import Syntax
 
     # Show plan info
     console.print(f"[bold cyan]Plan ID:[/bold cyan] {plan.plan_id}")
@@ -524,7 +520,6 @@ def plan_execute(
     ),
 ):
     """Execute an approved plan."""
-    from .config import Config, get_default_aish_data_dir
     from .plans.manager import PlanManager
     from .plans.models import PlanStatus
 
@@ -538,7 +533,7 @@ def plan_execute(
     if plan.status != PlanStatus.APPROVED:
         console.print(f"Plan is not approved. Current status: {plan.status.value}", style="yellow")
         console.print("Use the following to approve the plan first:")
-        console.print(f"  In shell: Use 'approve_plan' tool or set status to approved")
+        console.print("  In shell: Use 'approve_plan' tool or set status to approved")
         raise typer.Exit(1)
 
     console.print(f"[green]Executing plan: {plan.title}[/green]")

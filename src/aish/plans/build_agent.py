@@ -133,7 +133,6 @@ class BuildAgent(ToolBase):
 
         # Update TUI if available
         if self.shell and hasattr(self.shell, "_tui_app"):
-            from aish.tui.types import StepStatus as TUIStepStatus
             self.shell._tui_app.set_mode("PLAN")
 
             # Show plan queue
@@ -252,7 +251,7 @@ class BuildAgent(ToolBase):
 
                 context = context_manager.as_messages()
 
-                response = await subsession.process_input(
+                await subsession.process_input(
                     prompt=current_prompt,
                     context_manager=context_manager,
                     system_message=system_message,
