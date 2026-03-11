@@ -70,6 +70,7 @@ dmypy.json
 # Virtual environments
 venv/
 .venv/
+.build-venv/
 .env/
 
 # Editor files
@@ -80,8 +81,6 @@ venv/
 # OS files
 .DS_Store
 Thumbs.db
-
-prefetched_data/
 
 .claude-trace/
 
