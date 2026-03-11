@@ -676,16 +676,7 @@ class AIShell:
 
     def print_welcome(self):
         """Print welcome message"""
-        # In TUI mode, add welcome to content area instead of direct print
-        if self._tui_app is not None:
-            from aish import __version__
-            from aish.tui.types import ContentLineType
-
-            welcome_text = f"AI Shell v{__version__} | Model: {self.config.model or 'not configured'}"
-            self._tui_app.add_content(welcome_text, ContentLineType.SYSTEM)
-            self._tui_app.add_content("Type commands or use ; for AI mode. Press Ctrl+C twice to exit.", ContentLineType.SYSTEM)
-        else:
-            self.console.print(build_welcome_renderable(self.config))
+        self.console.print(build_welcome_renderable(self.config))
 
     async def execute_command_with_pty(self, command: str) -> CommandResult:
         """Execute a command with PTY support and enhanced error handling."""
