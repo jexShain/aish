@@ -196,7 +196,7 @@ async def test_process_input_tool_call_content_is_marked_non_final():
 
 
 @pytest.mark.anyio
-async def test_process_input_litellm_error_is_beautified_and_localized():
+async def test_process_input_litellm_error_uses_raw_message():
     config = ConfigModel(model="test-model", api_key="test-key")
     session = LLMSession(config=config, skill_manager=SkillManager())
 
@@ -230,12 +230,12 @@ async def test_process_input_litellm_error_is_beautified_and_localized():
 
     assert result == ""
 
-    # Expect an ERROR event with litellm_error and a friendly (non-raw) message.
+    # Expect an ERROR event with litellm_error and the native provider message.
     error_events = [e for e in events if e.event_type == LLMEventType.ERROR]
     assert len(error_events) == 1
     err = error_events[0]
     assert err.data.get("error_type") == "litellm_error"
-    assert err.data.get("error_message")
+    assert err.data.get("error_message") == "invalid api key: sk-THIS_SHOULD_NOT_LEAK"
     # Ensure secrets are redacted in debug details.
     details = err.data.get("error_details")
     if details is not None:

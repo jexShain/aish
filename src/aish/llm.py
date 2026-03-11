@@ -13,12 +13,7 @@ from aish.agents import SystemDiagnoseAgent
 from aish.cancellation import CancellationReason, CancellationToken
 from aish.config import ConfigModel
 from aish.context_manager import ContextManager, MemoryType
-from aish.exception import (AuthenticationError, ContextWindowExceededError,
-                            InvalidRequestError, LiteLLMError, RateLimitError,
-                            ServiceUnavailableError)
-from aish.exception import TimeoutError as LiteLLMTimeoutError
-from aish.exception import (handle_litellm_exception, is_litellm_exception,
-                            redact_secrets)
+from aish.exception import is_litellm_exception, redact_secrets
 from aish.i18n import t
 from aish.interruption import ShellState
 from aish.litellm_loader import load_litellm
@@ -664,23 +659,6 @@ class LLMSession:
                 return LLMCallbackResult.CONTINUE
             return result if result is not None else LLMCallbackResult.CONTINUE
         return LLMCallbackResult.CONTINUE
-
-    def _format_litellm_error_for_user(self, err: LiteLLMError) -> str:
-        if isinstance(err, AuthenticationError):
-            return t("errors.llm.auth")
-        if isinstance(err, RateLimitError):
-            return t("errors.llm.rate_limit")
-        if isinstance(err, InvalidRequestError):
-            return t("errors.llm.invalid_request")
-        if isinstance(err, LiteLLMTimeoutError):
-            return t("errors.llm.timeout")
-        if isinstance(err, ServiceUnavailableError):
-            return t("errors.llm.service_unavailable")
-        if isinstance(err, ContextWindowExceededError):
-            return t("errors.llm.context_length")
-
-        message = str(err) or "unknown"
-        return t("errors.llm.unknown", message=message)
 
     def request_confirmation(
         self,
@@ -1532,15 +1510,14 @@ class LLMSession:
                     raise
                 except Exception as e:
                     if isinstance(e, Exception) and is_litellm_exception(e):
-                        mapped = handle_litellm_exception(e)
-                        friendly = self._format_litellm_error_for_user(mapped)
+                        raw_message = str(e) or type(e).__name__
                         events.emit_error(
                             error_type="litellm_error",
-                            error_message=friendly,
+                            error_message=raw_message,
                             error_details=redact_secrets(str(e)),
                         )
                         events.emit_generation_end(
-                            status="error", error_message=friendly
+                            status="error", error_message=raw_message
                         )
                     else:
                         events.emit_error(
@@ -1765,14 +1742,13 @@ class LLMSession:
             events.emit_generation_end(status="timeout")
         except Exception as e:
             if isinstance(e, Exception) and is_litellm_exception(e):
-                mapped = handle_litellm_exception(e)
-                friendly = self._format_litellm_error_for_user(mapped)
+                raw_message = str(e) or type(e).__name__
                 events.emit_error(
                     error_type="litellm_error",
-                    error_message=friendly,
+                    error_message=raw_message,
                     error_details=redact_secrets(str(e)),
                 )
-                events.emit_generation_end(status="error", error_message=friendly)
+                events.emit_generation_end(status="error", error_message=raw_message)
             else:
                 events.emit_error(
                     error_type="completion_error",
