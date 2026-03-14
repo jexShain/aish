@@ -33,6 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - TBD
 
+## [0.1.2] - 2026-03-14
+
+### Added
+
+- Added a provider abstraction layer for OAuth-backed integrations, including a reusable provider registry and shared OAuth helpers.
+- Added regression coverage for release metadata extraction so tagged releases read notes from the versioned changelog section.
+
+### Changed
+
+- Changed the release pipeline to be fully tag-driven by removing the manual Release PR workflow and creating GitHub Releases directly from stable tag pushes.
+- Changed OpenAI Codex provider internals to use the shared provider/OAuth architecture for future provider expansion.
+
+### Fixed
+
+- Fixed LiteLLM provider tool calls so forwarded tool parameters reach the provider correctly.
+
 ## [0.1.1] - 2026-03-13
 
 ### Added
