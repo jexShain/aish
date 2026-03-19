@@ -169,7 +169,7 @@ shell:
 
   command_cancelled: "Comando cancelado"
   error_correction:
-    press_semicolon_hint: "La ejecución del comando falló. Pulsa ; para analizar y reparar automáticamente, o introduce el siguiente comando."
+    press_semicolon_hint: "La ejecución del comando falló. Escribe ; y pulsa Enter para analizar y reparar automáticamente, o introduce el siguiente comando."
     corrected_command_label: "Corrección sugerida:"
   error:
     execution_error: "❌ Error durante la ejecución: {error}"

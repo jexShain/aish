@@ -169,7 +169,7 @@ shell:
 
   command_cancelled: "Commande annulee"
   error_correction:
-    press_semicolon_hint: "L'execution de la commande a echoue. Appuyez sur ; pour analyser et reparer automatiquement, ou saisissez directement la commande suivante."
+    press_semicolon_hint: "L'execution de la commande a echoue. Tapez ; puis Enter pour analyser et reparer automatiquement, ou saisissez la commande suivante."
     corrected_command_label: "Correction suggeree :"
   error:
     execution_error: "❌ Erreur pendant l'execution : {error}"

@@ -212,7 +212,7 @@ shell:
   command_cancelled: "Command cancelled"
 
   error_correction:
-    press_semicolon_hint: "Command execution failed. Press ; to automatically analyze and repair, or enter the next command directly."
+    press_semicolon_hint: "Command execution failed. Type ; and press Enter to auto-analyze and fix, or enter the next command directly."
     corrected_command_label: "Suggested fix:"
 
   error:

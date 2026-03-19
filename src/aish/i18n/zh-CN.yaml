@@ -212,7 +212,7 @@ shell:
   command_cancelled: "命令已取消"
 
   error_correction:
-    press_semicolon_hint: "命令执行失败。按 ; 自动分析修复，或直接输入下一条命令。"
+    press_semicolon_hint: "命令执行失败。输入 ; 后按 Enter 自动分析修复，或直接输入下一条命令。"
     corrected_command_label: "修复建议:"
 
   error:

@@ -46,7 +46,6 @@ async def get_user_input(
     import threading
     import time
 
-    from prompt_toolkit.filters import Condition
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.keys import Keys
 
@@ -89,9 +88,6 @@ async def get_user_input(
     # 用于存储 app 引用和刷新控制
     app_ref = [None]
     refresh_stop_event = threading.Event()
-
-    # Track whether correction was triggered
-    correction_triggered = [False]
 
     # Create bottom toolbar for TUI mode - shows status bar at bottom
     from prompt_toolkit.application import get_app_or_none
@@ -295,40 +291,6 @@ async def get_user_input(
         if app_ref[0] is None:
             app_ref[0] = event.app
 
-    # Handle semicolon key for error correction when there's a pending correction
-    if has_pending_correction:
-        # Create a filter that checks if we still have pending correction
-        def has_correction_filter():
-            return self._pending_error_correction is not None
-
-        @kb.add(";", filter=Condition(has_correction_filter))
-        def handle_correction_key(event):
-            """Trigger error correction when semicolon is pressed at line start."""
-            if app_ref[0] is None:
-                app_ref[0] = event.app
-            # Only trigger when cursor is at line start (first character is semicolon)
-            # Does not affect semicolon input at other positions
-            buffer = event.app.current_buffer
-            if buffer.cursor_position == 0:
-                correction_triggered[0] = True
-                event.app.exit(result="__CORRECT_SEMICOLON__")
-            else:
-                # Not at line start, insert semicolon normally
-                buffer.insert_text(";")
-
-        @kb.add("；", filter=Condition(has_correction_filter))
-        def handle_correction_key_cn(event):
-            """Trigger error correction when Chinese semicolon is pressed at line start."""
-            if app_ref[0] is None:
-                app_ref[0] = event.app
-            buffer = event.app.current_buffer
-            if buffer.cursor_position == 0:
-                correction_triggered[0] = True
-                event.app.exit(result="__CORRECT_SEMICOLON__")
-            else:
-                # Not at line start, insert Chinese semicolon normally
-                buffer.insert_text("；")
-
     try:
         result = await self.session.prompt_async(
             base_prompt,
@@ -340,12 +302,12 @@ async def get_user_input(
         if result is None:
             return ""
 
-        # Check if correction was triggered (user pressed Y)
-        if correction_triggered[0]:
-            return result
-
-        # If we had pending correction but user didn't press Y, clear it
-        if self._pending_error_correction is not None:
+        # Clear pending correction if user didn't type only semicolon
+        # If they typed only ";" or "；", preserve it for shell.py to handle
+        if (
+            self._pending_error_correction is not None
+            and result.strip() not in (";", "；")
+        ):
             self._pending_error_correction = None
 
         # 检查是否在确认窗口期内按了其他键

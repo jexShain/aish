@@ -3396,11 +3396,11 @@ class AIShell:
                                 # Get first line of input
                                 first_input = await self.get_user_input(prompt_text)
 
-                                # Check for semicolon key press for error correction
-                                # Only if there's pending error correction
-                                if (
-                                    self._pending_error_correction
-                                    and first_input == "__CORRECT_SEMICOLON__"
+                                # Check for semicolon input for error correction
+                                # User must press Enter after typing ";" or "；" to trigger correction
+                                if self._pending_error_correction and first_input.strip() in (
+                                    ";",
+                                    "；",
                                 ):
                                     await self._execute_error_correction()
                                     continue
