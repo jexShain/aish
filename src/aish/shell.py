@@ -27,6 +27,7 @@ from anyio import to_thread
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.history import FileHistory
+from rich.box import HORIZONTALS
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -1033,7 +1034,9 @@ class AIShell:
             await self.handle_json_command(json_cmd)
         else:
             # Normal response without JSON command
-            self.console.print(Panel(Markdown(response), border_style=border_style))
+            self.console.print(
+                Panel(Markdown(response), border_style=border_style, box=HORIZONTALS)
+            )
 
     async def handle_error_detect(self, command: str, stdout: str, stderr: str):
         """Handle smart error detection when return code is 0"""
