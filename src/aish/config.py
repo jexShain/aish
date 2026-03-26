@@ -155,10 +155,6 @@ class TUISettings(BaseModel):
     )
     show_time: bool = Field(default=True, description="Show time in status bar")
     show_cwd: bool = Field(default=True, description="Show current directory in status bar")
-    inline_ui: bool = Field(
-        default=True,
-        description="Use inline UI for selections (ask_user) at bottom of screen",
-    )
 
 
 class ConfigModel(BaseModel):

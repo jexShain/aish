@@ -44,6 +44,7 @@ from .env_manager import EnvironmentManager
 from .help_manager import HelpManager
 from .history_manager import HistoryManager
 from .i18n import t
+from .interaction import InteractionRequest, InteractionResponse, InteractionStatus
 from .interruption import (InterruptionManager, PromptConfig,
                            ShellState)
 from .llm import LLMCallbackResult, LLMEvent, LLMEventType, LLMSession
@@ -67,9 +68,7 @@ from .shell_enhanced.shell_prompt_io import \
 from .shell_enhanced.shell_prompt_io import \
     get_user_input as _prompt_get_user_input
 from .shell_enhanced.shell_prompt_io import \
-    handle_ask_user_required as _prompt_handle_ask_user_required
-from .shell_enhanced.shell_prompt_io import \
-    handle_ask_user_required_inline as _prompt_handle_ask_user_required_inline
+    handle_interaction_required as _prompt_handle_interaction_required
 from .shell_enhanced.shell_prompt_io import \
     handle_tool_confirmation_required as \
     _prompt_handle_tool_confirmation_required
@@ -207,7 +206,7 @@ class AIShell:
             LLMEventType.TOOL_EXECUTION_END: self.handle_tool_execution_end,
             LLMEventType.ERROR: self.handle_error_event,
             LLMEventType.TOOL_CONFIRMATION_REQUIRED: self.handle_tool_confirmation_required,
-            LLMEventType.ASK_USER_REQUIRED: self.handle_ask_user_required,
+            LLMEventType.INTERACTION_REQUIRED: self.handle_interaction_required,
             LLMEventType.CANCELLED: self.handle_processing_cancelled,
         }
         self._llm_event_router = LLMEventRouter(self.event_handlers)
@@ -3489,41 +3488,19 @@ class AIShell:
         """Handle tool confirmation required event - display confirmation dialog and get user response"""
         return _prompt_handle_tool_confirmation_required(self, event)
 
-    def handle_ask_user_required(self, event: LLMEvent) -> LLMCallbackResult:
-        """Handle ask_user event - show interactive single-choice UI.
+    def handle_interaction_required(self, event: LLMEvent) -> LLMCallbackResult:
+        """Handle interaction events with a single prompt UI."""
+        return _prompt_handle_interaction_required(self, event)
 
-        Uses inline UI at bottom of screen if config.tui.inline_ui is True,
-        otherwise uses the traditional modal dialog.
-        """
-        # Check if inline UI is enabled in config (default to True)
-        try:
-            inline_ui = getattr(getattr(self.config, "tui", None), "inline_ui", True)
-        except Exception:
-            inline_ui = True
-        if inline_ui:
-            return _prompt_handle_ask_user_required_inline(self, event)
-        return _prompt_handle_ask_user_required(self, event)
-
-    def request_user_choice(self, data: dict) -> tuple[str | None, str]:
-        """Request a user choice via the shell UI.
+    def request_interaction(
+        self,
+        request: InteractionRequest,
+    ) -> InteractionResponse:
+        """Request a user interaction via the shell UI.
 
         This method is used by plan_agent to get user input for plan confirmation.
 
-        Args:
-            data: Dictionary containing:
-                - prompt: The question to ask
-                - options: List of option dicts with 'value' and 'label'
-                - default: Default option value
-                - title: Optional title for the selection
-                - allow_cancel: Whether to allow cancellation
-                - allow_custom_input: Whether to allow custom input
-
-        Returns:
-            (selected_value, status) where status is one of:
-            - "selected": User made a selection
-            - "cancelled": User cancelled
-            - "unavailable": UI not available (non-TTY)
-            - "error": An error occurred
+        Returns the normalized interaction response.
         """
         import sys
 
@@ -3538,32 +3515,39 @@ class AIShell:
         # If no TTY but we have a running shell, try anyway
         # (This handles the case where plan_agent runs in ThreadPoolExecutor)
         if not has_tty and not self.running:
-            return None, "unavailable"
+            return InteractionResponse(
+                interaction_id=request.id,
+                status=InteractionStatus.UNAVAILABLE,
+                reason="unavailable",
+            )
 
         try:
             # Create event and handle it
+            event_data = {"interaction_request": request.to_dict()}
             event = LLMEvent(
-                event_type=LLMEventType.ASK_USER_REQUIRED,
-                data=data,
+                event_type=LLMEventType.INTERACTION_REQUIRED,
+                data=event_data,
                 timestamp=time.time(),
             )
-            self.handle_ask_user_required(event)
+            self.handle_interaction_required(event)
 
-            # Check if user made a selection
-            selected_value = data.get("selected_value")
-            if isinstance(selected_value, str) and selected_value:
-                return selected_value, "selected"
+            response_payload = event_data.get("interaction_response")
+            if isinstance(response_payload, dict):
+                return InteractionResponse.from_dict(response_payload)
 
-            # Check for custom input
-            custom_input = data.get("custom_input")
-            if isinstance(custom_input, str) and custom_input.strip():
-                return custom_input.strip(), "selected"
-
-            return None, "cancelled"
+            return InteractionResponse(
+                interaction_id=request.id,
+                status=InteractionStatus.CANCELLED,
+                reason="cancelled",
+            )
         except KeyboardInterrupt:
             raise
         except Exception:
-            return None, "error"
+            return InteractionResponse(
+                interaction_id=request.id,
+                status=InteractionStatus.UNAVAILABLE,
+                reason="error",
+            )
 
     def _display_security_panel(self, data: dict, panel_mode: str = "confirm"):
         """Display rich security panel for AI tool calls."""

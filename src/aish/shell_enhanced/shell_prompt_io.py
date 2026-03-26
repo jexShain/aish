@@ -14,6 +14,11 @@ from rich.panel import Panel
 
 from ..cancellation import CancellationReason
 from ..i18n import t
+from ..interaction import (InteractionAnswer, InteractionAnswerType,
+                           InteractionKind,
+                           InteractionRequest, InteractionResponse,
+                           InteractionStatus,
+                           apply_interaction_response_to_data)
 from ..interruption import InterruptAction, PromptConfig, ShellState
 from ..llm import LLMCallbackResult, LLMEvent
 
@@ -386,10 +391,8 @@ def handle_tool_confirmation_required(shell: Any, event: LLMEvent) -> LLMCallbac
     return LLMCallbackResult.CONTINUE
 
 
-def handle_ask_user_required(shell: Any, event: LLMEvent) -> LLMCallbackResult:
-    """Handle ask_user event - show interactive single-choice UI."""
+def _prepare_interaction_prompt(shell: Any) -> None:
     self = shell
-    # Stop any active Live/animation before prompting.
     self._stop_animation()
     if self.current_live:
         try:
@@ -397,96 +400,147 @@ def handle_ask_user_required(shell: Any, event: LLMEvent) -> LLMCallbackResult:
             self.current_live.stop()
         finally:
             self.current_live = None
-
     self._finalize_content_preview()
 
-    data = event.data or {}
-    prompt = str(data.get("prompt") or "")
-    options = data.get("options") if isinstance(data.get("options"), list) else []
-    default_value = data.get("default")
-    if not isinstance(default_value, str):
-        default_value = None
-    title = str(data.get("title") or t("shell.ask_user.title"))
-    allow_cancel = bool(data.get("allow_cancel", True))
-    allow_custom_input = bool(data.get("allow_custom_input", False))
-    custom_label_raw = data.get("custom_label")
-    custom_label = str(custom_label_raw or t("shell.ask_user.custom_label"))
-    if isinstance(custom_label_raw, str) and custom_label_raw.strip():
-        label_text = custom_label_raw.strip()
-    else:
-        label_text = custom_label.strip()
 
-    values: list[tuple[str, str]] = []
-    for item in options:
-        if not isinstance(item, dict):
-            continue
-        value = item.get("value")
-        label = item.get("label")
-        if isinstance(value, str) and value and isinstance(label, str) and label:
-            values.append((value, label))
+def _build_interaction_response(
+    request: Any,
+    selected_value: str | None,
+) -> InteractionResponse:
+    if isinstance(selected_value, str) and selected_value:
+        selected_option = request.get_option_by_value(selected_value)
+        answer = InteractionAnswer(
+            type=InteractionAnswerType.OPTION
+            if selected_option is not None
+            else InteractionAnswerType.TEXT,
+            value=selected_option.value if selected_option is not None else selected_value,
+            label=selected_option.label if selected_option is not None else selected_value,
+        )
+        return InteractionResponse(
+            interaction_id=request.id,
+            status=InteractionStatus.SUBMITTED,
+            answer=answer,
+        )
+    return InteractionResponse(
+        interaction_id=request.id,
+        status=InteractionStatus.CANCELLED,
+        reason="cancelled",
+    )
+
+
+def _request_allows_custom_input(request: Any) -> bool:
+    return request.kind in (
+        InteractionKind.CHOICE_OR_TEXT,
+        InteractionKind.TEXT_INPUT,
+    )
+
+
+def render_interaction_modal(shell: Any, request: Any) -> InteractionResponse:
+    self = shell
+    prompt = request.prompt
+    options = [option.to_dict() for option in request.options]
+    default_value = request.default
+    title = str(request.title or t("shell.ask_user.title"))
+    allow_cancel = request.allow_cancel
+    allow_custom_input = _request_allows_custom_input(request)
+    label_text = str(t("shell.ask_user.custom_label"))
+    custom_prompt = request.placeholder
+    if request.custom is not None:
+        label_text = request.custom.label
+        custom_prompt = request.custom.placeholder
+
+    values = [(item["value"], item["label"]) for item in options]
+    description_by_value = {
+        item["value"]: item.get("description", "") for item in options
+    }
+    if not values and not allow_custom_input:
+        return InteractionResponse(
+            interaction_id=request.id,
+            status=InteractionStatus.DISMISSED,
+            reason="dismissed",
+        )
+
+    selected_index = 0
+    if default_value:
+        for index, (value, _) in enumerate(values):
+            if value == default_value:
+                selected_index = index
+                break
 
     selected_value: str | None = None
     try:
-        from functools import partial
-
         from prompt_toolkit import Application
         from prompt_toolkit.buffer import Buffer
-        from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
-        from prompt_toolkit.key_binding.defaults import load_key_bindings
+        from prompt_toolkit.filters import Condition
+        from prompt_toolkit.key_binding import KeyBindings
         from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
-        from prompt_toolkit.layout.containers import Float, FloatContainer
+        from prompt_toolkit.layout.containers import ConditionalContainer
         from prompt_toolkit.layout.dimension import D
         from prompt_toolkit.styles import Style
         from prompt_toolkit.utils import get_cwidth
-        from prompt_toolkit.widgets import Box, RadioList
 
-        # Flush any pending key presses (e.g., the Enter used to submit the last prompt)
-        # to avoid instantly selecting/exiting the dialog.
         try:
             if sys.stdin.isatty():
                 termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
         except Exception:
             pass
 
-        radio_list = RadioList(values=values, default=default_value)
         custom_buffer = Buffer() if allow_custom_input else None
+        state = {
+            "selected_index": selected_index,
+            "custom_active": allow_custom_input and not values,
+        }
+        custom_placeholder_text = custom_prompt or label_text
+
+        def _is_custom_selected() -> bool:
+            return allow_custom_input and bool(state["custom_active"])
+
+        def _sync_focus(event) -> None:
+            if allow_custom_input and custom_input_field is not None and _is_custom_selected():
+                event.app.layout.focus(custom_input_field)
+            else:
+                event.app.layout.focus(options_window)
 
         kb = KeyBindings()
 
-        @kb.add("tab", eager=True)
-        def _next(event):
-            if allow_custom_input and custom_input_field is not None:
-                if event.app.layout.has_focus(custom_input_field):
-                    event.app.layout.focus(radio_list)
-                else:
-                    event.app.layout.focus(custom_input_field)
+        @kb.add("up", eager=True)
+        def _move_up(event):
+            if _is_custom_selected():
+                if values:
+                    state["custom_active"] = False
+                    state["selected_index"] = min(max(0, len(values) - 1), state["selected_index"])
+                    _sync_focus(event)
+                    event.app.invalidate()
+                return
+            if values:
+                state["selected_index"] = max(0, state["selected_index"] - 1)
+                _sync_focus(event)
+                event.app.invalidate()
 
-        @kb.add("s-tab", eager=True)
-        def _prev(event):
-            if allow_custom_input and custom_input_field is not None:
-                if event.app.layout.has_focus(custom_input_field):
-                    event.app.layout.focus(radio_list)
-                else:
-                    event.app.layout.focus(custom_input_field)
+        @kb.add("down", eager=True)
+        def _move_down(event):
+            if _is_custom_selected():
+                return
+            if values and state["selected_index"] < len(values) - 1:
+                state["selected_index"] = min(len(values) - 1, state["selected_index"] + 1)
+                _sync_focus(event)
+                event.app.invalidate()
+                return
+            if allow_custom_input:
+                state["custom_active"] = True
+                _sync_focus(event)
+                event.app.invalidate()
 
         @kb.add("enter", eager=True)
         def _select(event):
-            if (
-                allow_custom_input
-                and custom_buffer is not None
-                and custom_input_field is not None
-            ):
-                if event.app.layout.has_focus(custom_input_field):
-                    text_value = (custom_buffer.text or "").strip()
-                    if text_value:
-                        event.app.exit(result=text_value)
-                        return
-            # Ensure the currently highlighted item becomes the current value.
-            try:
-                radio_list._handle_enter()
-            except Exception:
-                pass
-            event.app.exit(result=radio_list.current_value)
+            if allow_custom_input and custom_buffer is not None and _is_custom_selected():
+                text_value = (custom_buffer.text or "").strip()
+                if text_value:
+                    event.app.exit(result=text_value)
+                    return
+                return
+            if values:
+                event.app.exit(result=values[state["selected_index"]][0])
 
         if allow_cancel:
 
@@ -502,41 +556,155 @@ def handle_ask_user_required(shell: Any, event: LLMEvent) -> LLMCallbackResult:
 
         def _current_max_visible() -> int:
             return self._compute_ask_user_max_visible(
-                total_options=len(values),
+                total_options=max(1, len(values)),
                 term_rows=(self._read_terminal_size() or (24, 80))[0],
                 allow_custom_input=allow_custom_input,
             )
 
-        options_window = Box(
-            body=radio_list,
+        def _regular_visible_range() -> tuple[int, int]:
+            total_regular = len(values)
+            if total_regular <= 0:
+                return (0, 0)
+
+            visible_count = _current_max_visible()
+            visible_regular = max(1, visible_count)
+
+            selected_regular = min(state["selected_index"], total_regular - 1)
+            start_index = max(0, selected_regular - visible_regular + 1)
+            if selected_regular < start_index:
+                start_index = selected_regular
+            if start_index + visible_regular > total_regular:
+                start_index = max(0, total_regular - visible_regular)
+            end_index = min(total_regular, start_index + visible_regular)
+            return (start_index, end_index)
+
+        def _build_option_lines() -> list[tuple[str, str]]:
+            start_index, end_index = _regular_visible_range()
+
+            fragments: list[tuple[str, str]] = []
+            if start_index > 0:
+                fragments.append(("class:hint", "  ^ 更多选项\n"))
+
+            for index in range(start_index, end_index):
+                is_selected = index == state["selected_index"] and not _is_custom_selected()
+                value, label = values[index]
+                description = description_by_value.get(value, "")
+                prefix = ">" if is_selected else " "
+                style = "class:option.selected" if is_selected else "class:option"
+                fragments.append((style, f"{prefix} {index + 1}. {label}\n"))
+                if description:
+                    desc_style = (
+                        "class:option.description.selected"
+                        if is_selected
+                        else "class:option.description"
+                    )
+                    fragments.append((desc_style, f"      {description}\n"))
+
+            if end_index < len(values):
+                fragments.append(("class:hint", "  v 更多选项\n"))
+
+            return fragments
+
+        def _visible_option_rows() -> int:
+            start_index, end_index = _regular_visible_range()
+
+            rows = max(0, end_index - start_index)
+            rows += sum(
+                1
+                for index in range(start_index, end_index)
+                if description_by_value.get(values[index][0], "")
+            )
+            if start_index > 0:
+                rows += 1
+            if end_index < len(values):
+                rows += 1
+            return rows
+
+        def _separator_text() -> str:
+            term_cols = (self._read_terminal_size() or (24, 80))[1]
+            return "─" * max(20, term_cols - 1)
+
+        options_window = Window(
+            content=FormattedTextControl(
+                text=_build_option_lines,
+                focusable=True,
+                show_cursor=False,
+            ),
+            wrap_lines=True,
+            dont_extend_height=True,
             height=lambda: D(
-                min=3,
-                preferred=_current_max_visible(),
-                max=_current_max_visible(),
+                min=0,
+                preferred=_visible_option_rows(),
+                max=_visible_option_rows(),
             ),
         )
 
-        custom_input_label_window = None
+        custom_row_window = None
         custom_input_field = None
-        if allow_custom_input and custom_buffer is not None:
-            term_cols = (self._read_terminal_size() or (24, 80))[1]
-            max_label_width = max(8, term_cols // 3)
-            label_width = min(get_cwidth(label_text) + 1, max_label_width)
-            custom_input_label_window = Window(
+        if allow_custom_input:
+            max_label_width = max(8, (self._read_terminal_size() or (24, 80))[1] // 3)
+            label_width = min(max(8, get_cwidth(label_text) + 1), max_label_width)
+            _ = label_width
+            custom_header_window = Window(
                 content=FormattedTextControl(
-                    text=f"{label_text} ", style="class:input.label"
+                    text=lambda: [
+                        (
+                            "class:option.selected" if _is_custom_selected() else "class:option",
+                            f"> {label_text}" if _is_custom_selected() else f"  {label_text}",
+                        )
+                    ],
+                    show_cursor=False,
                 ),
                 dont_extend_height=True,
-                width=D(preferred=label_width, min=label_width),
+                wrap_lines=True,
             )
-            custom_input_field = Window(
-                content=BufferControl(buffer=custom_buffer, focusable=True),
-                height=1,
-                style="class:input",
+
+            custom_body_prefix = Window(
+                content=FormattedTextControl(text="    "),
+                dont_extend_height=True,
+                width=D(preferred=4, min=4, max=4),
             )
-            custom_row = HSplit(
+
+            if custom_buffer is not None:
+                custom_input_field = Window(
+                    content=BufferControl(buffer=custom_buffer, focusable=True),
+                    height=1,
+                    style="class:input",
+                )
+
+            custom_placeholder_body = VSplit(
                 [
-                    VSplit([custom_input_label_window, custom_input_field], padding=1),
+                    custom_body_prefix,
+                    Window(
+                        content=FormattedTextControl(
+                            text=custom_placeholder_text,
+                            style="class:option.placeholder",
+                        ),
+                        dont_extend_height=True,
+                        wrap_lines=True,
+                    ),
+                ],
+                padding=0,
+            )
+
+            custom_input_body = VSplit(
+                [custom_body_prefix, custom_input_field]
+                if custom_input_field is not None
+                else [custom_body_prefix],
+                padding=0,
+            )
+
+            custom_row_window = HSplit(
+                [
+                    custom_header_window,
+                    ConditionalContainer(
+                        content=custom_placeholder_body,
+                        filter=Condition(lambda: not _is_custom_selected()),
+                    ),
+                    ConditionalContainer(
+                        content=custom_input_body,
+                        filter=Condition(_is_custom_selected),
+                    ),
                 ],
                 padding=0,
             )
@@ -552,152 +720,59 @@ def handle_ask_user_required(shell: Any, event: LLMEvent) -> LLMCallbackResult:
             dont_extend_height=True,
         )
 
-        body_items = [prompt_window, options_window]
-        if allow_custom_input and custom_buffer is not None:
-            body_items.append(custom_row)
+        separator_window_top = Window(
+            content=FormattedTextControl(text=_separator_text, style="class:separator"),
+            dont_extend_height=True,
+            height=1,
+        )
+        separator_window_bottom = Window(
+            content=FormattedTextControl(text=_separator_text, style="class:separator"),
+            dont_extend_height=True,
+            height=1,
+        )
+
+        title_window = Window(
+            content=FormattedTextControl(text=f"[ {title} ]", style="class:title"),
+            wrap_lines=True,
+            dont_extend_height=True,
+        )
+
+        body_items = [title_window, separator_window_top, prompt_window, Window(height=1, char="")]
+        if values:
+            body_items.append(options_window)
+        if custom_row_window is not None:
+            body_items.append(custom_row_window)
+        body_items.append(separator_window_bottom)
         body_items.append(hint_window)
 
-        body = HSplit(body_items, padding=1)
-
-        rounded = {
-            "tl": "╭",
-            "tr": "╮",
-            "bl": "╰",
-            "br": "╯",
-            "h": "─",
-            "v": "│",
-        }
-        fill = partial(Window, style="class:frame.border")
-
-        top_row_with_title = VSplit(
-            [
-                fill(width=1, height=1, char=rounded["tl"]),
-                fill(char=rounded["h"]),
-                fill(width=1, height=1, char=rounded["v"]),
-                Window(
-                    FormattedTextControl(lambda: f" {title} "),
-                    style="class:frame.label",
-                    dont_extend_width=True,
-                ),
-                fill(width=1, height=1, char=rounded["v"]),
-                fill(char=rounded["h"]),
-                fill(width=1, height=1, char=rounded["tr"]),
-            ],
-            height=1,
-        )
-
-        top_row_without_title = VSplit(
-            [
-                fill(width=1, height=1, char=rounded["tl"]),
-                fill(char=rounded["h"]),
-                fill(width=1, height=1, char=rounded["tr"]),
-            ],
-            height=1,
-        )
-
-        top_row = top_row_with_title if title else top_row_without_title
-
-        middle_row = VSplit(
-            [
-                fill(width=1, char=rounded["v"]),
-                body,
-                fill(width=1, char=rounded["v"]),
-            ]
-        )
-
-        bottom_row = VSplit(
-            [
-                fill(width=1, height=1, char=rounded["bl"]),
-                fill(char=rounded["h"]),
-                fill(width=1, height=1, char=rounded["br"]),
-            ],
-            height=1,
-        )
-
-        frame_container = HSplit(
-            [top_row, middle_row, bottom_row],
-            style="class:frame",
-        )
+        body = HSplit(body_items, padding=0)
 
         style = Style.from_dict(
             {
-                "frame.border": "#5f5f5f",
-                "frame.label": "bold #7aa2f7",
-                "radio-list": "fg:#c0caf5",
-                "radio-selected": "reverse",
-                "radio-checked": "bold #7dcfff",
+                "title": "bold",
+                "separator": "fg:#6c7086",
+                "option": "",
+                "option.selected": "bold fg:#7dcfff",
+                "option.description": "fg:#7a8499",
+                "option.description.selected": "fg:#9ccfd8",
+                "option.placeholder": "fg:#7a8499",
+                "input": "",
                 "hint": "fg:#7a8499",
-                "input.label": "fg:#9aa5ce",
-                "input": "fg:#c0caf5",
             }
         )
 
-        focus_target = radio_list
-        if allow_custom_input and custom_input_field is not None:
-            focus_target = custom_input_field
-
-        def _line_count(text: str, width: int) -> int:
-            if width <= 0:
-                return 1
-            count = 1
-            current = 0
-            for ch in text:
-                if ch == "\n":
-                    count += 1
-                    current = 0
-                    continue
-                w = get_cwidth(ch)
-                if current + w > width:
-                    count += 1
-                    current = w
-                else:
-                    current += w
-            return max(1, count)
-
-        def _dialog_height() -> int:
-            rows, cols = self._read_terminal_size() or (24, 80)
-            max_visible = self._compute_ask_user_max_visible(
-                total_options=len(values),
-                term_rows=rows,
-                allow_custom_input=allow_custom_input,
-            )
-            inner_width = max(20, cols - 4)
-            prompt_lines = _line_count(prompt, inner_width)
-            hint_lines = _line_count(hint_text, inner_width)
-            custom_row_lines = 1 if allow_custom_input else 0
-            item_count = 2 + (1 if allow_custom_input else 0) + 1
-            padding_lines = max(0, item_count - 1)
-            min_height = (
-                prompt_lines
-                + max_visible
-                + custom_row_lines
-                + hint_lines
-                + padding_lines
-                + 2
-            )
-            return max(6, min(rows, min_height))
-
-        # Overlay the dialog on top of existing content to avoid line shifts on every keypress.
-        overlay = FloatContainer(
-            content=Window(),
-            floats=[
-                Float(
-                    content=frame_container,
-                    left=0,
-                    right=0,
-                    top=0,
-                    height=_dialog_height,
-                    transparent=False,
-                )
-            ],
+        focus_target = (
+            custom_input_field
+            if _is_custom_selected() and custom_input_field is not None
+            else options_window
         )
 
         app = Application(
-            layout=Layout(overlay, focused_element=focus_target),
-            key_bindings=merge_key_bindings([load_key_bindings(), kb]),
+            layout=Layout(body, focused_element=focus_target),
+            key_bindings=kb,
             full_screen=False,
             style=style,
-            mouse_support=True,
+            mouse_support=False,
         )
         try:
             app.input.flush()
@@ -721,10 +796,7 @@ def handle_ask_user_required(shell: Any, event: LLMEvent) -> LLMCallbackResult:
                     except Exception:
                         pass
 
-            threading.Thread(
-                target=_watch_ask_user_resize,
-                daemon=True,
-            ).start()
+            threading.Thread(target=_watch_ask_user_resize, daemon=True).start()
 
         try:
             while True:
@@ -739,184 +811,21 @@ def handle_ask_user_required(shell: Any, event: LLMEvent) -> LLMCallbackResult:
     except Exception:
         selected_value = None
 
-    # Mutate event.data so LLMSession can read the selection without changing callback return types.
-    try:
-        data["selected_value"] = selected_value
-    except Exception:
-        pass
-
-    return LLMCallbackResult.CONTINUE
+    return _build_interaction_response(request, selected_value)
 
 
-def handle_ask_user_required_inline(shell: Any, event: LLMEvent) -> LLMCallbackResult:
-    """Handle ask_user event with status bar style UI.
-
-    This displays a multi-line selection UI at the bottom of the screen,
-    styled like the status bar with gray background.
-    """
-    self = shell
-
-    # Guard: check if data already has selected_value (prevents duplicate calls)
-    if "selected_value" in event.data and event.data["selected_value"] is not None:
-        return LLMCallbackResult.CONTINUE
-
-    # Stop any active Live/animation before prompting.
-    self._stop_animation()
-    if self.current_live:
-        try:
-            self.current_live.update("", refresh=True)
-            self.current_live.stop()
-        finally:
-            self.current_live = None
-
-    self._finalize_content_preview()
-
+def handle_interaction_required(shell: Any, event: LLMEvent) -> LLMCallbackResult:
+    """Handle interaction event with modal UI."""
     data = event.data or {}
-    prompt = str(data.get("prompt") or "")
-    options = data.get("options") if isinstance(data.get("options"), list) else []
-    default_value = data.get("default")
-    if not isinstance(default_value, str):
-        default_value = None
-    title = str(data.get("title") or t("shell.ask_user.title"))
-    allow_cancel = bool(data.get("allow_cancel", True))
-
-    # Normalize options
-    values: list[tuple[str, str]] = []
-    for item in options:
-        if not isinstance(item, dict):
-            continue
-        value = item.get("value")
-        label = item.get("label")
-        if isinstance(value, str) and value and isinstance(label, str) and label:
-            values.append((value, label))
-
-    if not values:
-        data["selected_value"] = None
+    request_payload = data.get("interaction_request")
+    if not isinstance(request_payload, dict):
         return LLMCallbackResult.CONTINUE
-
-    # Set initial selection
-    selected_index = 0
-    if default_value:
-        for i, (v, _) in enumerate(values):
-            if v == default_value:
-                selected_index = i
-                break
-
-    selected_value: str | None = None
+    request = InteractionRequest.from_dict(request_payload)
+    _prepare_interaction_prompt(shell)
+    response = render_interaction_modal(shell, request)
 
     try:
-        from prompt_toolkit import Application
-        from prompt_toolkit.formatted_text import HTML
-        from prompt_toolkit.key_binding import KeyBindings
-        from prompt_toolkit.layout import HSplit, Layout, Window
-        from prompt_toolkit.layout.controls import FormattedTextControl
-        from prompt_toolkit.styles import Style
-
-        # Flush any pending key presses
-        try:
-            if sys.stdin.isatty():
-                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-        except Exception:
-            pass
-
-        # Selection state
-        state = {"index": selected_index}
-
-        kb = KeyBindings()
-
-        @kb.add("up", eager=True)
-        def _up(event):
-            state["index"] = max(0, state["index"] - 1)
-            event.app.invalidate()
-
-        @kb.add("down", eager=True)
-        def _down(event):
-            state["index"] = min(len(values) - 1, state["index"] + 1)
-            event.app.invalidate()
-
-        @kb.add("enter", eager=True)
-        def _select(event):
-            event.app.exit(result=values[state["index"]][0])
-
-        if allow_cancel:
-
-            @kb.add("escape", eager=True)
-            def _cancel(event):
-                event.app.exit(result=None)
-
-        def get_content():
-            """Build status bar style content for selection UI."""
-            import html as html_module
-            from prompt_toolkit.formatted_text import merge_formatted_text
-
-            lines = []
-
-            # Title line with status bar style
-            title_text = title or prompt
-            if title_text:
-                # Escape special characters for HTML
-                safe_title = html_module.escape(title_text)
-                lines.append(HTML(f'<style fg="cyan" bg="ansiblack">{safe_title}</style>\n'))
-
-            # Option lines with status bar style (gray background)
-            for idx, (value, label) in enumerate(values):
-                # Escape special characters for HTML
-                safe_label = html_module.escape(label)
-                if idx == state["index"]:
-                    # Selected: cyan foreground, bold, with arrow
-                    lines.append(
-                        HTML(f'<style fg="cyan" bg="ansiblack" bold="">  ➤ {safe_label}</style>\n')
-                    )
-                else:
-                    # Unselected: dim foreground
-                    lines.append(HTML(f'<style fg="gray" bg="ansiblack">    {safe_label}</style>\n'))
-
-            # Hint line with status bar style
-            hint_parts = ["  "]
-            hint_parts.append("↑↓ Select")
-            hint_parts.append(" · Enter Confirm")
-            if allow_cancel:
-                hint_parts.append(" · Esc Cancel")
-            hint = "".join(hint_parts)
-            lines.append(HTML(f'<style fg="gray" bg="ansiblack">{hint}</style>'))
-
-            return merge_formatted_text(lines)
-
-        # Create a dynamic control that updates on each render
-        control = FormattedTextControl(get_content)
-        window = Window(content=control, dont_extend_height=True, style="class:status-bar")
-        root = HSplit([window])
-
-        # Style with status bar appearance
-        style = Style.from_dict(
-            {
-                "status-bar": "bg:#1e1e1e",
-            }
-        )
-
-        app = Application(
-            layout=Layout(root),
-            key_bindings=kb,
-            full_screen=False,
-            style=style,
-        )
-
-        try:
-            app.input.flush()
-            app.input.flush_keys()
-        except Exception:
-            pass
-
-        selected_value = app.run(in_thread=True)
-
-    except KeyboardInterrupt:
-        raise
-    except Exception:
-        selected_value = None
-
-    # Mutate event.data so LLMSession can read the selection
-    try:
-        event.data["selected_value"] = selected_value
+        apply_interaction_response_to_data(data, response)
     except Exception:
         pass
 

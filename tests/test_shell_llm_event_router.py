@@ -27,18 +27,18 @@ def test_router_uses_handler_for_confirmation_event():
 def test_router_uses_handler_for_ask_user_event():
     router = LLMEventRouter(
         {
-            LLMEventType.ASK_USER_REQUIRED: lambda _event: LLMCallbackResult.CANCEL,
+            LLMEventType.INTERACTION_REQUIRED: lambda _event: LLMCallbackResult.CANCEL,
         }
     )
-    result = router.handle(make_event(LLMEventType.ASK_USER_REQUIRED))
+    result = router.handle(make_event(LLMEventType.INTERACTION_REQUIRED))
     assert result == LLMCallbackResult.CANCEL
 
 
 def test_router_ignores_non_callback_result_for_ask_user():
     router = LLMEventRouter(
         {
-            LLMEventType.ASK_USER_REQUIRED: lambda _event: "ignored",
+            LLMEventType.INTERACTION_REQUIRED: lambda _event: "ignored",
         }
     )
-    result = router.handle(make_event(LLMEventType.ASK_USER_REQUIRED))
+    result = router.handle(make_event(LLMEventType.INTERACTION_REQUIRED))
     assert result == LLMCallbackResult.CONTINUE

@@ -24,7 +24,7 @@ class LLMEventRouter:
         result = handler(event)
         if event.event_type in {
             LLMEventType.TOOL_CONFIRMATION_REQUIRED,
-            LLMEventType.ASK_USER_REQUIRED,
+            LLMEventType.INTERACTION_REQUIRED,
         }:
             if isinstance(result, LLMCallbackResult):
                 return result

@@ -12,6 +12,8 @@ import pytest
 
 from aish.config import ConfigModel
 from aish.context_manager import MemoryType
+from aish.interaction import AskUserRequestBuilder
+from aish.llm import LLMCallbackResult, LLMEvent, LLMEventType
 from aish.providers.openai_codex import OPENAI_CODEX_PROVIDER_ADAPTER
 from aish.security.security_manager import SecurityDecision
 from aish.security.security_policy import RiskLevel
@@ -84,6 +86,40 @@ class TestAIShell:
         config = ConfigModel(model="gpt-4")
         shell = make_shell(config)
         assert shell.llm_session.model == "gpt-4"
+
+    @pytest.mark.parametrize(
+        ("kind", "custom"),
+        [
+            ("single_select", None),
+            ("choice_or_text", {"label": "Other"}),
+        ],
+    )
+    def test_handle_interaction_required_uses_single_prompt_ui(self, kind, custom):
+        config = ConfigModel(model="test-model")
+        shell = make_shell(config)
+        request = AskUserRequestBuilder.from_tool_args(
+            kind=kind,
+            prompt="pick one",
+            options=[
+                {"value": "a", "label": "A"},
+                {"value": "b", "label": "B"},
+            ],
+            custom=custom,
+        )
+        event = LLMEvent(
+            event_type=LLMEventType.INTERACTION_REQUIRED,
+            data={"interaction_request": request.to_dict()},
+            timestamp=0.0,
+        )
+
+        with patch(
+            "aish.shell._prompt_handle_interaction_required",
+            return_value=LLMCallbackResult.CONTINUE,
+        ) as mock_modal:
+            result = shell.handle_interaction_required(event)
+
+        assert result == LLMCallbackResult.CONTINUE
+        mock_modal.assert_called_once_with(shell, event)
 
     @pytest.mark.asyncio
     async def test_model_command_show_current(self):

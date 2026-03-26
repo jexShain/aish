@@ -196,8 +196,8 @@ shell:
   ask_user:
     title: "Option auswählen"
     custom_label: "Benutzerdefiniert:"
-    hint_select: "↑/↓ zum Bewegen • Enter zum Bestätigen • Esc zum Abbrechen"
-    hint_custom: "Zum Eingeben tippen • Enter zum Bestätigen • Tab zu den Optionen • Esc zum Abbrechen"
+    hint_select: "Enter zum Auswählen · ↑/↓ zum Navigieren · Esc zum Abbrechen"
+    hint_custom: "Enter zum Auswählen · ↑/↓ zum Navigieren · Esc zum Abbrechen"
     paused:
       title: "⏸ Benutzereingabe erforderlich (Aufgabe pausiert)"
       prompt: "Frage: {prompt}"

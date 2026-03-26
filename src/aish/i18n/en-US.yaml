@@ -298,15 +298,15 @@ shell:
   ask_user:
     title: "Select an option"
     custom_label: "Custom:"
-    hint_select: "↑/↓ to move • Enter to confirm • Esc to cancel"
-    hint_custom: "Type to input custom value • Enter to confirm • Tab to options • Esc to cancel"
+    hint_select: "Enter to confirm · ↑/↓ to navigate · Esc to cancel"
+    hint_custom: "Enter to confirm · ↑/↓ to navigate · Esc to cancel"
     paused:
       title: "⏸ User input required (task paused)"
       prompt: "Question: {prompt}"
       reason: "Reason: {reason}"
       options_header: "Options:"
       custom_input: "You can also reply with any custom value."
-      how_to: "Reply with an option value (or number), or type `; continue with default` (default: {default})."
+      how_to: "Reply with an option value (or number), or type `; continue with default` (default: {default}). Option descriptions are shown beneath each choice when available."
 
   diagnose_cancelled: "  └─ ❌ System diagnosis cancelled"
 

@@ -1,16 +1,21 @@
 from __future__ import annotations
 
-import json
-import sys
-from typing import Callable, Optional
+from collections.abc import Callable
 
-from aish.i18n import t
+from aish.interaction import (
+    AskUserRequestBuilder,
+    AskUserInteractionAdapter,
+    InteractionKind,
+    InteractionRequest,
+    InteractionResponse,
+    InteractionService,
+)
 from aish.tools.base import ToolBase
 from aish.tools.result import ToolResult
 
 
 class AskUserTool(ToolBase):
-    """Ask the user to choose one option.
+    """Ask the user for structured input.
 
     Cancellation or unavailable interactive UI MUST pause the task and ask the user
     to decide how to proceed (manual selection or continue with default).
@@ -18,14 +23,18 @@ class AskUserTool(ToolBase):
 
     def __init__(
         self,
-        request_choice: Callable[[dict], tuple[Optional[str], str]],
+        request_interaction: Callable[[InteractionRequest], InteractionResponse],
     ) -> None:
         super().__init__(
             name="ask_user",
             description=(
                 "\n".join(
                     [
-                        "Ask the user to choose one option from a list.",
+                        "Ask the user for one of three interaction kinds:",
+                        "- single_select: choose exactly one predefined option.",
+                        "- text_input: enter free-form text only.",
+                        "- choice_or_text: choose a predefined option or enter custom text.",
+                        "Returns structured output so callers can distinguish selected options from custom text.",
                         "If the UI is unavailable or the user cancels, the task will pause and require user input.",
                     ]
                 )
@@ -33,13 +42,22 @@ class AskUserTool(ToolBase):
             parameters={
                 "type": "object",
                 "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Optional interaction id. If omitted, one is generated.",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["single_select", "text_input", "choice_or_text"],
+                        "description": "Interaction type: single_select, text_input, or choice_or_text.",
+                    },
                     "prompt": {
                         "type": "string",
                         "description": "Question/description shown to the user.",
                     },
                     "options": {
                         "type": "array",
-                        "description": "List of options to choose from (must be non-empty).",
+                        "description": "Predefined options. Required for single_select and choice_or_text; omit for text_input.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -53,230 +71,105 @@ class AskUserTool(ToolBase):
                     },
                     "default": {
                         "type": "string",
-                        "description": "Default option value used when user chooses to continue with default later.",
+                        "description": "Default value used when present and valid for the interaction kind.",
                     },
                     "title": {
                         "type": "string",
                         "description": "Optional UI title.",
+                    },
+                    "required": {
+                        "type": "boolean",
+                        "description": "Whether answering is required.",
+                        "default": True,
                     },
                     "allow_cancel": {
                         "type": "boolean",
                         "description": "Whether user can cancel/ESC.",
                         "default": True,
                     },
-                    "cancel_hint": {
-                        "type": "string",
-                        "description": "Optional custom hint shown when the tool pauses due to cancel/unavailable.",
+                    "metadata": {
+                        "type": "object",
+                        "description": "Optional metadata carried with the interaction request.",
+                        "additionalProperties": True,
                     },
-                    "allow_custom_input": {
-                        "type": "boolean",
-                        "description": "Whether to allow the user to input a custom value.",
-                        "default": False,
-                    },
-                    "custom_label": {
+                    "placeholder": {
                         "type": "string",
-                        "description": "Label for the custom input option (when allow_custom_input=true).",
+                        "description": "Placeholder text for text_input, or fallback placeholder for choice_or_text custom input.",
                     },
-                    "custom_prompt": {
-                        "type": "string",
-                        "description": "Prompt shown when asking for a custom input value.",
+                    "validation": {
+                        "type": "object",
+                        "description": "Optional validation config for text input interactions.",
+                        "properties": {
+                            "required": {"type": "boolean"},
+                            "min_length": {"type": "integer"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    "custom": {
+                        "type": "object",
+                        "description": "Custom text entry config for choice_or_text interactions. Do not provide this for single_select.",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "placeholder": {"type": "string"},
+                            "submit_mode": {"type": "string"},
+                        },
+                        "additionalProperties": False,
                     },
                 },
-                "required": ["prompt", "options"],
+                "required": ["kind", "prompt"],
             },
         )
-        self._request_choice = request_choice
-
-    @staticmethod
-    def _normalize_options(options: object) -> list[dict[str, str]]:
-        if not isinstance(options, list):
-            return []
-        normalized: list[dict[str, str]] = []
-        for item in options:
-            if not isinstance(item, dict):
-                continue
-            value = item.get("value")
-            label = item.get("label")
-            if not isinstance(value, str) or not value.strip():
-                continue
-            if not isinstance(label, str) or not label.strip():
-                continue
-            normalized.append({"value": value.strip(), "label": label.strip()})
-        return normalized
-
-    @staticmethod
-    def _pick_default(default: object, options: list[dict[str, str]]) -> str:
-        if options:
-            fallback = options[0]["value"]
-        else:
-            fallback = ""
-        if isinstance(default, str) and default in {o["value"] for o in options}:
-            return default
-        return fallback
-
-    def _build_pause_message(
-        self,
-        *,
-        prompt: str,
-        options: list[dict[str, str]],
-        default_value: str,
-        reason: str,
-        cancel_hint: str | None,
-        allow_custom_input: bool,
-    ) -> str:
-        lines: list[str] = []
-        lines.append(t("shell.ask_user.paused.title"))
-        lines.append(t("shell.ask_user.paused.prompt", prompt=prompt))
-        lines.append(t("shell.ask_user.paused.reason", reason=reason))
-        lines.append(t("shell.ask_user.paused.options_header"))
-        for idx, opt in enumerate(options, start=1):
-            lines.append(f"  {idx}. {opt['label']} ({opt['value']})")
-        if allow_custom_input:
-            lines.append(t("shell.ask_user.paused.custom_input"))
-        if cancel_hint and str(cancel_hint).strip():
-            lines.append("")
-            lines.append(str(cancel_hint).strip())
-        lines.append("")
-        lines.append(
-            t(
-                "shell.ask_user.paused.how_to",
-                default=default_value,
-            )
+        self._interaction_service = InteractionService(
+            renderer=request_interaction
         )
-        lines.append("")
-        # Include structured context to help the model reliably continue on the next user turn.
-        context = {
-            "kind": "ask_user_context",
-            "prompt": prompt,
-            "default": default_value,
-            "options": options,
-            "suggested_continue_commands": [
-                "; continue with default",
-                "; 使用默认继续",
-            ],
-        }
-        lines.append("```json")
-        lines.append(json.dumps(context, ensure_ascii=False))
-        lines.append("```")
-        return "\n".join(lines).strip()
 
     def __call__(
         self,
+        kind: str,
         prompt: str,
-        options: list[dict],
+        options: list[dict] | None = None,
         default: str | None = None,
         title: str | None = None,
+        required: bool = True,
         allow_cancel: bool = True,
-        cancel_hint: str | None = None,
-        allow_custom_input: bool = False,
-        custom_label: str | None = None,
-        custom_prompt: str | None = None,
+        metadata: dict | None = None,
+        placeholder: str | None = None,
+        validation: dict | None = None,
+        custom: dict | None = None,
+        id: str | None = None,
     ) -> ToolResult:
-        normalized_options = self._normalize_options(options)
-        if not normalized_options:
+        request = AskUserRequestBuilder.from_tool_args(
+            kind=kind,
+            prompt=prompt,
+            options=options,
+            default=default,
+            title=title,
+            required=required,
+            allow_cancel=allow_cancel,
+            metadata=metadata,
+            placeholder=placeholder,
+            validation=validation,
+            custom=custom,
+            interaction_id=id,
+        )
+
+        if request.kind not in {
+            InteractionKind.SINGLE_SELECT,
+            InteractionKind.TEXT_INPUT,
+            InteractionKind.CHOICE_OR_TEXT,
+        }:
             return ToolResult(
                 ok=False,
-                output="Error: options must be a non-empty list of {value,label}.",
+                output=f"Error: unsupported ask_user kind: {request.kind.value}.",
                 meta={"kind": "invalid_args"},
             )
 
-        default_value = self._pick_default(default, normalized_options)
-
-        # Fast fail for non-interactive environments.
-        if not (sys.stdin.isatty() and sys.stdout.isatty()):
-            reason = "unavailable"
-            pause_text = self._build_pause_message(
-                prompt=prompt,
-                options=normalized_options,
-                default_value=default_value,
-                reason=reason,
-                cancel_hint=cancel_hint,
-                allow_custom_input=allow_custom_input,
-            )
+        if not request.options and request.kind != InteractionKind.TEXT_INPUT:
             return ToolResult(
                 ok=False,
-                output=pause_text,
-                meta={
-                    "kind": "user_input_required",
-                    "reason": reason,
-                    "prompt": prompt,
-                    "default": default_value,
-                    "options": normalized_options,
-                },
-                stop_tool_chain=True,
+                output="Error: options must be a non-empty list of {value,label} for selection interactions.",
+                meta={"kind": "invalid_args"},
             )
 
-        try:
-            selected, status = self._request_choice(
-                {
-                    "prompt": prompt,
-                    "options": normalized_options,
-                    "default": default_value,
-                    "title": title,
-                    "allow_cancel": bool(allow_cancel),
-                    "allow_custom_input": bool(allow_custom_input),
-                    "custom_label": custom_label,
-                    "custom_prompt": custom_prompt,
-                }
-            )
-        except KeyboardInterrupt:
-            raise
-        except Exception:
-            selected, status = None, "error"
-
-        allowed_values = {o["value"] for o in normalized_options}
-        if isinstance(selected, str) and selected in allowed_values:
-            label_lookup = {o["value"]: o["label"] for o in normalized_options}
-            label = label_lookup.get(selected, selected)
-            # Return a clear, LLM-friendly message instead of JSON
-            # Store the structured data in the data field for potential future use
-            return ToolResult(
-                ok=True,
-                output=f"User selected: {label}",
-                data={
-                    "value": selected,
-                    "label": label,
-                    "status": "selected",
-                },
-            )
-        if (
-            allow_custom_input
-            and isinstance(selected, str)
-            and selected.strip()
-            and selected not in allowed_values
-        ):
-            return ToolResult(
-                ok=True,
-                output=f"User input: {selected}",
-                data={
-                    "value": selected,
-                    "label": selected,
-                    "status": "custom",
-                },
-            )
-
-        reason = (
-            "cancelled"
-            if status == "cancelled"
-            else ("unavailable" if status == "unavailable" else "error")
-        )
-        pause_text = self._build_pause_message(
-            prompt=prompt,
-            options=normalized_options,
-            default_value=default_value,
-            reason=reason,
-            cancel_hint=cancel_hint,
-            allow_custom_input=allow_custom_input,
-        )
-        return ToolResult(
-            ok=False,
-            output=pause_text,
-            meta={
-                "kind": "user_input_required",
-                "reason": reason,
-                "prompt": prompt,
-                "default": default_value,
-                "options": normalized_options,
-            },
-            stop_tool_chain=True,
-        )
+        response = self._interaction_service.request(request)
+        return AskUserInteractionAdapter.to_tool_result(request, response)

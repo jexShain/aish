@@ -16,6 +16,7 @@ from aish.cancellation import CancellationReason, CancellationToken
 from aish.config import ConfigModel
 from aish.context_manager import ContextManager, MemoryType
 from aish.exception import is_litellm_exception, redact_secrets
+from aish.interaction import InteractionRequest, InteractionResponse, InteractionStatus
 from aish.interruption import ShellState
 from aish.litellm_loader import load_litellm
 from aish.providers.registry import get_provider_for_model
@@ -76,7 +77,7 @@ class LLMEventType(Enum):
     TOOL_EXECUTION_END = "tool_execution_end"
     ERROR = "error"
     TOOL_CONFIRMATION_REQUIRED = "tool_confirmation_required"
-    ASK_USER_REQUIRED = "ask_user_required"
+    INTERACTION_REQUIRED = "interaction_required"
     CANCELLED = "cancelled"
 
 
@@ -362,7 +363,7 @@ class LLMSession:
             self.edit_file_tool = EditFileTool()
             from aish.tools.ask_user import AskUserTool
 
-            self.ask_user_tool = AskUserTool(request_choice=self.request_user_choice)
+            self.ask_user_tool = AskUserTool(request_interaction=self.request_interaction)
             self.skill_tool = SkillTool(
                 skill_manager=self.skill_manager,
                 prompt_manager=self.prompt_manager,
@@ -759,37 +760,55 @@ class LLMSession:
             # If any error occurs during confirmation, use default
             return default_on_timeout
 
-    def request_user_choice(self, data: dict) -> tuple[str | None, str]:
-        """Request a user choice via the shell UI.
-
-        Returns:
-            (selected_value, status)
-            status in {"selected","cancelled","unavailable","error"}.
-        """
+    def request_interaction(
+        self,
+        request: InteractionRequest,
+    ) -> InteractionResponse:
+        """Request a user interaction via the shell UI."""
         # Non-interactive / no UI callback available.
         if not self.event_callback:
-            return None, "unavailable"
+            return InteractionResponse(
+                interaction_id=request.id,
+                status=InteractionStatus.UNAVAILABLE,
+                reason="unavailable",
+            )
 
         try:
             import sys
 
             if not (sys.stdin.isatty() and sys.stdout.isatty()):
-                return None, "unavailable"
+                return InteractionResponse(
+                    interaction_id=request.id,
+                    status=InteractionStatus.UNAVAILABLE,
+                    reason="unavailable",
+                )
         except Exception:
             # Conservatively treat as unavailable.
-            return None, "unavailable"
+            return InteractionResponse(
+                interaction_id=request.id,
+                status=InteractionStatus.UNAVAILABLE,
+                reason="unavailable",
+            )
 
         try:
-            # Shell handler is expected to mutate data["selected_value"].
-            self.emit_event(LLMEventType.ASK_USER_REQUIRED, data)
-            selected_value = data.get("selected_value")
-            if isinstance(selected_value, str) and selected_value:
-                return selected_value, "selected"
-            return None, "cancelled"
+            event_data = {"interaction_request": request.to_dict()}
+            self.emit_event(LLMEventType.INTERACTION_REQUIRED, event_data)
+            response_payload = event_data.get("interaction_response")
+            if isinstance(response_payload, dict):
+                return InteractionResponse.from_dict(response_payload)
+            return InteractionResponse(
+                interaction_id=request.id,
+                status=InteractionStatus.CANCELLED,
+                reason="cancelled",
+            )
         except KeyboardInterrupt:
             raise
         except Exception:
-            return None, "error"
+            return InteractionResponse(
+                interaction_id=request.id,
+                status=InteractionStatus.UNAVAILABLE,
+                reason="error",
+            )
 
     def _get_langfuse_metadata(self, generation_type: str) -> dict:
         """Generate Langfuse metadata for better observability"""

@@ -29,7 +29,7 @@ Important:
 - NEVER just announce or mention a skill in your text response without actually calling this tool
 - This is a BLOCKING REQUIREMENT: invoke the relevant Skill tool BEFORE generating any other response about the task
 - Do not invoke a skill that is already running
-- If a skill requires user feedback/choice, use the `ask_user` tool. You can enable custom input via `allow_custom_input`. If the user cancels or UI is unavailable, the task pauses
+- If a skill requires user feedback/choice, use the `ask_user` tool with explicit interaction kinds: `single_select` for strict option-only choice, `text_input` for free text only, and `choice_or_text` for option-or-custom input. Use `custom` only with `choice_or_text`. If the user cancels or UI is unavailable, the task pauses
 </skills_instructions>
 """
 

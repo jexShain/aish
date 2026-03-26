@@ -96,27 +96,58 @@ AI 在调用 Skill 时遵循以下规范：
 
 ```json
 {
+  "kind": "choice_or_text",
   "prompt": "请选择下一步操作",
   "options": [
-    {"value": "a", "label": "方案 A"},
-    {"value": "b", "label": "方案 B"}
+    {"value": "a", "label": "方案 A", "description": "适合风险较低、改动较小的情况"},
+    {"value": "b", "label": "方案 B", "description": "适合需要更完整验证的情况"}
   ],
   "default": "a",
   "title": "选择",
   "allow_cancel": true,
-  "allow_custom_input": true,
-  "custom_label": "其他（自行输入）",
-  "custom_prompt": "请输入自定义内容"
+  "custom": {
+    "label": "其他（自行输入）",
+    "placeholder": "请输入自定义内容"
+  }
 }
 ```
 
+推荐约定：
+
+- `single_select`：只能选择预设项，不要传 `custom`
+- `text_input`：只允许自由输入，不要传 `options`
+- `choice_or_text`：既给 `options`，也给 `custom`，用于“候选项可能不完整”的场景
+
 ### ask_user 返回
 
-- 用户选中某项：返回 JSON（`status=selected`）
+- 用户选中某项：返回结构化结果（`status=selected`），并保留选中的 value/label
+- 用户输入自定义内容：返回结构化结果（`status=custom`），并保留输入文本；可通过 `answer_type=text` 区分于预设选项
 - 用户取消或交互不可用：任务会暂停并提示用户继续方式。你可以：
   - 直接回复选项 value/编号/文字
   - 输入 `; 使用默认继续`（或 `; continue with default`）明确使用默认值继续
-- 若启用 `allow_custom_input`，UI 会提供“自定义输入”行，用户可直接输入内容并回车，返回 `status=custom`
+- 若使用 `choice_or_text`，会显示支持自定义输入的对话框；用户可直接输入内容并回车，返回 `status=custom`
+- 若为选项提供 `description`，UI 和暂停提示会把说明展示在选项下方
+
+### 推荐调用示例
+
+```json
+{
+  "kind": "choice_or_text",
+  "prompt": "请选择一个水果，或输入列表中没有的水果",
+  "title": "水果选择",
+  "options": [
+    {"value": "apple", "label": "苹果"},
+    {"value": "banana", "label": "香蕉"},
+    {"value": "orange", "label": "橙子"}
+  ],
+  "default": "apple",
+  "custom": {
+    "label": "其他水果",
+    "placeholder": "输入自定义水果名称"
+  },
+  "allow_cancel": true
+}
+```
 
 ## 开发新 Skill
 

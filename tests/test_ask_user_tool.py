@@ -5,6 +5,10 @@ import pytest
 
 from aish.config import ConfigModel
 from aish.context_manager import ContextManager
+from aish.interaction import (InteractionAnswer, InteractionAnswerType,
+                              InteractionKind, InteractionRequest,
+                              InteractionResponse, InteractionSource,
+                              InteractionStatus)
 from aish.llm import (LLMCallbackResult, LLMSession, ToolDispatchOutcome,
                       ToolDispatchStatus)
 from aish.skills import SkillManager
@@ -18,13 +22,22 @@ def test_ask_user_tool_selected(monkeypatch):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
 
-    def request_choice(data):
-        assert data["prompt"] == "pick one"
-        assert data["default"] == "a"
-        return "b", "selected"
+    def request_interaction(request: InteractionRequest) -> InteractionResponse:
+        assert request.prompt == "pick one"
+        assert request.default == "a"
+        return InteractionResponse(
+            interaction_id=request.id,
+            status=InteractionStatus.SUBMITTED,
+            answer=InteractionAnswer(
+                type=InteractionAnswerType.OPTION,
+                value="b",
+                label="B",
+            ),
+        )
 
-    tool = AskUserTool(request_choice=request_choice)
+    tool = AskUserTool(request_interaction=request_interaction)
     result = tool(
+        kind="single_select",
         prompt="pick one",
         options=[
             {"value": "a", "label": "A"},
@@ -45,14 +58,19 @@ def test_ask_user_tool_cancelled_pauses(monkeypatch):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
 
-    def request_choice(_data):
-        return None, "cancelled"
+    def request_interaction(request: InteractionRequest) -> InteractionResponse:
+        return InteractionResponse(
+            interaction_id=request.id,
+            status=InteractionStatus.CANCELLED,
+            reason="cancelled",
+        )
 
-    tool = AskUserTool(request_choice=request_choice)
+    tool = AskUserTool(request_interaction=request_interaction)
     result = tool(
+        kind="single_select",
         prompt="pick one",
         options=[
-            {"value": "a", "label": "A"},
+            {"value": "a", "label": "A", "description": "Alpha option"},
             {"value": "b", "label": "B"},
         ],
         default="a",
@@ -62,6 +80,43 @@ def test_ask_user_tool_cancelled_pauses(monkeypatch):
     assert result.meta.get("kind") == "user_input_required"
     assert result.meta.get("reason") == "cancelled"
     assert "continue with default" in result.output
+    assert "Alpha option" in result.output
+
+
+def test_ask_user_tool_preserves_option_descriptions(monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    captured: dict[str, object] = {}
+
+    def request_interaction(request: InteractionRequest) -> InteractionResponse:
+        captured.update(request.to_dict())
+        return InteractionResponse(
+            interaction_id=request.id,
+            status=InteractionStatus.SUBMITTED,
+            answer=InteractionAnswer(
+                type=InteractionAnswerType.OPTION,
+                value="a",
+                label="A",
+            ),
+        )
+
+    tool = AskUserTool(request_interaction=request_interaction)
+    result = tool(
+        kind="single_select",
+        prompt="pick one",
+        options=[
+            {"value": "a", "label": "A", "description": "Alpha option"},
+            {"value": "b", "label": "B"},
+        ],
+        default="a",
+    )
+
+    assert result.ok is True
+    assert captured["options"] == [
+        {"value": "a", "label": "A", "description": "Alpha option"},
+        {"value": "b", "label": "B"},
+    ]
 
 
 def test_ask_user_tool_unavailable_pauses():
@@ -69,8 +124,19 @@ def test_ask_user_tool_unavailable_pauses():
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
-    tool = AskUserTool(request_choice=lambda _data: ("a", "selected"))
+    tool = AskUserTool(
+        request_interaction=lambda request: InteractionResponse(
+            interaction_id=request.id,
+            status=InteractionStatus.SUBMITTED,
+            answer=InteractionAnswer(
+                type=InteractionAnswerType.OPTION,
+                value="a",
+                label="A",
+            ),
+        )
+    )
     result = tool(
+        kind="single_select",
         prompt="pick one",
         options=[
             {"value": "a", "label": "A"},
@@ -88,17 +154,25 @@ def test_ask_user_tool_custom_input_allowed(monkeypatch):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
 
-    def request_choice(_data):
-        return "mango", "selected"
+    def request_interaction(request: InteractionRequest) -> InteractionResponse:
+        return InteractionResponse(
+            interaction_id=request.id,
+            status=InteractionStatus.SUBMITTED,
+            answer=InteractionAnswer(
+                type=InteractionAnswerType.TEXT,
+                value="mango",
+            ),
+        )
 
-    tool = AskUserTool(request_choice=request_choice)
+    tool = AskUserTool(request_interaction=request_interaction)
     result = tool(
+        kind="choice_or_text",
         prompt="pick one",
         options=[
             {"value": "a", "label": "A"},
             {"value": "b", "label": "B"},
         ],
-        allow_custom_input=True,
+        custom={"label": "Other"},
     )
 
     assert result.ok is True
@@ -106,6 +180,120 @@ def test_ask_user_tool_custom_input_allowed(monkeypatch):
     assert result.output == "User input: mango"
     assert payload["value"] == "mango"
     assert payload["status"] == "custom"
+    assert payload["answer_type"] == "text"
+
+
+def test_ask_user_tool_text_input_mode(monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    def request_interaction(request: InteractionRequest) -> InteractionResponse:
+        assert request.kind == InteractionKind.TEXT_INPUT
+        assert request.options == []
+        assert request.placeholder == "Enter fruit name"
+        return InteractionResponse(
+            interaction_id=request.id,
+            status=InteractionStatus.SUBMITTED,
+            answer=InteractionAnswer(
+                type=InteractionAnswerType.TEXT,
+                value="dragonfruit",
+            ),
+        )
+
+    tool = AskUserTool(request_interaction=request_interaction)
+    result = tool(
+        kind="text_input",
+        prompt="Type a fruit",
+        placeholder="Enter fruit name",
+    )
+
+    assert result.ok is True
+    payload = result.data
+    assert result.output == "User input: dragonfruit"
+    assert payload["value"] == "dragonfruit"
+    assert payload["status"] == "custom"
+    assert payload["answer_type"] == "text"
+
+
+def test_request_interaction_prefers_standard_response(monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    config = ConfigModel(model="test-model", api_key="test-key")
+
+    def event_callback(event):
+        event.data["interaction_response"] = {
+            "interaction_id": "interaction_1",
+            "status": "submitted",
+            "answer": {
+                "type": "option",
+                "value": "b",
+                "label": "B",
+            },
+        }
+        return LLMCallbackResult.CONTINUE
+
+    session = LLMSession(
+        config=config,
+        skill_manager=SkillManager(),
+        event_callback=event_callback,
+    )
+
+    response = session.request_interaction(
+        InteractionRequest.from_dict(
+            {
+                "id": "interaction_1",
+                "kind": "single_select",
+                "prompt": "pick one",
+                "required": True,
+                "allow_cancel": True,
+                "source": {"type": "tool", "name": "ask_user"},
+                "metadata": {},
+                "options": [
+                    {"value": "a", "label": "A"},
+                    {"value": "b", "label": "B"},
+                ],
+            }
+        )
+    )
+
+    assert response.status.value == "submitted"
+    assert response.answer is not None
+    assert response.answer.type == InteractionAnswerType.OPTION
+    assert response.answer.value == "b"
+
+
+def test_request_interaction_returns_cancelled_without_response(monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    config = ConfigModel(model="test-model", api_key="test-key")
+
+    def event_callback(event):
+        return LLMCallbackResult.CONTINUE
+
+    session = LLMSession(
+        config=config,
+        skill_manager=SkillManager(),
+        event_callback=event_callback,
+    )
+
+    response = session.request_interaction(
+        InteractionRequest.from_dict(
+            {
+                "id": "interaction_2",
+                "kind": "single_select",
+                "prompt": "pick one",
+                "required": True,
+                "allow_cancel": True,
+                "source": {"type": "tool", "name": "ask_user"},
+                "metadata": {},
+                "options": [{"value": "a", "label": "A"}],
+            }
+        )
+    )
+
+    assert response.status == InteractionStatus.CANCELLED
 
 
 @pytest.mark.anyio
@@ -118,7 +306,10 @@ async def test_handle_tool_calls_ask_user_user_input_required_breaks(monkeypatch
         {
             "id": "call_1",
             "type": "function",
-            "function": {"name": "ask_user", "arguments": "{}"},
+            "function": {
+                "name": "ask_user",
+                "arguments": '{"kind":"single_select","prompt":"pick one","options":[{"value":"a","label":"A"}]}'
+            },
         },
         {
             "id": "call_2",

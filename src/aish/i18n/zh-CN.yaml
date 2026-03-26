@@ -298,15 +298,15 @@ shell:
   ask_user:
     title: "请选择"
     custom_label: "自定义："
-    hint_select: "↑/↓ 选择 • Enter 确认 • Esc 取消"
-    hint_custom: "直接输入自定义内容 • Enter 确认 • Tab 切换选项 • Esc 取消"
+    hint_select: "按 Enter 键选择 · 按 ↑/↓ 键导航 · 按 Esc 键取消"
+    hint_custom: "按 Enter 键选择 · 按 ↑/↓ 键导航 · 按 Esc 键取消"
     paused:
       title: "⏸ 需要你的选择（任务已暂停）"
       prompt: "问题：{prompt}"
       reason: "原因：{reason}"
       options_header: "可选项："
       custom_input: "你也可以直接回复任意自定义内容。"
-      how_to: "你可以直接回复选项 value（或编号），或输入 `; 使用默认继续` / `; continue with default`（默认：{default}）。"
+      how_to: "你可以直接回复选项 value（或编号），或输入 `; 使用默认继续` / `; continue with default`（默认：{default}）。如有选项说明，会显示在选项下方。"
 
   diagnose_cancelled: "  └─ ❌ 系统诊断已取消"
 

@@ -6,10 +6,11 @@ from unittest.mock import patch
 
 from rich.console import Console
 
+from aish.interaction import AskUserRequestBuilder
 from aish.llm import LLMCallbackResult, LLMEvent, LLMEventType
 from aish.shell_enhanced.shell_prompt_io import (
     display_security_panel,
-    handle_ask_user_required,
+    handle_interaction_required,
     handle_tool_confirmation_required,
 )
 
@@ -50,21 +51,21 @@ class _DummyShell:
         return False
 
 
-def test_handle_ask_user_required_sets_selected_value():
+def test_handle_interaction_required_sets_interaction_response():
     shell = _DummyShell()
+    request = AskUserRequestBuilder.from_tool_args(
+        kind="choice_or_text",
+        prompt="Pick one",
+        options=[
+            {"value": "opt1", "label": "Option 1"},
+            {"value": "opt2", "label": "Option 2"},
+        ],
+        default="opt1",
+        custom={"label": "Other", "placeholder": "This is intentionally very long to avoid squeezing input space"},
+    )
     event = LLMEvent(
-        event_type=LLMEventType.ASK_USER_REQUIRED,
-        data={
-            "prompt": "Pick one",
-            "options": [
-                {"value": "opt1", "label": "Option 1"},
-                {"value": "opt2", "label": "Option 2"},
-            ],
-            "default": "opt1",
-            "allow_cancel": True,
-            "allow_custom_input": True,
-            "custom_prompt": "This is intentionally very long to avoid squeezing input space",
-        },
+        event_type=LLMEventType.INTERACTION_REQUIRED,
+        data={"interaction_request": request.to_dict()},
         timestamp=time.time(),
     )
 
@@ -86,10 +87,98 @@ def test_handle_ask_user_required_sets_selected_value():
             return "opt2"
 
     with patch("prompt_toolkit.Application", _DummyApp):
-        result = handle_ask_user_required(shell, event)
+        result = handle_interaction_required(shell, event)
 
     assert result == LLMCallbackResult.CONTINUE
-    assert event.data.get("selected_value") == "opt2"
+    response_payload = event.data.get("interaction_response")
+    assert isinstance(response_payload, dict)
+    assert response_payload.get("interaction_id") == request.id
+    assert response_payload.get("answer", {}).get("value") == "opt2"
+
+
+def test_handle_interaction_required_reads_interaction_request_payload():
+    shell = _DummyShell()
+    request = AskUserRequestBuilder.from_tool_args(
+        kind="single_select",
+        prompt="Pick one",
+        options=[
+            {"value": "opt1", "label": "Option 1"},
+            {"value": "opt2", "label": "Option 2", "description": "Second option"},
+        ],
+        default="opt1",
+    )
+    event = LLMEvent(
+        event_type=LLMEventType.INTERACTION_REQUIRED,
+        data={"interaction_request": request.to_dict()},
+        timestamp=time.time(),
+    )
+
+    class _DummyApp:
+        def __init__(self, *args, **kwargs) -> None:
+            class _Input:
+                @staticmethod
+                def flush() -> None:
+                    return
+
+                @staticmethod
+                def flush_keys() -> None:
+                    return
+
+            self.input = _Input()
+
+        def run(self, in_thread: bool = True) -> str:
+            _ = in_thread
+            return "opt2"
+
+    with patch("prompt_toolkit.Application", _DummyApp):
+        result = handle_interaction_required(shell, event)
+
+    assert result == LLMCallbackResult.CONTINUE
+    response_payload = event.data.get("interaction_response")
+    assert isinstance(response_payload, dict)
+    assert response_payload.get("interaction_id") == request.id
+    assert response_payload.get("status") == "submitted"
+
+
+def test_handle_interaction_required_supports_text_input():
+    shell = _DummyShell()
+    request = AskUserRequestBuilder.from_tool_args(
+        kind="text_input",
+        prompt="Type a fruit",
+        placeholder="Enter fruit name",
+    )
+    event = LLMEvent(
+        event_type=LLMEventType.INTERACTION_REQUIRED,
+        data={"interaction_request": request.to_dict()},
+        timestamp=time.time(),
+    )
+
+    class _DummyApp:
+        def __init__(self, *args, **kwargs) -> None:
+            class _Input:
+                @staticmethod
+                def flush() -> None:
+                    return
+
+                @staticmethod
+                def flush_keys() -> None:
+                    return
+
+            self.input = _Input()
+
+        def run(self, in_thread: bool = True) -> str:
+            _ = in_thread
+            return "dragonfruit"
+
+    with patch("prompt_toolkit.Application", _DummyApp):
+        result = handle_interaction_required(shell, event)
+
+    assert result == LLMCallbackResult.CONTINUE
+    response_payload = event.data.get("interaction_response")
+    assert isinstance(response_payload, dict)
+    assert response_payload.get("interaction_id") == request.id
+    assert response_payload.get("answer", {}).get("type") == "text"
+    assert response_payload.get("answer", {}).get("value") == "dragonfruit"
 
 
 def test_display_security_panel_shows_fallback_rule_details(monkeypatch):

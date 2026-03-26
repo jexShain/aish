@@ -196,8 +196,8 @@ shell:
   ask_user:
     title: "Selectionnez une option"
     custom_label: "Personnalise :"
-    hint_select: "↑/↓ pour se deplacer • Enter pour confirmer • Esc pour annuler"
-    hint_custom: "Tapez pour saisir une valeur • Enter pour confirmer • Tab pour aller aux options • Esc pour annuler"
+    hint_select: "Entree pour choisir · ↑/↓ pour naviguer · Esc pour annuler"
+    hint_custom: "Entree pour choisir · ↑/↓ pour naviguer · Esc pour annuler"
     paused:
       title: "⏸ Saisie utilisateur requise (tache en pause)"
       prompt: "Question : {prompt}"
