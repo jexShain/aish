@@ -118,10 +118,7 @@ class AskUserRequestBuilder:
             if request_validation is None:
                 request_validation = InteractionValidation(required=required, min_length=1)
 
-        if interaction_kind in (
-            InteractionKind.SINGLE_SELECT,
-            InteractionKind.CHOICE_OR_TEXT,
-        ):
+        if interaction_kind == InteractionKind.CHOICE_OR_TEXT:
             request_placeholder = None
 
         return InteractionRequest(

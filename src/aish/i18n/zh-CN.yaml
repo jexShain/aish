@@ -298,8 +298,8 @@ shell:
   ask_user:
     title: "请选择"
     custom_label: "自定义："
-    hint_select: "按 Enter 键选择 · 按 ↑/↓ 键导航 · 按 Esc 键取消"
-    hint_custom: "按 Enter 键选择 · 按 ↑/↓ 键导航 · 按 Esc 键取消"
+    hint_select: "按 Enter 键确认 · 按 ↑/↓ 键导航 · 按 Esc 取消"
+    hint_custom: "按 Enter 键确认 · 按 ↑/↓ 键导航 · 按 Tab 或直接输入进入自定义内容 · 按 Esc 取消"
     paused:
       title: "⏸ 需要你的选择（任务已暂停）"
       prompt: "问题：{prompt}"

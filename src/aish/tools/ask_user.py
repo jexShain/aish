@@ -30,10 +30,11 @@ class AskUserTool(ToolBase):
             description=(
                 "\n".join(
                     [
-                        "Ask the user for one of three interaction kinds:",
-                        "- single_select: choose exactly one predefined option.",
-                        "- text_input: enter free-form text only.",
-                        "- choice_or_text: choose a predefined option or enter custom text.",
+                        "Ask the user a structured question to gather requirements or clarify ambiguity.",
+                        "Use this when the agent needs more user intent before it can plan or proceed.",
+                        "- choice_or_text: default for all option-style clarification prompts; always allow custom input.",
+                        "- text_input: use when free-form clarification is needed and predefined options would not help.",
+                        "Avoid using ask_user as a generic approval or execute/save/cancel mechanism when a dedicated host flow exists.",
                         "Returns structured output so callers can distinguish selected options from custom text.",
                         "If the UI is unavailable or the user cancels, the task will pause and require user input.",
                     ]
@@ -48,8 +49,8 @@ class AskUserTool(ToolBase):
                     },
                     "kind": {
                         "type": "string",
-                        "enum": ["single_select", "text_input", "choice_or_text"],
-                        "description": "Interaction type: single_select, text_input, or choice_or_text.",
+                        "enum": ["text_input", "choice_or_text"],
+                        "description": "Interaction type for requirement clarification. Use choice_or_text for all option-style questions and text_input for pure free-text prompts.",
                     },
                     "prompt": {
                         "type": "string",
@@ -57,7 +58,7 @@ class AskUserTool(ToolBase):
                     },
                     "options": {
                         "type": "array",
-                        "description": "Predefined options. Required for single_select and choice_or_text; omit for text_input.",
+                        "description": "Predefined options for choice_or_text prompts; users can still provide custom input.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -107,7 +108,7 @@ class AskUserTool(ToolBase):
                     },
                     "custom": {
                         "type": "object",
-                        "description": "Custom text entry config for choice_or_text interactions. Do not provide this for single_select.",
+                        "description": "Custom text entry config for choice_or_text clarification prompts.",
                         "properties": {
                             "label": {"type": "string"},
                             "placeholder": {"type": "string"},
@@ -154,7 +155,6 @@ class AskUserTool(ToolBase):
         )
 
         if request.kind not in {
-            InteractionKind.SINGLE_SELECT,
             InteractionKind.TEXT_INPUT,
             InteractionKind.CHOICE_OR_TEXT,
         }:

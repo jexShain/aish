@@ -197,7 +197,7 @@ shell:
     title: "オプションを選択"
     custom_label: "カスタム:"
     hint_select: "Enter で選択 ・ ↑/↓ で移動 ・ Esc でキャンセル"
-    hint_custom: "Enter で選択 ・ ↑/↓ で移動 ・ Esc でキャンセル"
+    hint_custom: "Enter で確定 ・ ↑/↓ で移動 ・ Tab または直接入力でカスタム入力へ ・ Esc でキャンセル"
     paused:
       title: "⏸ ユーザー入力が必要です（タスクは一時停止中）"
       prompt: "質問: {prompt}"

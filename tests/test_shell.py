@@ -90,7 +90,6 @@ class TestAIShell:
     @pytest.mark.parametrize(
         ("kind", "custom"),
         [
-            ("single_select", None),
             ("choice_or_text", {"label": "Other"}),
         ],
     )

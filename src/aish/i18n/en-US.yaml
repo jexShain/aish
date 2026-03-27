@@ -299,7 +299,7 @@ shell:
     title: "Select an option"
     custom_label: "Custom:"
     hint_select: "Enter to confirm · ↑/↓ to navigate · Esc to cancel"
-    hint_custom: "Enter to confirm · ↑/↓ to navigate · Esc to cancel"
+    hint_custom: "Enter to confirm · ↑/↓ to navigate · Tab or type to enter custom input · Esc to cancel"
     paused:
       title: "⏸ User input required (task paused)"
       prompt: "Question: {prompt}"

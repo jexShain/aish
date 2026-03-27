@@ -197,7 +197,7 @@ shell:
     title: "Selecciona una opción"
     custom_label: "Personalizado:"
     hint_select: "Enter para elegir · ↑/↓ para navegar · Esc para cancelar"
-    hint_custom: "Enter para elegir · ↑/↓ para navegar · Esc para cancelar"
+    hint_custom: "Enter para confirmar · ↑/↓ para navegar · Tab o escribe para introducir texto · Esc para cancelar"
     paused:
       title: "⏸ Se requiere entrada del usuario (tarea en pausa)"
       prompt: "Pregunta: {prompt}"

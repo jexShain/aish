@@ -29,7 +29,11 @@ Important:
 - NEVER just announce or mention a skill in your text response without actually calling this tool
 - This is a BLOCKING REQUIREMENT: invoke the relevant Skill tool BEFORE generating any other response about the task
 - Do not invoke a skill that is already running
-- If a skill requires user feedback/choice, use the `ask_user` tool with explicit interaction kinds: `single_select` for strict option-only choice, `text_input` for free text only, and `choice_or_text` for option-or-custom input. Use `custom` only with `choice_or_text`. If the user cancels or UI is unavailable, the task pauses
+- If a skill needs more requirements, preferences, or ambiguity resolution from the user, use `ask_user`.
+- For any option-style clarification prompt, always use `choice_or_text` so the user can still type custom requirements.
+- Use `text_input` for pure free-text clarification with no useful predefined options.
+- Do not treat `ask_user` as the default mechanism for approvals or execute/save/cancel branches when a dedicated host flow exists.
+- Use `custom` only with `choice_or_text`. If the user cancels or UI is unavailable, the task pauses
 </skills_instructions>
 """
 

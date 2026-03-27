@@ -11,6 +11,7 @@ from aish.llm import LLMCallbackResult, LLMEvent, LLMEventType
 from aish.shell_enhanced.shell_prompt_io import (
     display_security_panel,
     handle_interaction_required,
+    render_interaction_modal,
     handle_tool_confirmation_required,
 )
 
@@ -99,7 +100,7 @@ def test_handle_interaction_required_sets_interaction_response():
 def test_handle_interaction_required_reads_interaction_request_payload():
     shell = _DummyShell()
     request = AskUserRequestBuilder.from_tool_args(
-        kind="single_select",
+        kind="choice_or_text",
         prompt="Pick one",
         options=[
             {"value": "opt1", "label": "Option 1"},
@@ -230,6 +231,222 @@ def test_handle_interaction_required_prefills_text_input_default():
     assert isinstance(response_payload, dict)
     assert response_payload.get("interaction_id") == request.id
     assert response_payload.get("answer", {}).get("value") == "kiwi"
+
+
+def test_render_interaction_modal_supports_digit_shortcuts():
+    shell = _DummyShell()
+    request = AskUserRequestBuilder.from_tool_args(
+        kind="choice_or_text",
+        prompt="Pick one",
+        options=[
+            {"value": "opt1", "label": "Option 1"},
+            {"value": "opt2", "label": "Option 2"},
+            {"value": "opt3", "label": "Option 3"},
+        ],
+        default="opt1",
+    )
+
+    class _FakeKeyBindings:
+        def __init__(self) -> None:
+            self.handlers: dict[str, tuple[object, object]] = {}
+
+        def add(self, *keys, filter=None, eager=False):
+            _ = eager
+
+            def decorator(func):
+                self.handlers[str(keys[0])] = (func, filter)
+                return func
+
+            return decorator
+
+    class _DummyApp:
+        def __init__(self, *args, **kwargs) -> None:
+            self.layout = kwargs["layout"]
+            self.key_bindings = kwargs["key_bindings"]
+            self._result = None
+
+            class _Input:
+                @staticmethod
+                def flush() -> None:
+                    return
+
+                @staticmethod
+                def flush_keys() -> None:
+                    return
+
+            self.input = _Input()
+
+        def exit(self, result=None) -> None:
+            self._result = result
+
+        def invalidate(self) -> None:
+            return
+
+        def run(self, in_thread: bool = True) -> str | None:
+            _ = in_thread
+            handler, filter_obj = self.key_bindings.handlers["2"]
+            if filter_obj is not None:
+                assert filter_obj()
+            event = type("_Event", (), {"app": self})()
+            handler(event)
+
+            enter_handler, _enter_filter = self.key_bindings.handlers["enter"]
+            enter_handler(event)
+            return self._result
+
+    with patch("prompt_toolkit.key_binding.KeyBindings", _FakeKeyBindings), patch(
+        "prompt_toolkit.Application", _DummyApp
+    ):
+        response = render_interaction_modal(shell, request)
+
+    assert response.status.value == "submitted"
+    assert response.answer is not None
+    assert response.answer.value == "opt2"
+
+
+def test_render_interaction_modal_ctrl_c_cancels():
+    shell = _DummyShell()
+    request = AskUserRequestBuilder.from_tool_args(
+        kind="choice_or_text",
+        prompt="Pick one",
+        options=[
+            {"value": "opt1", "label": "Option 1"},
+            {"value": "opt2", "label": "Option 2"},
+        ],
+        default="opt1",
+    )
+
+    class _FakeKeyBindings:
+        def __init__(self) -> None:
+            self.handlers: dict[str, tuple[object, object]] = {}
+
+        def add(self, *keys, filter=None, eager=False):
+            _ = filter, eager
+
+            def decorator(func):
+                self.handlers[str(keys[0])] = (func, filter)
+                return func
+
+            return decorator
+
+    class _DummyApp:
+        def __init__(self, *args, **kwargs) -> None:
+            self.layout = kwargs["layout"]
+            self.key_bindings = kwargs["key_bindings"]
+            self._result = None
+
+            class _Input:
+                @staticmethod
+                def flush() -> None:
+                    return
+
+                @staticmethod
+                def flush_keys() -> None:
+                    return
+
+            self.input = _Input()
+
+        def exit(self, result=None) -> None:
+            self._result = result
+
+        def invalidate(self) -> None:
+            return
+
+        def run(self, in_thread: bool = True) -> str | None:
+            _ = in_thread
+            handler, _filter_obj = self.key_bindings.handlers["c-c"]
+            event = type("_Event", (), {"app": self})()
+            handler(event)
+            return self._result
+
+    with patch("prompt_toolkit.key_binding.KeyBindings", _FakeKeyBindings), patch(
+        "prompt_toolkit.Application", _DummyApp
+    ):
+        response = render_interaction_modal(shell, request)
+
+    assert response.status.value == "cancelled"
+    assert response.answer is None
+
+
+def test_render_interaction_modal_typing_switches_to_custom_input():
+    shell = _DummyShell()
+    request = AskUserRequestBuilder.from_tool_args(
+        kind="choice_or_text",
+        prompt="Pick one or type",
+        options=[
+            {"value": "opt1", "label": "Option 1"},
+            {"value": "opt2", "label": "Option 2"},
+        ],
+        default="opt1",
+        custom={"label": "Other", "placeholder": "Type here"},
+    )
+
+    class _FakeBuffer:
+        def __init__(self, *args, **kwargs) -> None:
+            _ = args, kwargs
+            self.text = ""
+
+        def insert_text(self, value: str) -> None:
+            self.text += value
+
+    class _FakeKeyBindings:
+        def __init__(self) -> None:
+            self.handlers: dict[str, tuple[object, object]] = {}
+
+        def add(self, *keys, filter=None, eager=False):
+            _ = eager
+
+            def decorator(func):
+                self.handlers[str(keys[0])] = (func, filter)
+                return func
+
+            return decorator
+
+    class _DummyApp:
+        def __init__(self, *args, **kwargs) -> None:
+            self.layout = kwargs["layout"]
+            self.key_bindings = kwargs["key_bindings"]
+            self._result = None
+
+            class _Input:
+                @staticmethod
+                def flush() -> None:
+                    return
+
+                @staticmethod
+                def flush_keys() -> None:
+                    return
+
+            self.input = _Input()
+
+        def exit(self, result=None) -> None:
+            self._result = result
+
+        def invalidate(self) -> None:
+            return
+
+        def run(self, in_thread: bool = True) -> str | None:
+            _ = in_thread
+            any_handler, any_filter = self.key_bindings.handlers["<any>"]
+            if any_filter is not None:
+                assert any_filter()
+            any_event = type("_Event", (), {"app": self, "data": "m"})()
+            any_handler(any_event)
+
+            enter_handler, _enter_filter = self.key_bindings.handlers["enter"]
+            enter_event = type("_Event", (), {"app": self})()
+            enter_handler(enter_event)
+            return self._result
+
+    with patch("prompt_toolkit.buffer.Buffer", _FakeBuffer), patch(
+        "prompt_toolkit.key_binding.KeyBindings", _FakeKeyBindings
+    ), patch("prompt_toolkit.Application", _DummyApp):
+        response = render_interaction_modal(shell, request)
+
+    assert response.status.value == "submitted"
+    assert response.answer is not None
+    assert response.answer.type.value == "text"
+    assert response.answer.value == "m"
 
 
 def test_display_security_panel_shows_fallback_rule_details(monkeypatch):

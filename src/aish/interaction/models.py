@@ -6,7 +6,6 @@ from typing import Any
 
 
 class InteractionKind(str, Enum):
-    SINGLE_SELECT = "single_select"
     TEXT_INPUT = "text_input"
     CHOICE_OR_TEXT = "choice_or_text"
     CONFIRM = "confirm"
@@ -189,11 +188,16 @@ class InteractionRequest:
             data.get("validation") if isinstance(data.get("validation"), dict) else None
         )
         custom_data = data.get("custom") if isinstance(data.get("custom"), dict) else None
-        options_data = data.get("options") if isinstance(data.get("options"), list) else []
+        raw_options = data.get("options")
+        options_data: list[dict[str, Any]] = (
+            [option for option in raw_options if isinstance(option, dict)]
+            if isinstance(raw_options, list)
+            else []
+        )
         return cls(
             id=str(data.get("id") or ""),
             kind=InteractionKind(
-                str(data.get("kind") or InteractionKind.SINGLE_SELECT.value)
+                str(data.get("kind") or InteractionKind.CHOICE_OR_TEXT.value)
             ),
             prompt=str(data.get("prompt") or ""),
             title=str(data.get("title")) if isinstance(data.get("title"), str) else None,
@@ -202,9 +206,7 @@ class InteractionRequest:
             source=InteractionSource.from_dict(source_data),
             metadata=dict(data.get("metadata") or {}),
             options=[
-                InteractionOption.from_dict(option)
-                for option in options_data
-                if isinstance(option, dict)
+                InteractionOption.from_dict(option) for option in options_data
             ],
             default=str(data.get("default")) if isinstance(data.get("default"), str) else None,
             placeholder=str(data.get("placeholder")) if isinstance(data.get("placeholder"), str) else None,

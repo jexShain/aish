@@ -36,7 +36,7 @@ def test_ask_user_tool_selected(monkeypatch):
 
     tool = AskUserTool(request_interaction=request_interaction)
     result = tool(
-        kind="single_select",
+        kind="choice_or_text",
         prompt="pick one",
         options=[
             {"value": "a", "label": "A"},
@@ -66,7 +66,7 @@ def test_ask_user_tool_cancelled_pauses(monkeypatch):
 
     tool = AskUserTool(request_interaction=request_interaction)
     result = tool(
-        kind="single_select",
+        kind="choice_or_text",
         prompt="pick one",
         options=[
             {"value": "a", "label": "A", "description": "Alpha option"},
@@ -102,7 +102,7 @@ def test_ask_user_tool_preserves_option_descriptions(monkeypatch):
 
     tool = AskUserTool(request_interaction=request_interaction)
     result = tool(
-        kind="single_select",
+        kind="choice_or_text",
         prompt="pick one",
         options=[
             {"value": "a", "label": "A", "description": "Alpha option"},
@@ -127,7 +127,7 @@ def test_ask_user_tool_respects_interaction_response_status():
         )
     )
     result = tool(
-        kind="single_select",
+        kind="choice_or_text",
         prompt="pick one",
         options=[
             {"value": "a", "label": "A"},
@@ -171,6 +171,40 @@ def test_ask_user_tool_custom_input_allowed(monkeypatch):
     assert payload["value"] == "mango"
     assert payload["status"] == "custom"
     assert payload["answer_type"] == "text"
+
+
+def test_ask_user_tool_choice_or_text_accepts_custom(monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    seen: dict[str, object] = {}
+
+    def request_interaction(request: InteractionRequest) -> InteractionResponse:
+        seen["kind"] = request.kind
+        seen["has_custom"] = request.custom is not None
+        return InteractionResponse(
+            interaction_id=request.id,
+            status=InteractionStatus.SUBMITTED,
+            answer=InteractionAnswer(
+                type=InteractionAnswerType.OPTION,
+                value="a",
+                label="A",
+            ),
+        )
+
+    tool = AskUserTool(request_interaction=request_interaction)
+    result = tool(
+        kind="choice_or_text",
+        prompt="pick one",
+        options=[
+            {"value": "a", "label": "A"},
+            {"value": "b", "label": "B"},
+        ],
+    )
+
+    assert result.ok is True
+    assert seen["kind"] == InteractionKind.CHOICE_OR_TEXT
+    assert seen["has_custom"] is True
 
 
 def test_ask_user_tool_text_input_mode(monkeypatch):
@@ -233,7 +267,7 @@ def test_request_interaction_prefers_standard_response(monkeypatch):
         InteractionRequest.from_dict(
             {
                 "id": "interaction_1",
-                "kind": "single_select",
+                "kind": "choice_or_text",
                 "prompt": "pick one",
                 "required": True,
                 "allow_cancel": True,
@@ -272,7 +306,7 @@ def test_request_interaction_returns_cancelled_without_response(monkeypatch):
         InteractionRequest.from_dict(
             {
                 "id": "interaction_2",
-                "kind": "single_select",
+                "kind": "choice_or_text",
                 "prompt": "pick one",
                 "required": True,
                 "allow_cancel": True,
@@ -298,7 +332,7 @@ async def test_handle_tool_calls_ask_user_user_input_required_breaks(monkeypatch
             "type": "function",
             "function": {
                 "name": "ask_user",
-                "arguments": '{"kind":"single_select","prompt":"pick one","options":[{"value":"a","label":"A"}]}'
+                "arguments": '{"kind":"choice_or_text","prompt":"pick one","options":[{"value":"a","label":"A"}]}'
             },
         },
         {

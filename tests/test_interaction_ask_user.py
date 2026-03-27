@@ -36,9 +36,9 @@ def test_ask_user_request_builder_builds_choice_or_text_request():
     assert request.metadata["cancel_hint"] == "custom cancel hint"
 
 
-def test_ask_user_request_builder_keeps_single_select_strict():
+def test_ask_user_request_builder_builds_choice_or_text_with_default():
     request = AskUserRequestBuilder.from_tool_args(
-        kind="single_select",
+        kind="choice_or_text",
         prompt="pick one",
         options=[
             {"value": "a", "label": "A"},
@@ -49,9 +49,9 @@ def test_ask_user_request_builder_keeps_single_select_strict():
         custom={"label": "Other", "placeholder": "Should not appear"},
     )
 
-    assert request.kind == InteractionKind.SINGLE_SELECT
+    assert request.kind == InteractionKind.CHOICE_OR_TEXT
     assert request.default == "b"
-    assert request.custom is None
+    assert request.custom is not None
     assert request.placeholder is None
 
 
@@ -114,7 +114,7 @@ def test_interaction_request_round_trips_via_dict():
 
 def test_interaction_service_delegates_to_renderer_without_tty_gate():
     request = AskUserRequestBuilder.from_tool_args(
-        kind="single_select",
+        kind="choice_or_text",
         prompt="pick one",
         options=[{"value": "a", "label": "A"}],
     )
@@ -159,7 +159,7 @@ def test_ask_user_adapter_builds_pause_message_for_cancelled():
 
 def test_ask_user_adapter_builds_selected_tool_result():
     request = AskUserRequestBuilder.from_tool_args(
-        kind="single_select",
+        kind="choice_or_text",
         prompt="pick one",
         options=[{"value": "a", "label": "A"}],
         default="a",

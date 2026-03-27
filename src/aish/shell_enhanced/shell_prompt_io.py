@@ -507,6 +507,16 @@ def render_interaction_modal(shell: Any, request: Any) -> InteractionResponse:
             else:
                 event.app.layout.focus(options_window)
 
+        def _activate_custom_input(event, seed_text: str | None = None) -> None:
+            if not allow_custom_input or custom_buffer is None or custom_input_field is None:
+                return
+
+            state["custom_active"] = True
+            event.app.layout.focus(custom_input_field)
+            if seed_text:
+                custom_buffer.insert_text(seed_text)
+            event.app.invalidate()
+
         kb = KeyBindings()
 
         @kb.add("up", eager=True)
@@ -537,6 +547,45 @@ def render_interaction_modal(shell: Any, request: Any) -> InteractionResponse:
                 _sync_focus(event)
                 event.app.invalidate()
 
+        @kb.add(
+            "tab",
+            eager=True,
+            filter=Condition(
+                lambda: allow_custom_input
+                and custom_input_field is not None
+                and not _is_custom_selected()
+            ),
+        )
+        def _focus_custom_input(event):
+            _activate_custom_input(event)
+
+        @kb.add(
+            "s-tab",
+            eager=True,
+            filter=Condition(lambda: _is_custom_selected() and bool(values)),
+        )
+        def _focus_options(event):
+            state["custom_active"] = False
+            _sync_focus(event)
+            event.app.invalidate()
+
+        @kb.add(
+            "<any>",
+            eager=True,
+            filter=Condition(
+                lambda: allow_custom_input
+                and custom_input_field is not None
+                and not _is_custom_selected()
+            ),
+        )
+        def _type_to_custom_input(event):
+            text = getattr(event, "data", "")
+            if not isinstance(text, str):
+                return
+            if not text.isprintable() or text in {"\r", "\n", "\t"}:
+                return
+            _activate_custom_input(event, seed_text=text)
+
         @kb.add("enter", eager=True)
         def _select(event):
             if allow_custom_input and custom_buffer is not None and _is_custom_selected():
@@ -552,6 +601,10 @@ def render_interaction_modal(shell: Any, request: Any) -> InteractionResponse:
 
             @kb.add("escape", eager=True)
             def _cancel(event):
+                event.app.exit(result=None)
+
+            @kb.add("c-c", eager=True)
+            def _cancel_ctrl_c(event):
                 event.app.exit(result=None)
 
         prompt_window = Window(
@@ -583,6 +636,31 @@ def render_interaction_modal(shell: Any, request: Any) -> InteractionResponse:
                 start_index = max(0, total_regular - visible_regular)
             end_index = min(total_regular, start_index + visible_regular)
             return (start_index, end_index)
+
+        def _highlight_visible_option_by_digit(event, digit: int) -> None:
+            if not values:
+                return
+
+            start_index, end_index = _regular_visible_range()
+            visible_values = values[start_index:end_index]
+            target_offset = digit - 1
+            if target_offset < 0 or target_offset >= len(visible_values):
+                return
+
+            state["selected_index"] = start_index + target_offset
+            state["custom_active"] = False
+            _sync_focus(event)
+            event.app.invalidate()
+
+        for digit in range(1, 10):
+
+            @kb.add(
+                str(digit),
+                eager=True,
+                filter=Condition(lambda: not _is_custom_selected()),
+            )
+            def _select_digit(event, digit=digit):
+                _highlight_visible_option_by_digit(event, digit)
 
         def _build_option_lines() -> list[tuple[str, str]]:
             start_index, end_index = _regular_visible_range()
@@ -780,6 +858,11 @@ def render_interaction_modal(shell: Any, request: Any) -> InteractionResponse:
             style=style,
             mouse_support=False,
         )
+        # This modal runs inside an already active shell UI. Disable CPR probing
+        # to avoid noisy warnings on terminals that don't support cursor
+        # position requests when the custom input field receives focus.
+        if hasattr(app, "output") and hasattr(app.output, "enable_cpr"):
+            setattr(app.output, "enable_cpr", False)
         try:
             app.input.flush()
             app.input.flush_keys()
@@ -806,14 +889,15 @@ def render_interaction_modal(shell: Any, request: Any) -> InteractionResponse:
 
         try:
             while True:
-                selected_value = app.run(in_thread=True)
+                try:
+                    selected_value = app.run(in_thread=True)
+                except KeyboardInterrupt:
+                    selected_value = None
                 if selected_value is None and not allow_cancel:
                     continue
                 break
         finally:
             resize_stop_event.set()
-    except KeyboardInterrupt:
-        raise
     except Exception:
         selected_value = None
 
