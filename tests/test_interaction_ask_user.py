@@ -60,11 +60,13 @@ def test_ask_user_request_builder_builds_text_input_request():
         kind="text_input",
         prompt="type a fruit",
         placeholder="Enter fruit name",
+        default="dragonfruit",
     )
 
     assert request.kind == InteractionKind.TEXT_INPUT
     assert request.options == []
     assert request.custom is None
+    assert request.default == "dragonfruit"
     assert request.placeholder == "Enter fruit name"
     assert request.validation is not None
     assert request.validation.required is True
@@ -110,7 +112,7 @@ def test_interaction_request_round_trips_via_dict():
     assert restored.custom.placeholder == "Type here"
 
 
-def test_interaction_service_returns_unavailable_without_tty():
+def test_interaction_service_delegates_to_renderer_without_tty_gate():
     request = AskUserRequestBuilder.from_tool_args(
         kind="single_select",
         prompt="pick one",
@@ -118,17 +120,15 @@ def test_interaction_service_returns_unavailable_without_tty():
     )
     service = InteractionService(
         renderer=lambda _request: InteractionResponse(
-            interaction_id="unexpected",
+            interaction_id=request.id,
             status=InteractionStatus.SUBMITTED,
-        ),
-        is_interactive=lambda: False,
+        )
     )
 
     response = service.request(request)
 
     assert response.interaction_id == request.id
-    assert response.status == InteractionStatus.UNAVAILABLE
-    assert response.reason == "unavailable"
+    assert response.status == InteractionStatus.SUBMITTED
 
 
 def test_ask_user_adapter_builds_pause_message_for_cancelled():

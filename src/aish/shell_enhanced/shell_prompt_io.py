@@ -486,6 +486,12 @@ def render_interaction_modal(shell: Any, request: Any) -> InteractionResponse:
             pass
 
         custom_buffer = Buffer() if allow_custom_input else None
+        if (
+            custom_buffer is not None
+            and request.kind == InteractionKind.TEXT_INPUT
+            and isinstance(default_value, str)
+        ):
+            custom_buffer.text = default_value
         state = {
             "selected_index": selected_index,
             "custom_active": allow_custom_input and not values,

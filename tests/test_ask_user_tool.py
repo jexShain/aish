@@ -7,8 +7,7 @@ from aish.config import ConfigModel
 from aish.context_manager import ContextManager
 from aish.interaction import (InteractionAnswer, InteractionAnswerType,
                               InteractionKind, InteractionRequest,
-                              InteractionResponse, InteractionSource,
-                              InteractionStatus)
+                              InteractionResponse, InteractionStatus)
 from aish.llm import (LLMCallbackResult, LLMSession, ToolDispatchOutcome,
                       ToolDispatchStatus)
 from aish.skills import SkillManager
@@ -119,20 +118,12 @@ def test_ask_user_tool_preserves_option_descriptions(monkeypatch):
     ]
 
 
-def test_ask_user_tool_unavailable_pauses():
-    # Ensure deterministic "unavailable" across environments.
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
-    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+def test_ask_user_tool_respects_interaction_response_status():
     tool = AskUserTool(
         request_interaction=lambda request: InteractionResponse(
             interaction_id=request.id,
-            status=InteractionStatus.SUBMITTED,
-            answer=InteractionAnswer(
-                type=InteractionAnswerType.OPTION,
-                value="a",
-                label="A",
-            ),
+            status=InteractionStatus.UNAVAILABLE,
+            reason="unavailable",
         )
     )
     result = tool(
@@ -147,7 +138,6 @@ def test_ask_user_tool_unavailable_pauses():
     assert result.ok is False
     assert result.meta.get("kind") == "user_input_required"
     assert result.meta.get("reason") == "unavailable"
-    monkeypatch.undo()
 
 
 def test_ask_user_tool_custom_input_allowed(monkeypatch):

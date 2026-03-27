@@ -181,6 +181,57 @@ def test_handle_interaction_required_supports_text_input():
     assert response_payload.get("answer", {}).get("value") == "dragonfruit"
 
 
+def test_handle_interaction_required_prefills_text_input_default():
+    shell = _DummyShell()
+    request = AskUserRequestBuilder.from_tool_args(
+        kind="text_input",
+        prompt="Type a fruit",
+        placeholder="Enter fruit name",
+        default="kiwi",
+    )
+    event = LLMEvent(
+        event_type=LLMEventType.INTERACTION_REQUIRED,
+        data={"interaction_request": request.to_dict()},
+        timestamp=time.time(),
+    )
+
+    class _CapturingBuffer:
+        instances: list["_CapturingBuffer"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            _ = args, kwargs
+            self.text = ""
+            self.__class__.instances.append(self)
+
+    class _DummyApp:
+        def __init__(self, *args, **kwargs) -> None:
+            class _Input:
+                @staticmethod
+                def flush() -> None:
+                    return
+
+                @staticmethod
+                def flush_keys() -> None:
+                    return
+
+            self.input = _Input()
+
+        def run(self, in_thread: bool = True) -> str:
+            _ = in_thread
+            return _CapturingBuffer.instances[-1].text
+
+    with patch("prompt_toolkit.buffer.Buffer", _CapturingBuffer), patch(
+        "prompt_toolkit.Application", _DummyApp
+    ):
+        result = handle_interaction_required(shell, event)
+
+    assert result == LLMCallbackResult.CONTINUE
+    response_payload = event.data.get("interaction_response")
+    assert isinstance(response_payload, dict)
+    assert response_payload.get("interaction_id") == request.id
+    assert response_payload.get("answer", {}).get("value") == "kiwi"
+
+
 def test_display_security_panel_shows_fallback_rule_details(monkeypatch):
     monkeypatch.setenv("LANG", "zh_CN.UTF-8")
     _reset_i18n_cache()

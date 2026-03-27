@@ -7,7 +7,6 @@ from aish.i18n import t
 from aish.tools.result import ToolResult
 
 from .models import (
-    InteractionAnswer,
     InteractionAnswerType,
     InteractionCustomConfig,
     InteractionKind,
@@ -21,6 +20,12 @@ from .models import (
 
 
 class AskUserRequestBuilder:
+    @staticmethod
+    def pick_text_default(default: object) -> str | None:
+        if isinstance(default, str):
+            return default
+        return None
+
     @staticmethod
     def normalize_options(options: object) -> list[InteractionOption]:
         if not isinstance(options, list):
@@ -72,10 +77,11 @@ class AskUserRequestBuilder:
         custom: object = None,
         interaction_id: str | None = None,
     ) -> InteractionRequest:
+        interaction_kind = InteractionKind(kind)
         normalized_options = cls.normalize_options(options)
         default_value = cls.pick_default(default, normalized_options)
-
-        interaction_kind = InteractionKind(kind)
+        if interaction_kind == InteractionKind.TEXT_INPUT:
+            default_value = cls.pick_text_default(default)
 
         request_metadata = dict(metadata) if isinstance(metadata, dict) else {}
 
@@ -128,7 +134,7 @@ class AskUserRequestBuilder:
             source=InteractionSource(type="tool", name="ask_user"),
             metadata=request_metadata,
             options=normalized_options,
-            default=default_value or None,
+            default=default_value,
             placeholder=request_placeholder,
             validation=request_validation,
             custom=request_custom,
