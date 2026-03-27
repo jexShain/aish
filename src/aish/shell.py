@@ -325,27 +325,6 @@ class AIShell:
 
         self.help_manager = HelpManager(self.console)
 
-        # Plan mode components
-        from .plans.manager import PlanManager
-        from .plans.plan_agent import PlanAgent
-
-        self.plan_manager = PlanManager()
-        self.plan_agent = PlanAgent(
-            config=config,
-            model_id=config.model,
-            skill_manager=skill_manager,
-            plan_manager=self.plan_manager,
-            shell=self,  # Pass shell reference for TUI updates
-            api_base=config.api_base,
-            api_key=config.api_key,
-            parent_event_callback=self.handle_llm_event,
-            cancellation_token=self.llm_session.cancellation_token,
-            history_manager=self.history_manager,
-        )
-
-        # Register plan agent to LLM session for tool access
-        self.llm_session.tools[self.plan_agent.name] = self.plan_agent
-
         self.task_counter = 0
         # Per-operation cancel scope (reset for each user request)
         self._current_op_scope: anyio.CancelScope | None = None
@@ -3498,22 +3477,18 @@ class AIShell:
     ) -> InteractionResponse:
         """Request a user interaction via the shell UI.
 
-        This method is used by plan_agent to get user input for plan confirmation.
-
         Returns the normalized interaction response.
         """
         import sys
 
         # Check if we have a terminal available
-        # Note: In plan_agent context, we may be running in a ThreadPoolExecutor
-        # but still have access to the terminal
+        # This may be called from background worker threads that still share the terminal.
         try:
             has_tty = sys.stdin.isatty() and sys.stdout.isatty()
         except Exception:
             has_tty = False
 
-        # If no TTY but we have a running shell, try anyway
-        # (This handles the case where plan_agent runs in ThreadPoolExecutor)
+        # If no TTY but we have a running shell, try anyway.
         if not has_tty and not self.running:
             return InteractionResponse(
                 interaction_id=request.id,
