@@ -101,9 +101,15 @@ class ExitCodeTracker:
 
         Use this to discard stale exit code state (e.g. before a new command)
         while preserving _last_command for error correction features.
+
+        Note: This does NOT clear _has_error flag. Use clear_error() to clear
+        the error state when starting a completely new command sequence.
         """
         self._exit_code_available = False
-        self._has_error = False  # Also clear error flag for new command
+
+    def clear_error(self) -> None:
+        """Clear the error state for a new command sequence."""
+        self._has_error = False
 
     def has_exit_code(self) -> bool:
         """Check if a command completed and exit code is available.
