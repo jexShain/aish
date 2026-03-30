@@ -142,6 +142,66 @@ class PTYAIShell:
         self._approved_ai_commands: set[str] = set()
         self._placeholder_manager: Optional[PlaceholderManager] = None
 
+        self._last_exit_code: int = 0
+        self._shell_preview_bytes: int = 4096
+
+    def add_shell_history(
+        self,
+        command: str,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        offload: dict[str, Any] | None = None,
+    ) -> None:
+        """Add shell execution context for LLM with output previews and offload hints."""
+        # Update last exit code for prompt hooks
+        self._last_exit_code = returncode
+
+        # Truncate output previews
+        preview_bytes = self._shell_preview_bytes
+        stdout_preview = self._truncate_utf8_preview(stdout or "", preview_bytes)
+        stderr_preview = self._truncate_utf8_preview(stderr or "", preview_bytes)
+
+        if not stdout_preview:
+            stdout_preview = ""
+        if not stderr_preview:
+            stderr_preview = ""
+
+        # Build history entry
+        import json
+        offload_json = json.dumps(offload or {})
+        history_entry = "\n".join(
+            [
+                f"[Shell] {command}",
+                f"<returncode>{returncode}</returncode>",
+                f"<stdout>{stdout_preview}</stdout>",
+                f"<stderr>{stderr_preview}</stderr>",
+                f"<offload>{offload_json}</offload>",
+            ]
+        )
+        self.context_manager.add_memory(MemoryType.SHELL, history_entry)
+
+    def _truncate_utf8_preview(self, text: str, max_bytes: int) -> str:
+        """Truncate text to fit within max_bytes while preserving valid UTF-8."""
+        if not text:
+            return ""
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) <= max_bytes:
+            return encoded.decode("utf-8", errors="replace")
+        # Truncate to max_bytes
+        encoded = encoded[:max_bytes]
+        # Try to decode, handling potential partial characters
+        try:
+            return encoded.decode("utf-8")
+        except UnicodeDecodeError:
+            # Remove bytes until we have valid UTF-8
+            while encoded:
+                try:
+                    return encoded.decode("utf-8")
+                except UnicodeDecodeError:
+                    encoded = encoded[:-1]
+            return ""
+
     def _create_llm_session(self) -> "LLMSession":
         """Create LLMSession with all necessary dependencies."""
         import logging
@@ -825,6 +885,7 @@ class PTYAIShell:
         self._output_processor = OutputProcessor(
             pty_manager=self._pty_manager,
             placeholder_manager=self._placeholder_manager,
+            shell=self,
         )
         self._input_router = InputRouter(
             self._pty_manager,
@@ -853,10 +914,93 @@ class PTYAIShell:
                 if processed:
                     sys.stdout.buffer.write(processed)
                     sys.stdout.buffer.flush()
+
+                # Check if command completed and add to context
+                if self._pty_manager.exit_tracker.has_exit_code():
+                    error_info = self._pty_manager.exit_tracker.consume_exit_code()
+                    if error_info:
+                        cmd, returncode = error_info
+                        if cmd:
+                            # Add command execution to context for LLM
+                            self.add_shell_history(
+                                command=cmd,
+                                returncode=returncode,
+                                stdout="",  # stdout is already displayed
+                                stderr="",
+                            )
             else:
                 self._running = False
         except OSError:
             self._running = False
+
+    def add_shell_history(
+        self,
+        command: str,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        offload: dict[str, Any] | None = None,
+    ) -> None:
+        """Add shell execution context for LLM with output previews and offload hints."""
+        import json
+
+        # Update last exit code for prompt hooks
+        self._last_exit_code = returncode
+
+        # Truncate output previews
+        preview_bytes = 4096
+        stdout_preview, stdout_truncated = self._truncate_utf8_preview(
+            stdout or "", preview_bytes
+        )
+        stderr_preview, stderr_truncated = self._truncate_utf8_preview(
+            stderr or "", preview_bytes
+        )
+
+        if not stdout_preview:
+            stdout_preview = ""
+        if not stderr_preview:
+            stderr_preview = ""
+
+        if stdout_truncated:
+            stdout_preview += (
+                f"\n... [stdout preview truncated to {preview_bytes} bytes]"
+            )
+        if stderr_truncated:
+            stderr_preview += (
+                f"\n... [stderr preview truncated to {preview_bytes} bytes]"
+            )
+
+        offload_json = json.dumps(offload or {})
+
+        history_entry = "\n".join(
+            [
+                f"[Shell] {command}",
+                f"<returncode>{returncode}</returncode>",
+                f"<stdout>{stdout_preview}</stdout>",
+                f"<stderr>{stderr_preview}</stderr>",
+                f"<offload>{offload_json}</offload>",
+            ]
+        )
+        self.context_manager.add_memory(MemoryType.SHELL, history_entry)
+
+    def _truncate_utf8_preview(self, text: str, max_bytes: int) -> tuple[str, bool]:
+        """Truncate text to fit within max_bytes while preserving valid UTF-8."""
+        if not text:
+            return "", False
+
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) <= max_bytes:
+            return text, False
+
+        # Truncate and decode back, handling potential partial characters
+        truncated = encoded[:max_bytes]
+        try:
+            decoded = truncated.decode("utf-8")
+        except UnicodeDecodeError:
+            # Remove the last partial character
+            decoded = truncated.rstrip().decode("utf-8", errors="ignore")
+
+        return decoded, True
 
     def _cleanup(self) -> None:
         if not self._running and hasattr(self, "_cleanup_done"):

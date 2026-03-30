@@ -1,0 +1,38 @@
+Test run by xzx on Mon Mar 30 17:06:26 2026
+Native configuration is x86_64-pc-linux-gnu
+
+		===  tests ===
+
+Schedule of variations:
+    unix
+
+Running target unix
+Running ./build/tests/dejagnu/shell_pty_ai.exp ...
+ERROR: tcl error sourcing ./build/tests/dejagnu/shell_pty_ai.exp.
+ERROR: send: spawn id exp5 not open
+    while executing
+"send "; echo hello\r""
+    (file "./build/tests/dejagnu/shell_pty_ai.exp" line 16)
+    invoked from within
+"source ./build/tests/dejagnu/shell_pty_ai.exp"
+    ("uplevel" body line 1)
+    invoked from within
+"uplevel #0 source ./build/tests/dejagnu/shell_pty_ai.exp"
+    invoked from within
+"catch "uplevel #0 source $test_file_name""
+Running ./tests/dejagnu/shell_pty_ai.exp ...
+ERROR: tcl error sourcing ./tests/dejagnu/shell_pty_ai.exp.
+ERROR: send: spawn id exp8 not open
+    while executing
+"send "; echo hello\r""
+    (file "./tests/dejagnu/shell_pty_ai.exp" line 16)
+    invoked from within
+"source ./tests/dejagnu/shell_pty_ai.exp"
+    ("uplevel" body line 1)
+    invoked from within
+"uplevel #0 source ./tests/dejagnu/shell_pty_ai.exp"
+    invoked from within
+"catch "uplevel #0 source $test_file_name""
+
+		===  Summary ===
+

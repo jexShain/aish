@@ -117,6 +117,8 @@ class InputRouter:
                 if suffix:
                     self.pty_manager.send(suffix.encode("utf-8"))
                     self._current_cmd += suffix
+                    # Update exit tracker with the full command
+                    self.pty_manager.exit_tracker.set_last_command(self._current_cmd)
                     return
             if self._in_ai_mode:
                 return
@@ -180,7 +182,7 @@ class InputRouter:
                     ) or cmd_stripped.startswith(("exit ", "logout "))
                     if self.output_processor:
                         if not is_exit_cmd:
-                            self.output_processor.set_waiting_for_result(True)
+                            self.output_processor.set_waiting_for_result(True, cmd_stripped)
                         else:
                             self.output_processor.set_filter_exit_echo(True)
                 self.pty_manager.send(b"\r")
