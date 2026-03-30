@@ -40,7 +40,7 @@ Week 11-12 │ v0.6.0 → v0.7.0  │ Agent SDK & MCP Protocol
 
 **Fixes**
 - 🐛 Implement skill tool invocation (`skill.py` TODO)
-- 🐛 Fix tool call history not added to memory (`shell.py:889`)
+- 🐛 Fix tool call history not added to memory (shell core)
 - 🐛 Disable auto-trigger of `handle_error_detect()` (temporary mitigation)
 
 **Impact**: Reduces immediate user pain points

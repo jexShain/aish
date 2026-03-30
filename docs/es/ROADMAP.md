@@ -42,7 +42,7 @@ Semana 11-12 │ v0.6.0 → v0.7.0  │ Agent SDK y protocolo MCP
 
 **Correcciones**
 - 🐛 Implementar la invocación de la herramienta skill (`skill.py` TODO)
-- 🐛 Corregir el historial de tool calls no añadido a la memoria (`shell.py:889`)
+- 🐛 Corregir el historial de tool calls no añadido a la memoria (núcleo del shell)
 - 🐛 Deshabilitar el auto‑disparo de `handle_error_detect()` (mitigación temporal)
 
 **Impacto**: Reduce puntos de dolor inmediatos de usuarios

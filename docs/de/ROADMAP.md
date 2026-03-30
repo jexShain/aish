@@ -42,7 +42,7 @@ Woche 11-12 │ v0.6.0 → v0.7.0  │ Agent SDK & MCP‑Protokoll
 
 **Fixes**
 - 🐛 Skill‑Tool‑Invocation implementieren (`skill.py` TODO)
-- 🐛 Tool‑Call‑Historie wird nicht in den Speicher aufgenommen (`shell.py:889`)
+- 🐛 Tool‑Call‑Historie wird nicht in den Speicher aufgenommen (Shell‑Core)
 - 🐛 Auto‑Trigger von `handle_error_detect()` deaktivieren (temporäre Abhilfe)
 
 **Auswirkung**: Reduziert akute Nutzerprobleme
