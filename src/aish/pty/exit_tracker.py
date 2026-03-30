@@ -66,16 +66,16 @@ class ExitCodeTracker:
         return data
 
     def consume_error(self) -> Optional[Tuple[str, int]]:
-        """Consume and return error info if there was an error.
+        """Check and return error info if there was an error.
+
+        Note: This does NOT clear the _has_error flag. Use clear_exit_available()
+        to clear the error state before a new command.
 
         Returns:
             (command, exit_code) if error existed, None otherwise
         """
         if self._has_error:
-            cmd = self._last_command
-            code = self._last_exit_code
-            self._has_error = False
-            return cmd, code
+            return self._last_command, self._last_exit_code
         return None
 
     def consume_exit_code(self) -> Optional[Tuple[str, int]]:
@@ -99,6 +99,7 @@ class ExitCodeTracker:
         while preserving _last_command for error correction features.
         """
         self._exit_code_available = False
+        self._has_error = False  # Also clear error flag for new command
 
     def has_exit_code(self) -> bool:
         """Check if a command completed and exit code is available.
