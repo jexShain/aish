@@ -95,11 +95,20 @@ class AIHandler:
 
     @staticmethod
     def _run_async_in_thread(coro):
-        """Run an async function in a separate thread with its own event loop."""
+        """Run an async coroutine in a separate thread with its own event loop."""
+        import asyncio
         from concurrent.futures import ThreadPoolExecutor
 
+        def run_in_thread():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
         with ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(anyio.run, coro).result()
+            return pool.submit(run_in_thread).result()
 
     def _extract_skill_refs(self, text: str) -> list[str]:
         """Extract skill references from text."""
