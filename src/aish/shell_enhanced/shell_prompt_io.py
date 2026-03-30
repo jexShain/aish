@@ -95,66 +95,29 @@ async def get_user_input(
     app_ref = [None]
     refresh_stop_event = threading.Event()
 
-    # Create bottom toolbar for TUI mode - shows status bar at bottom
+    # Create bottom toolbar for inline hint display.
     from prompt_toolkit.application import get_app_or_none
     from prompt_toolkit.formatted_text import HTML, merge_formatted_text
 
     def get_bottom_toolbar():
         """Get bottom toolbar content for prompt.
 
-        Shows status bar with model, mode, cwd and hint information.
-        In non-TUI mode, only shows hint on the right side.
+        Shows prompt hints in the bottom toolbar.
         """
-        # Build status bar parts
         parts = []
 
-        # TUI mode: show full status bar
-        if self._tui_app is not None:
-            status = self._tui_app.state.status
-            tui_settings = self._tui_app.tui_settings
-
-            # Model name
-            if status.model:
-                model_display = status.model
-                if len(model_display) > 20:
-                    model_display = model_display[:17] + "..."
-                parts.append(HTML(f'<style fg="gray">[Model: {model_display}]</style>'))
-
-            # Mode (PTY/AI/PLAN) - unified gray style
-            parts.append(HTML(f'<style fg="gray">[Mode: {status.mode}]</style>'))
-
-            # Current working directory
-            if status.cwd and tui_settings.show_cwd:
-                cwd_display = status.cwd
-                if len(cwd_display) > 30:
-                    cwd_display = "..." + cwd_display[-27:]
-                parts.append(HTML(f'<style fg="gray">[{cwd_display}]</style>'))
-
-            # Plan queue progress (compact) - unified gray style
-            plan_queue_state = self._tui_app.get_plan_queue_state()
-            if plan_queue_state.is_visible:
-                completed, total, percent = plan_queue_state.get_progress_summary()
-                if total > 0:
-                    parts.append(
-                        HTML(
-                            f'<style fg="gray">[Plan: {completed}/{total} ({percent}%)]</style>'
-                        )
-                    )
-
-        # Get hint message (for both TUI and non-TUI mode)
+        # Get hint message.
         hint = self.interruption_manager.get_prompt_message()
         if hint is None:
-            # Check if user has input - hide hint when typing
             try:
                 app = get_app_or_none()
                 if app is not None:
                     buffer = app.current_buffer
                     if buffer and len(buffer.document.text) > 0:
-                        hint = None  # Hide hint when user is typing
+                        hint = None
             except Exception:
                 pass
 
-            # Show default ai_hint if still None (for both TUI and non-TUI mode)
             if hint is None:
                 hint = t("shell.prompt.ai_hint")
 

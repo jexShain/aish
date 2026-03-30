@@ -133,30 +133,6 @@ class BashOutputOffloadSettings(BaseModel):
     write_meta: bool = Field(default=True)
 
 
-class TUISettings(BaseModel):
-    """TUI mode configuration settings."""
-
-    enabled: bool = Field(default=False, description="Enable TUI mode")
-    theme: str = Field(default="dark", description="TUI theme (dark/light)")
-    status_bar_height: int = Field(
-        default=1, ge=1, le=3, description="Status bar height in lines"
-    )
-    notification_timeout: float = Field(
-        default=5.0, ge=1.0, description="Notification auto-dismiss timeout in seconds"
-    )
-    max_history_display: int = Field(
-        default=20, ge=5, description="Maximum history items to display"
-    )
-    animation_fps: int = Field(
-        default=10, ge=5, le=30, description="TUI refresh rate in frames per second"
-    )
-    max_content_lines: int = Field(
-        default=1000, ge=100, description="Maximum lines in content buffer"
-    )
-    show_time: bool = Field(default=True, description="Show time in status bar")
-    show_cwd: bool = Field(default=True, description="Show current directory in status bar")
-
-
 class ConfigModel(BaseModel):
     """Pydantic model for AI Shell configuration"""
 
@@ -235,10 +211,6 @@ class ConfigModel(BaseModel):
     terminal_resize_mode: str = Field(
         default="full",
         description="Terminal resize handling mode: full, pty_only, or off.",
-    )
-    tui: TUISettings = Field(
-        default_factory=TUISettings,
-        description="TUI mode settings.",
     )
     enable_scripts: bool = Field(
         default=True,
