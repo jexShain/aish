@@ -136,7 +136,8 @@ class AIHandler:
         """Handle error correction."""
         tracker = self.pty_manager.exit_tracker
 
-        if tracker.last_exit_code == 0:
+        # Check has_error flag which tracks if last command had non-zero exit
+        if not tracker.has_error:
             print("\r\033[KNo previous error to fix.")
             self._trigger_prompt_redraw()
             self._set_raw_mode()
