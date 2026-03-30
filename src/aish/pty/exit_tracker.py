@@ -46,7 +46,7 @@ class ExitCodeTracker:
             data: Raw PTY output bytes
 
         Returns:
-            Cleaned output with exit code markers removed
+                Cleaned output with exit code markers removed
         """
         # Find all markers in the output
         markers = list(self.MARKER_PATTERN.finditer(data))
@@ -59,10 +59,14 @@ class ExitCodeTracker:
             self._has_error = exit_code != 0
             self._exit_code_available = True  # Mark that exit code is available
 
+            # Debug output
+            import sys
+            sys.stderr.write(f"[DEBUG parse_and_update] exit_code={exit_code}, has_error={self._has_error}\n")
+            sys.stderr.flush()
+
             # Remove all markers from output
             cleaned = self.MARKER_PATTERN.sub(b"", data)
             return cleaned
-
         return data
 
     def consume_error(self) -> Optional[Tuple[str, int]]:
