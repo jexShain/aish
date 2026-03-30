@@ -136,6 +136,11 @@ class AIHandler:
         """Handle error correction."""
         tracker = self.pty_manager.exit_tracker
 
+        # Debug info
+        import sys
+        sys.stderr.write(f"\r\n[DEBUG] has_error={tracker.has_error}, last_exit_code={tracker.last_exit_code}, last_command={tracker.last_command!r}\n")
+        sys.stderr.flush()
+
         # Check has_error flag which tracks if last command had non-zero exit
         if not tracker.has_error:
             print("\r\033[KNo previous error to fix.")
