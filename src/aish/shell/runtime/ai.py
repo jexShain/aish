@@ -176,17 +176,18 @@ Exit code: {tracker.last_exit_code}
             shell.interruption_manager.set_state(ShellState.AI_THINKING)
             shell.operation_in_progress = True
 
-            completed_normally = True
             try:
-                response = self._run_async_in_thread(_fix)
+                response = self._run_async_in_thread(_fix())
             except (
                 anyio.get_cancelled_exc_class(),
                 asyncio.CancelledError,
                 KeyboardInterrupt,
             ):
-                completed_normally = False
                 shell.handle_processing_cancelled()
                 return
+            finally:
+                shell.interruption_manager.set_state(ShellState.NORMAL)
+                shell.operation_in_progress = False
 
             executed_cmd = False
             if response:
@@ -218,13 +219,8 @@ Exit code: {tracker.last_exit_code}
             self._set_raw_mode()
 
         except Exception as error:
-            completed_normally = False
             print(f"\r\033[KError: {error}")
             self._set_raw_mode()
-        finally:
-            # Always cleanup state, but only after all work is done
-            shell.interruption_manager.set_state(ShellState.NORMAL)
-            shell.operation_in_progress = False
 
     def handle_question(self, question: str) -> None:
         """Handle AI question."""
@@ -262,7 +258,7 @@ Exit code: {tracker.last_exit_code}
             shell.operation_in_progress = True
 
             try:
-                response = self._run_async_in_thread(_ask)
+                response = self._run_async_in_thread(_ask())
             except (
                 anyio.get_cancelled_exc_class(),
                 asyncio.CancelledError,
