@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from aish import PTYAIShell, run_shell
 from aish.pty import ExitCodeTracker, PTYManager
-from aish.shell_enhanced.shell_types import CommandResult, CommandStatus
+from aish.shell import CommandResult, CommandStatus
 
 
 def test_shell_exports_stable_symbols():

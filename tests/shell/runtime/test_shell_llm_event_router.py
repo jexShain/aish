@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from aish.llm import LLMCallbackResult, LLMEvent, LLMEventType
-from aish.shell_enhanced.shell_llm_events import LLMEventRouter
+from aish.shell.runtime.events import LLMEventRouter
 
 
 def make_event(event_type: LLMEventType) -> LLMEvent:

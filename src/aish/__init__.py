@@ -6,11 +6,11 @@ __version__ = "0.1.3"
 # This matters for system services like aish-sandbox, which only need aish.sandboxd.
 def __getattr__(name: str):
     if name == "PTYAIShell":
-        from .shell_pty import PTYAIShell as _PTYAIShell
+        from .shell import PTYAIShell as _PTYAIShell
 
         return _PTYAIShell
     if name == "run_shell":
-        from .shell_pty import run_shell as _run_shell
+        from .shell import run_shell as _run_shell
 
         return _run_shell
     if name == "main":

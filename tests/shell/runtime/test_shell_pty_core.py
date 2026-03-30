@@ -5,7 +5,8 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 from aish.i18n import t
-from aish.shell_pty import InputRouter, OutputProcessor
+from aish.shell.runtime.output import OutputProcessor
+from aish.shell.runtime.router import InputRouter
 
 
 class _FakeTracker:

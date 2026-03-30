@@ -6,7 +6,7 @@ import sys
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from ..history_manager import HistoryManager
+    from ...history_manager import HistoryManager
 
 
 # ANSI escape codes for suggestion display

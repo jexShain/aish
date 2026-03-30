@@ -40,7 +40,7 @@ dev:
 
 test:
 	@echo "🧪 Running tests..."
-	uv run --group dev pytest tests/ -v
+	uv run --group dev python -m pytest tests/ -v
 
 lint:
 	@echo "🔍 Running linting..."

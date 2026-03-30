@@ -8,8 +8,8 @@ from __future__ import annotations
 from typing import Optional
 from wcwidth import wcwidth
 
-from ..i18n import t
-from ..interruption import InterruptionManager, ShellState
+from ...i18n import t
+from ...interruption import InterruptionManager, ShellState
 
 
 class PlaceholderManager:

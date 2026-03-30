@@ -8,7 +8,7 @@ from rich.console import Console
 
 from aish.interaction import AskUserRequestBuilder
 from aish.llm import LLMCallbackResult, LLMEvent, LLMEventType
-from aish.shell_enhanced.shell_prompt_io import (
+from aish.shell.ui.prompt_io import (
     display_security_panel,
     handle_interaction_required,
     render_interaction_modal,
