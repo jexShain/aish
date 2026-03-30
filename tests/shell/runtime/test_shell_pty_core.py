@@ -76,7 +76,7 @@ def test_input_router_marks_normal_command_as_waiting_for_result():
 
     assert pty_manager.sent == [b"l", b"s", b"\r"]
     tracker.set_last_command.assert_called_once_with("ls")
-    output_processor.set_waiting_for_result.assert_called_once_with(True)
+    output_processor.set_waiting_for_result.assert_called_once_with(True, "ls")
     output_processor.set_filter_exit_echo.assert_not_called()
 
 
