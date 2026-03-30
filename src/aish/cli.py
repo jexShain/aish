@@ -365,7 +365,7 @@ def run(
     except Exception:
         pass
 
-    from aish.shell_pty import run_shell as run_pty_shell
+    from aish.shell import run_shell as run_pty_shell
 
     try:
         run_pty_shell(effective_config, skill_manager, config)

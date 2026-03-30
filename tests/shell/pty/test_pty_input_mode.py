@@ -1,6 +1,6 @@
 import termios
 
-from aish.shell_enhanced.shell_pty_executor import _build_passthrough_stdin_termios
+from aish.shell.pty.executor import _build_passthrough_stdin_termios
 from aish.tools.bash_executor import UnifiedBashExecutor
 
 

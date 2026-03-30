@@ -52,7 +52,7 @@ class TestCLI:
         assert "Features:" in result.output
         assert "Supported Models:" in result.output
 
-    @patch("aish.shell_pty.run_shell")
+    @patch("aish.shell.run_shell")
     def test_run_command_default(self, mock_run_shell):
         """Test run command with default parameters"""
         with patch("aish.cli.needs_interactive_setup", return_value=False):
@@ -61,7 +61,7 @@ class TestCLI:
         assert result.exit_code == 0
         mock_run_shell.assert_called_once()
 
-    @patch("aish.shell_pty.run_shell")
+    @patch("aish.shell.run_shell")
     def test_default_invokes_run(self, mock_run_shell):
         """Running `aish` with no args should default to `run`."""
 
@@ -71,7 +71,7 @@ class TestCLI:
         assert result.exit_code == 0
         mock_run_shell.assert_called_once()
 
-    @patch("aish.shell_pty.run_shell")
+    @patch("aish.shell.run_shell")
     def test_run_command_custom_model(self, mock_run_shell):
         """Test run command with custom model"""
         with patch("aish.cli.needs_interactive_setup", return_value=False):
@@ -80,7 +80,7 @@ class TestCLI:
         assert result.exit_code == 0
         mock_run_shell.assert_called_once()
 
-    @patch("aish.shell_pty.run_shell")
+    @patch("aish.shell.run_shell")
     @patch("aish.cli.os.environ", {})
     def test_run_command_with_api_key(self, mock_run_shell):
         """Test run command with API key"""
@@ -91,7 +91,7 @@ class TestCLI:
         assert result.exit_code == 0
         mock_run_shell.assert_called_once()
 
-    @patch("aish.shell_pty.run_shell")
+    @patch("aish.shell.run_shell")
     @patch("aish.cli.os.getenv")
     def test_run_command_no_api_key_minimal_output(
         self, mock_getenv, mock_run_shell
@@ -106,7 +106,7 @@ class TestCLI:
         assert t("cli.startup.no_api_key_warning") not in result.output
         mock_run_shell.assert_called_once()
 
-    @patch("aish.shell_pty.run_shell")
+    @patch("aish.shell.run_shell")
     def test_run_command_keyboard_interrupt(self, mock_run_shell):
         """Test run command handles keyboard interrupt"""
         mock_run_shell.side_effect = KeyboardInterrupt()
@@ -119,7 +119,7 @@ class TestCLI:
         mock_run_shell.assert_called_once()
 
     @patch("aish.cli.run_interactive_setup")
-    @patch("aish.shell_pty.run_shell")
+    @patch("aish.shell.run_shell")
     def test_run_skips_interactive_setup_when_config_present(
         self, mock_run_shell, mock_run_interactive_setup
     ):
@@ -149,7 +149,7 @@ class TestCLI:
         mock_run_interactive_setup.assert_not_called()
 
     @patch("aish.cli.run_interactive_setup")
-    @patch("aish.shell_pty.run_shell")
+    @patch("aish.shell.run_shell")
     def test_run_invokes_interactive_setup_when_config_missing(
         self, mock_run_shell, mock_run_interactive_setup
     ):

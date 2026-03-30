@@ -6,7 +6,6 @@ import pty
 import select
 import signal
 import struct
-import sys
 import termios
 import threading
 import time
@@ -160,9 +159,6 @@ PS1=""  # Will be set by PROMPT_COMMAND
         """Set callback for PTY output."""
         self._output_callback = callback
 
-    def set_exit_code_callback(self, callback: Callable[[int], None]) -> None:
-        """Set callback for exit code changes."""
-        self._exit_code_callback = callback
 
     def set_exit_code_callback(self, callback: Callable[[int], None]) -> None:
         """Set callback for exit code changes."""

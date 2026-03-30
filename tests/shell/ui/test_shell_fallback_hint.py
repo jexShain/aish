@@ -17,7 +17,7 @@ def test_security_panel_shows_fallback_hint_for_sandbox_execute_failed(monkeypat
     monkeypatch.setenv("LANG", "zh_CN.UTF-8")
     _reset_i18n_cache()
 
-    from aish.shell_enhanced.shell_prompt_io import display_security_panel
+    from aish.shell.ui.prompt_io import display_security_panel
 
     class _Shell:
         pass
@@ -47,7 +47,7 @@ def test_security_panel_hides_fallback_hint_in_command_fallback_mode(monkeypatch
     monkeypatch.setenv("LANG", "zh_CN.UTF-8")
     _reset_i18n_cache()
 
-    from aish.shell_enhanced.shell_prompt_io import display_security_panel
+    from aish.shell.ui.prompt_io import display_security_panel
 
     class _Shell:
         pass

@@ -16,13 +16,13 @@ from typing import Any
 
 from anyio import to_thread
 
-from ..i18n import t
-from ..offload.pty_output_offload import PtyOutputOffload
-from ..tools.shell_state_capture import (apply_changes, cleanup_state_file,
-                                         create_state_file, detect_changes,
-                                         get_current_state, parse_state_file,
-                                         wrap_command_with_state_capture)
-from .shell_types import CommandResult, CommandStatus
+from ...i18n import t
+from ...offload.pty_output_offload import PtyOutputOffload
+from ...tools.shell_state_capture import (apply_changes, cleanup_state_file,
+                                          create_state_file, detect_changes,
+                                          get_current_state, parse_state_file,
+                                          wrap_command_with_state_capture)
+from ..types import CommandResult, CommandStatus
 
 
 def _build_passthrough_stdin_termios(settings: list[Any]) -> list[Any]:

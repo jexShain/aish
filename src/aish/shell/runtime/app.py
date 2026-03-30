@@ -1,0 +1,874 @@
+"""Shell application runtime."""
+
+from __future__ import annotations
+
+import anyio
+import os
+import select
+import shutil
+import signal
+import sys
+import termios
+import threading
+import time
+import tty
+from typing import TYPE_CHECKING, Any, Optional
+
+from rich.console import Console
+from rich.live import Live
+
+from ...config import Config, ConfigModel, ToolArgPreviewSettings
+from ...context_manager import ContextManager, MemoryType
+from ...i18n import t
+from ...prompts import PromptManager
+from ...pty import PTYManager
+from ...skills.hotreload import SkillHotReloadService
+from ...utils import (
+    get_current_env_info,
+    get_or_fetch_static_env_info,
+    get_output_language,
+)
+from ...welcome_screen import build_welcome_renderable
+from .ai import AIHandler
+from .events import LLMEventRouter
+from ..ui.interaction import PTYUserInteraction
+from .output import OutputProcessor
+from ..ui.placeholder import PlaceholderManager
+from ..ui.prompt_io import display_security_panel, get_user_confirmation
+from .router import InputRouter
+
+if TYPE_CHECKING:
+    from ...llm import LLMSession, LLMEventType
+    from ...skills import SkillManager
+else:
+    from ...llm import LLMEventType
+
+
+class PTYAIShell:
+    """AI shell with direct PTY connection."""
+
+    def __init__(
+        self,
+        config: ConfigModel,
+        skill_manager: "SkillManager",
+        config_manager: Optional[Config] = None,
+        console: Optional[Console] = None,
+    ):
+        self.config = config
+        self.skill_manager = skill_manager
+        self.config_manager = config_manager
+        self.console = console or Console()
+
+        self._pty_manager: Optional[PTYManager] = None
+        self._input_router: Optional[InputRouter] = None
+        self._output_processor: Optional[OutputProcessor] = None
+        self._ai_handler: Optional[AIHandler] = None
+        self._running = False
+        self._original_termios: Optional[list] = None
+
+        self.prompt_manager: PromptManager = PromptManager()
+        self.context_manager: ContextManager = ContextManager(
+            max_llm_messages=getattr(config, "max_llm_messages", 50),
+            max_shell_messages=getattr(config, "max_shell_messages", 20),
+            token_budget=getattr(config, "context_token_budget", None),
+            model=config.model,
+            enable_token_estimation=getattr(config, "enable_token_estimation", True),
+        )
+        self.llm_session: "LLMSession" = self._create_llm_session()
+
+        self.uname_info, self.os_info, self.basic_env_info = get_or_fetch_static_env_info()
+        self.output_language = get_output_language(config)
+        self.current_env_info = get_current_env_info()
+
+        env_entry = f"[system information] {self.current_env_info}"
+        self.context_manager.add_memory(
+            MemoryType.LLM, {"role": "user", "content": env_entry}
+        )
+        self.context_manager.add_memory(
+            MemoryType.KNOWLEDGE, {"key": "system_info", "value": self.uname_info}
+        )
+        self.context_manager.add_memory(
+            MemoryType.KNOWLEDGE, {"key": "os_info", "value": self.os_info}
+        )
+        self.context_manager.add_memory(
+            MemoryType.KNOWLEDGE,
+            {"key": "output_language", "value": self.output_language},
+        )
+
+        self.skill_hotreload_service: SkillHotReloadService = SkillHotReloadService(
+            skill_manager=skill_manager, debounce_ms=200
+        )
+
+        self.llm_event_router: LLMEventRouter = LLMEventRouter(
+            handlers={
+                LLMEventType.OP_START: self.handle_operation_start,
+                LLMEventType.GENERATION_START: self.handle_generation_start,
+                LLMEventType.GENERATION_END: self.handle_generation_end,
+                LLMEventType.REASONING_START: self.handle_reasoning_start,
+                LLMEventType.REASONING_DELTA: self.handle_reasoning_delta,
+                LLMEventType.REASONING_END: self.handle_reasoning_end,
+                LLMEventType.CONTENT_DELTA: self.handle_content_delta,
+                LLMEventType.TOOL_EXECUTION_START: self.handle_tool_execution_start,
+                LLMEventType.TOOL_EXECUTION_END: self.handle_tool_execution_end,
+                LLMEventType.ERROR: self.handle_error_event,
+                LLMEventType.CANCELLED: self.handle_processing_cancelled,
+                LLMEventType.INTERACTION_REQUIRED: self.handle_ask_user_required,
+                LLMEventType.TOOL_CONFIRMATION_REQUIRED: self.handle_tool_confirmation_required,
+            }
+        )
+        self.animation_active: bool = False
+        self.animation_thread: Optional[threading.Thread] = None
+        self.animation_lock: threading.Lock = threading.Lock()
+        self.animation_counter: int = 0
+        self._animation_base_text: str = "思考中"
+        self._animation_pattern: str = "braille"
+        self._animation_update_text: Optional[str] = None
+        self._reasoning_display_enabled: bool = False
+        self._reasoning_active: bool = False
+        self._reasoning_partial: str = ""
+        self._reasoning_lines: list[str] = []
+        self._reasoning_max_lines: int = 2
+        self._last_reasoning_render_lines: list[str] = []
+        self._last_streaming_accumulated: str = ""
+        self.current_live: Optional[Any] = None
+        self._content_preview_active: bool = False
+        self._at_line_start: bool = True
+
+        self._current_op_scope: Optional[Any] = None
+        self._user_requested_exit: bool = False
+        self.operation_in_progress: bool = False
+
+        self.user_interaction: PTYUserInteraction = PTYUserInteraction()
+        self._approved_ai_commands: set[str] = set()
+        self._placeholder_manager: Optional[PlaceholderManager] = None
+
+    def _create_llm_session(self) -> "LLMSession":
+        """Create LLMSession with all necessary dependencies."""
+        import logging
+
+        from ...interruption import InterruptionManager
+        from ...llm import LLMSession
+
+        logger = logging.getLogger(__name__)
+        interruption_manager = InterruptionManager()
+        self.interruption_manager = interruption_manager
+        interruption_manager.set_interrupt_callback(self._on_interrupt_requested)
+
+        session = LLMSession(
+            config=self.config,
+            skill_manager=self.skill_manager,
+            event_callback=self.handle_llm_event,
+            env_manager=None,
+            interruption_manager=interruption_manager,
+            is_command_approved=None,
+            history_manager=None,
+        )
+
+        def init_litellm_in_background() -> None:
+            try:
+                session._get_litellm()
+                session._get_acompletion()
+                with session._sync_init_lock:
+                    session._initialized = True
+                logger.info("LLM client initialized successfully in background")
+            except Exception as error:
+                logger.warning(
+                    "LLM background initialization failed: %s, will retry on first use",
+                    error,
+                )
+
+        init_thread = threading.Thread(target=init_litellm_in_background, daemon=True)
+        init_thread.start()
+        return session
+
+    def handle_operation_start(self, event) -> None:
+        return None
+
+    def handle_generation_start(self, event) -> None:
+        self._finalize_content_preview()
+        self._reset_reasoning_state()
+        self._last_streaming_accumulated = ""
+        self._reasoning_display_enabled = True
+        return self.handle_thinking_start(event)
+
+    def handle_thinking_start(self, event) -> None:
+        self._stop_animation()
+        self._last_streaming_accumulated = ""
+        self._last_reasoning_render_lines = []
+
+        if self.current_live:
+            self.current_live.stop()
+
+        self.console.print()
+        self._at_line_start = True
+
+        self.current_live = Live(console=self.console, auto_refresh=False, transient=True)
+        self.current_live.start()
+        self._start_animation(base_text="思考中", pattern="braille")
+        return None
+
+    def _update_reasoning_live(self, lines: list[str]) -> None:
+        from rich.text import Text
+
+        self._check_terminal_resize()
+        if not self.current_live:
+            self.current_live = Live(console=self.console, auto_refresh=False, transient=True)
+            self.current_live.start()
+
+        self._last_reasoning_render_lines = list(lines)
+        with self.animation_lock:
+            spinner_char = self._get_current_spinner_char("dots")
+            self.animation_counter += 1
+
+        max_width = max(10, self.console.size.width - 4)
+        trimmed_lines = [line[-max_width:] if len(line) > max_width else line for line in lines]
+        thinking_label = "思考中"
+        if trimmed_lines:
+            display_text = "\n".join([f"{spinner_char} {thinking_label}", *trimmed_lines])
+        else:
+            display_text = f"{spinner_char} {thinking_label}..."
+
+        self.current_live.update(Text(display_text, style="grey50"), refresh=True)
+
+    def _render_streaming_chunk(self, accumulated_content: str) -> None:
+        from rich.text import Text
+
+        display_text = str(accumulated_content).replace("\n", " ")
+        terminal_width = self.console.size.width
+        display_width = min(60, int(terminal_width * 0.8))
+
+        if len(display_text) > display_width:
+            display_text = "🤖 思考中: " + display_text[-(display_width - 3):]
+        else:
+            display_text = "🤖 思考中: " + display_text
+
+        if self.current_live:
+            self.current_live.update(Text(display_text, style="green"), refresh=True)
+
+    def _start_animation(
+        self,
+        base_text: Optional[str] = None,
+        pattern: str = "braille",
+        update_text: Optional[str] = None,
+    ) -> None:
+        with self.animation_lock:
+            self._animation_base_text = base_text or "思考中"
+            self._animation_pattern = pattern
+            self._animation_update_text = update_text
+
+            if self.animation_thread and self.animation_thread.is_alive():
+                self.animation_active = True
+                return
+
+            self.animation_active = True
+            self.animation_counter = 0
+
+        self.animation_thread = threading.Thread(
+            target=self._animate_thinking,
+            daemon=True,
+        )
+        self.animation_thread.start()
+
+    def _animate_thinking(self) -> None:
+        from rich.text import Text
+
+        while self.animation_active:
+            try:
+                self._check_terminal_resize()
+                with self.animation_lock:
+                    if not self.animation_active or not self.current_live:
+                        break
+
+                    current_live = self.current_live
+                    pattern = self._animation_pattern
+                    base_text = self._animation_base_text
+                    update_text = self._animation_update_text
+
+                    spinner_char = self._get_current_spinner_char(pattern)
+                    self.animation_counter += 1
+
+                if update_text:
+                    display_text = f"{spinner_char} {update_text}"
+                else:
+                    display_text = f"{spinner_char} {base_text}..."
+
+                current_live.update(Text(display_text, style="blue"), refresh=True)
+                time.sleep(0.15)
+            except Exception:
+                break
+
+    def _stop_animation(self) -> None:
+        try:
+            with self.animation_lock:
+                self.animation_active = False
+
+            if self.animation_thread and self.animation_thread.is_alive():
+                self.animation_thread.join(timeout=0.5)
+        except Exception:
+            pass
+        finally:
+            self.animation_thread = None
+
+    def handle_generation_end(self, event) -> None:
+        self._stop_animation()
+        self._reset_reasoning_state()
+        self._last_streaming_accumulated = ""
+        self._finalize_content_preview()
+        if self.current_live:
+            self.current_live.update("", refresh=True)
+            self.current_live.stop()
+            self.current_live = None
+        return None
+
+    def handle_completion_done(self, event) -> None:
+        self._last_streaming_accumulated = ""
+        self._last_reasoning_render_lines = []
+        if self.current_live:
+            self.current_live.update("", refresh=True)
+            self.current_live.stop()
+            self.current_live = None
+        return None
+
+    def handle_reasoning_start(self, event) -> None:
+        if not self._reasoning_display_enabled:
+            return None
+
+        self._finalize_content_preview()
+        self._stop_animation()
+        self._reasoning_active = True
+        self._last_streaming_accumulated = ""
+        self._reasoning_partial = ""
+        self._reasoning_lines = []
+        self._update_reasoning_live([])
+        return None
+
+    def handle_reasoning_delta(self, event) -> None:
+        if not self._reasoning_display_enabled:
+            return None
+
+        delta = str(event.data.get("delta") or "")
+        if not delta:
+            return None
+
+        if not self._reasoning_active:
+            self.handle_reasoning_start(event)
+
+        lines = self._append_reasoning_delta(delta)
+        self._update_reasoning_live(lines)
+        return None
+
+    def _append_reasoning_delta(self, delta: str) -> list[str]:
+        normalized = delta.replace("\r\n", "\n").replace("\r", "\n")
+        parts = normalized.split("\n")
+        if not parts:
+            return []
+
+        self._reasoning_partial += parts[0]
+        for segment in parts[1:]:
+            self._reasoning_lines.append(self._reasoning_partial)
+            self._reasoning_partial = segment
+            if len(self._reasoning_lines) > self._reasoning_max_lines:
+                self._reasoning_lines = self._reasoning_lines[-self._reasoning_max_lines :]
+
+        all_lines = list(self._reasoning_lines)
+        if self._reasoning_partial:
+            all_lines.append(self._reasoning_partial)
+
+        if not all_lines:
+            return []
+        return all_lines[-self._reasoning_max_lines :]
+
+    def handle_reasoning_end(self, event) -> None:
+        self._reasoning_active = False
+        return None
+
+    def handle_content_delta(self, event) -> None:
+        from rich.text import Text
+
+        self._stop_animation()
+        self._reset_reasoning_state()
+        self._last_streaming_accumulated = ""
+
+        if self.current_live:
+            self.current_live.update("", refresh=True)
+            self.current_live.stop()
+            self.current_live = None
+
+        content = event.data.get("delta") or event.data.get("accumulated") or ""
+        content = str(content)
+        if not content:
+            return None
+
+        if not self._content_preview_active:
+            self._content_preview_active = True
+            content = f"🤖 {content}"
+
+        self.console.print(Text(content, style="bold grey50"), end="")
+        self._at_line_start = False
+        return None
+
+    def handle_tool_execution_start(self, event) -> None:
+        self._finalize_content_preview()
+        tool_name = event.data.get("tool_name", "unknown")
+        tool_args = self._format_tool_args_for_display(
+            tool_name, event.data.get("tool_args", {})
+        )
+
+        prefix = t("shell.tool.prefix")
+        if event.data and event.data.get("source") == "system_diagnose_agent":
+            prefix = t("shell.tool.prefix_diagnose")
+
+        self.console.print(f"{prefix}: {tool_name} ({tool_args})", style="cyan")
+        return None
+
+    def handle_tool_execution_end(self, event) -> None:
+        tool_name = event.data.get("tool_name", "unknown")
+
+        if event.data and event.data.get("source") == "system_diagnose_agent":
+            prefix = t("shell.tool.done_diagnose")
+            self.console.print(f"{prefix}: {tool_name}", style="green")
+        return None
+
+    def handle_error_event(self, event) -> None:
+        self._finalize_content_preview()
+        error_msg = event.data.get("error_message", "Unknown error")
+        self.console.print(f"\033[31m错误: {error_msg}\033[0m")
+
+        self._reset_reasoning_state()
+        self._last_streaming_accumulated = ""
+        if self.current_live:
+            self.current_live.update("", refresh=True)
+            self.current_live.stop()
+            self.current_live = None
+        return None
+
+    def _on_interrupt_requested(self) -> None:
+        from ...cancellation import CancellationReason
+
+        self.llm_session.cancellation_token.cancel(
+            CancellationReason.USER_INTERRUPT, "User pressed Ctrl+C"
+        )
+
+    def handle_processing_cancelled(self, event=None) -> None:
+        from ...interruption import ShellState
+
+        self._stop_animation()
+        self._reset_reasoning_state()
+        self._last_streaming_accumulated = ""
+        self._finalize_content_preview()
+
+        if self.current_live:
+            self.current_live.update("", refresh=True)
+            self.current_live.stop()
+            self.current_live = None
+
+        is_tool_denied = (
+            event and event.data and event.data.get("reason") == "tool_cancelled"
+        )
+
+        if not is_tool_denied:
+            last_ai_state = self.interruption_manager.get_last_ai_state()
+
+            if last_ai_state == ShellState.AI_THINKING:
+                self.console.print("<Interrupted received.>", style="dim")
+            elif last_ai_state == ShellState.SANDBOX_EVAL:
+                self.console.print(
+                    "<Stopping... finalizing current task.>", style="dim"
+                )
+            elif last_ai_state == ShellState.COMMAND_EXEC:
+                self.console.print(
+                    "<Stopping... finishing current task (this may take a moment)>",
+                    style="dim",
+                )
+
+        self.interruption_manager.clear_last_ai_state()
+
+    def handle_ask_user_required(self, event):
+        from ...llm import LLMCallbackResult
+
+        data = event.data or {}
+        prompt = data.get("prompt", "")
+        options = data.get("options", [])
+        allow_custom_input = data.get("allow_custom_input", False)
+
+        try:
+            choice_value, custom_input = self.user_interaction.request_choice(
+                prompt, options, allow_custom_input
+            )
+
+            if choice_value:
+                data["selected_value"] = choice_value
+            elif custom_input:
+                data["selected_value"] = custom_input
+
+            if choice_value:
+                data["choice"] = choice_value
+            elif custom_input:
+                data["custom_input"] = custom_input
+            else:
+                data["cancelled"] = True
+            return LLMCallbackResult.CONTINUE
+        except Exception as error:
+            data["error"] = str(error)
+            return LLMCallbackResult.CONTINUE
+
+    def handle_tool_confirmation_required(self, event):
+        from ...llm import LLMCallbackResult
+
+        self._stop_animation()
+        if self.current_live:
+            try:
+                self.current_live.update("", refresh=True)
+                self.current_live.stop()
+            finally:
+                self.current_live = None
+
+        self._finalize_content_preview()
+        data = event.data or {}
+        panel = data.get("panel") if isinstance(data.get("panel"), dict) else {}
+        panel_mode = str(panel.get("mode") or data.get("panel_mode", "confirm")).lower()
+
+        display_security_panel(self, data, panel_mode=panel_mode)
+
+        if panel_mode == "confirm":
+            remember_command = panel.get("remember_key", data.get("remember_key"))
+            allow_remember = bool(panel.get("allow_remember", data.get("allow_remember")))
+            return get_user_confirmation(
+                self,
+                remember_command=remember_command,
+                allow_remember=allow_remember,
+            )
+        return LLMCallbackResult.CONTINUE
+
+    def handle_llm_event(self, event) -> Any:
+        return self.llm_event_router.handle(event)
+
+    def run(self) -> None:
+        self._setup_signals()
+        self._save_terminal()
+        self._show_welcome()
+        self._setup_pty()
+        self._setup_components()
+
+        self._running = True
+
+        from ...cancellation import CancellationReason
+
+        async def _main_loop():
+            with anyio.open_signal_receiver(signal.SIGINT) as sigs:
+                signal_scope = anyio.CancelScope()
+
+                async def signal_handler():
+                    try:
+                        with signal_scope:
+                            async for _ in sigs:
+                                if self._current_op_scope is not None:
+                                    self._current_op_scope.cancel()
+                                self.llm_session.cancellation_token.cancel(
+                                    CancellationReason.USER_INTERRUPT,
+                                    "SIGINT received",
+                                )
+                    except anyio.get_cancelled_exc_class():
+                        pass
+
+                async def _loop_body():
+                    self._set_raw_mode()
+
+                    while self._running:
+                        try:
+                            read_fds = [sys.stdin.fileno()]
+                            if self._pty_manager and self._pty_manager._master_fd is not None:
+                                read_fds.append(self._pty_manager._master_fd)
+
+                            ready, _, _ = select.select(read_fds, [], [], 0.05)
+                        except (ValueError, OSError):
+                            break
+
+                        for fd in ready:
+                            if fd == sys.stdin.fileno():
+                                self._handle_stdin()
+                            elif self._pty_manager and self._pty_manager._master_fd:
+                                self._handle_pty_output()
+
+                        await anyio.sleep(0)
+
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(signal_handler)
+                    await _loop_body()
+                    signal_scope.cancel()
+
+        try:
+            anyio.run(_main_loop)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._cleanup()
+
+    def _setup_signals(self) -> None:
+        signal.signal(signal.SIGTERM, self._sigterm_handler)
+        signal.signal(signal.SIGWINCH, self._sigwinch_handler)
+
+    def _sigterm_handler(self, signum, frame) -> None:
+        self._running = False
+
+    def _sigwinch_handler(self, signum, frame) -> None:
+        if self._pty_manager:
+            try:
+                size = shutil.get_terminal_size()
+                self._pty_manager.resize(size.lines, size.columns)
+            except Exception:
+                pass
+
+    def _save_terminal(self) -> None:
+        try:
+            self._original_termios = termios.tcgetattr(sys.stdin.fileno())
+        except Exception:
+            pass
+
+    def _set_raw_mode(self) -> None:
+        if self._original_termios:
+            tty.setraw(sys.stdin.fileno())
+
+    def _restore_terminal(self) -> None:
+        if self._original_termios:
+            try:
+                termios.tcsetattr(
+                    sys.stdin.fileno(), termios.TCSADRAIN, self._original_termios
+                )
+            except Exception:
+                pass
+
+    def _get_spinner_patterns(self) -> dict[str, list[str]]:
+        return {
+            "braille": ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"],
+            "dots": ["⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈"],
+            "thinking": ["🤔", "💭", "🧠", "⚡", "✨", "🔍", "💡", "🎯"],
+            "progress": ["●○○○", "○●○○", "○○●○", "○○○●", "○○●○", "○●○○"],
+            "arrows": ["←", "↖", "↑", "↗", "→", "↘", "↓", "↙"],
+            "clock": [
+                "🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗",
+                "🕘", "🕙", "🕚", "🕛",
+            ],
+        }
+
+    def _get_current_spinner_char(self, pattern_name: str = "braille") -> str:
+        patterns = self._get_spinner_patterns()
+        pattern = patterns.get(pattern_name, patterns["braille"])
+        return pattern[self.animation_counter % len(pattern)]
+
+    def _reset_reasoning_state(self) -> None:
+        self._reasoning_display_enabled = False
+        self._reasoning_active = False
+        self._reasoning_partial = ""
+        self._reasoning_lines = []
+        self._last_reasoning_render_lines = []
+
+    def _finalize_content_preview(self) -> None:
+        if not self._content_preview_active:
+            return
+        self.console.print()
+        self._content_preview_active = False
+        self._at_line_start = True
+
+    @staticmethod
+    def _safe_cancel_scope():
+        scope = anyio.CancelScope()
+        try:
+            entered = scope.__enter__()
+        except (AssertionError, Exception):
+            yield None
+            return
+        try:
+            yield entered
+        finally:
+            scope.__exit__(None, None, None)
+
+    def _get_tool_arg_preview_settings(self, tool_name: str) -> ToolArgPreviewSettings:
+        raw_config = getattr(self.config, "tool_arg_preview", None)
+        if isinstance(raw_config, dict):
+            settings = raw_config.get(tool_name) or raw_config.get("default")
+            if isinstance(settings, ToolArgPreviewSettings):
+                return settings
+        return ToolArgPreviewSettings()
+
+    def _truncate_tool_text(self, text: str, settings: ToolArgPreviewSettings) -> str:
+        max_lines = settings.max_lines
+        max_chars = settings.max_chars
+
+        preview = text
+        suffix_parts = []
+        lines = text.splitlines()
+        if max_lines and len(lines) > max_lines:
+            preview = "\n".join(lines[:max_lines])
+            suffix_parts.append(f"+{len(lines) - max_lines} lines")
+
+        if max_chars and len(preview) > max_chars:
+            extra_chars = len(preview) - max_chars
+            preview = preview[:max_chars]
+            suffix_parts.append(f"+{extra_chars} chars")
+
+        if suffix_parts:
+            return f"{preview} ... ({', '.join(suffix_parts)})"
+        return preview
+
+    def _format_tool_arg_value(
+        self, value: object, settings: ToolArgPreviewSettings
+    ) -> str:
+        max_items = settings.max_items
+
+        if isinstance(value, str):
+            return self._truncate_tool_text(value, settings)
+        if isinstance(value, dict):
+            items = list(value.items())
+            rendered_items = []
+            for key, item in items[:max_items]:
+                rendered_items.append(
+                    f"{key}={self._format_tool_arg_value(item, settings)}"
+                )
+            if len(items) > max_items:
+                rendered_items.append(f"... (+{len(items) - max_items} more)")
+            return ", ".join(rendered_items)
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+            rendered_items = [
+                self._format_tool_arg_value(item, settings)
+                for item in items[:max_items]
+            ]
+            if len(items) > max_items:
+                rendered_items.append(f"... (+{len(items) - max_items} more)")
+            return "[" + ", ".join(rendered_items) + "]"
+        return str(value)
+
+    def _format_tool_args_for_display(self, tool_name: str, tool_args: object) -> str:
+        if tool_name == "write_file" and isinstance(tool_args, dict):
+            display_args = dict(tool_args)
+            display_args.pop("content", None)
+            return self._format_tool_arg_value(display_args, ToolArgPreviewSettings())
+        settings = self._get_tool_arg_preview_settings(tool_name)
+        if not settings.enabled:
+            if isinstance(tool_args, dict) and len(tool_args) == 1:
+                return str(next(iter(tool_args.values())))
+            return str(tool_args)
+
+        if isinstance(tool_args, dict) and len(tool_args) == 1:
+            tool_args = next(iter(tool_args.values()))
+        return self._format_tool_arg_value(tool_args, settings)
+
+    def _remember_approved_command(self, command: str) -> None:
+        command = str(command)
+        if not command:
+            return
+        self._approved_ai_commands.add(command)
+
+    def _is_command_approved(self, command: str) -> bool:
+        command = str(command)
+        return bool(command) and command in self._approved_ai_commands
+
+    def _check_terminal_resize(self) -> None:
+        try:
+            current_size = shutil.get_terminal_size()
+            if not hasattr(self, "_last_terminal_size"):
+                self._last_terminal_size = current_size
+                return
+            if current_size == self._last_terminal_size:
+                return
+            self._last_terminal_size = current_size
+            self._refresh_live_for_resize()
+        except Exception:
+            pass
+
+    def _refresh_live_for_resize(self) -> None:
+        if not self.current_live:
+            return
+
+        if self._reasoning_active or self._last_reasoning_render_lines:
+            self._update_reasoning_live(self._last_reasoning_render_lines)
+            return
+
+        if self._last_streaming_accumulated:
+            self._render_streaming_chunk(self._last_streaming_accumulated)
+
+    def _show_welcome(self) -> None:
+        try:
+            welcome = build_welcome_renderable(self.config)
+            self.console.print(welcome)
+        except Exception:
+            pass
+
+    def _setup_pty(self) -> None:
+        try:
+            size = shutil.get_terminal_size()
+            rows, cols = size.lines, size.columns
+        except Exception:
+            rows, cols = 24, 80
+
+        self._pty_manager = PTYManager(
+            rows=rows, cols=cols, cwd=os.getcwd(), use_output_thread=False
+        )
+        self._pty_manager.start()
+        time.sleep(0.2)
+
+    def _setup_components(self) -> None:
+        self._ai_handler = AIHandler(
+            self._pty_manager,
+            self.llm_session,
+            self.prompt_manager,
+            self.context_manager,
+            self.skill_manager,
+            self.user_interaction,
+            self._original_termios,
+        )
+        self._ai_handler.shell = self
+        self._placeholder_manager = PlaceholderManager(
+            interruption_manager=self.interruption_manager
+        )
+        self._output_processor = OutputProcessor(
+            pty_manager=self._pty_manager,
+            placeholder_manager=self._placeholder_manager,
+        )
+        self._input_router = InputRouter(
+            self._pty_manager,
+            self._ai_handler,
+            self._output_processor,
+            placeholder_manager=self._placeholder_manager,
+            interruption_manager=self.interruption_manager,
+        )
+
+    def _handle_stdin(self) -> None:
+        try:
+            data = os.read(sys.stdin.fileno(), 4096)
+            if data:
+                self._input_router.handle_input(data)
+            else:
+                self._running = False
+        except OSError:
+            self._running = False
+
+    def _handle_pty_output(self) -> None:
+        try:
+            data = os.read(self._pty_manager._master_fd, 1024 * 20)
+            if data:
+                cleaned = self._pty_manager.exit_tracker.parse_and_update(data)
+                processed = self._output_processor.process(cleaned)
+                if processed:
+                    sys.stdout.buffer.write(processed)
+                    sys.stdout.buffer.flush()
+            else:
+                self._running = False
+        except OSError:
+            self._running = False
+
+    def _cleanup(self) -> None:
+        if not self._running and hasattr(self, "_cleanup_done"):
+            return
+        self._running = False
+        self._cleanup_done = True
+
+        self._stop_animation()
+        self._finalize_content_preview()
+
+        if self._pty_manager:
+            self._pty_manager.stop()
+
+        self._restore_terminal()
+        self.console.print(t("cli.startup.goodbye"))
