@@ -5,6 +5,7 @@ Manages display and clearing of placeholder text after bash prompt.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 from wcwidth import wcwidth
 
@@ -23,16 +24,31 @@ class PlaceholderManager:
     GRAY = "\x1b[90m"
     RESET = "\x1b[0m"
 
-    def __init__(self, interruption_manager: InterruptionManager):
+    def __init__(
+        self,
+        interruption_manager: InterruptionManager,
+        enabled: bool = True,
+    ):
         """Initialize PlaceholderManager.
 
         Args:
             interruption_manager: Used to determine placeholder content
+            enabled: Whether placeholder rendering is enabled
         """
         self._interruption_manager = interruption_manager
+        self._enabled = enabled
         self._current_placeholder: Optional[str] = None
         self._placeholder_visible = False
         self._cleared_for_current_line = False
+
+    @classmethod
+    def from_environment(
+        cls,
+        interruption_manager: InterruptionManager,
+    ) -> "PlaceholderManager":
+        """Build a placeholder manager using environment feature flags."""
+        enabled = os.getenv("AISH_ENABLE_PLACEHOLDER", "0") == "1"
+        return cls(interruption_manager=interruption_manager, enabled=enabled)
 
     def get_placeholder_text(self) -> Optional[str]:
         """Get placeholder text based on current shell state.
@@ -40,6 +56,9 @@ class PlaceholderManager:
         Returns:
             Placeholder text string, or None if no placeholder should be shown
         """
+        if not self._enabled:
+            return None
+
         # Check InterruptionManager state first
         state = self._interruption_manager.state
 
@@ -84,6 +103,12 @@ class PlaceholderManager:
         Returns:
             Bytes to write to stdout to display the placeholder
         """
+        if not self._enabled:
+            return b""
+
+        if self._placeholder_visible:
+            return b""
+
         text = self.get_placeholder_text()
         if not text:
             self._placeholder_visible = False
@@ -116,6 +141,9 @@ class PlaceholderManager:
         Returns:
             Bytes to write to stdout to clear the placeholder
         """
+        if not self._enabled:
+            return b""
+
         if not self._placeholder_visible or not self._current_placeholder:
             return b""
 
@@ -137,6 +165,8 @@ class PlaceholderManager:
 
     def mark_cleared(self) -> None:
         """Mark placeholder as cleared for current line."""
+        if not self._enabled:
+            return
         self._cleared_for_current_line = True
         self._placeholder_visible = False
 
@@ -148,8 +178,8 @@ class PlaceholderManager:
 
     def is_visible(self) -> bool:
         """Check if placeholder is currently visible."""
-        return self._placeholder_visible
+        return self._enabled and self._placeholder_visible
 
     def is_cleared(self) -> bool:
         """Check if placeholder was cleared for current line."""
-        return self._cleared_for_current_line
+        return self._enabled and self._cleared_for_current_line

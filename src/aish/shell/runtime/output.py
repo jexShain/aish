@@ -6,6 +6,7 @@ import sys
 from typing import TYPE_CHECKING, Optional
 
 from ...i18n import t
+from ...pty.control_protocol import BackendControlEvent
 
 if TYPE_CHECKING:
     from ...pty import PTYManager
@@ -28,6 +29,7 @@ class OutputProcessor:
         self.placeholder_manager = placeholder_manager
         self.shell = shell
         self._current_command: str = ""
+        self._last_recorded_result: tuple[str, int] | None = None
 
     def set_waiting_for_result(self, waiting: bool, command: str = "") -> None:
         """Set whether we're waiting for a command result."""
@@ -43,6 +45,13 @@ class OutputProcessor:
     def set_filter_exit_echo(self, filter_exit: bool) -> None:
         """Set whether to filter exit command echo."""
         self._filter_exit_echo = filter_exit
+
+    def handle_backend_event(self, event: BackendControlEvent) -> None:
+        """Update output state from explicit backend lifecycle events."""
+        if event.type != "prompt_ready":
+            return
+
+        self._waiting_for_result = False
 
     def process(self, data: bytes) -> bytes:
         """Process PTY output, return cleaned output."""
@@ -63,7 +72,6 @@ class OutputProcessor:
                 b"% ",
                 b"> ",
                 b"\x1b[0m ",
-                b"m ",
             )
             for pattern in prompt_patterns:
                 if data.endswith(pattern):
@@ -74,18 +82,18 @@ class OutputProcessor:
 
         tracker = self.pty_manager.exit_tracker
 
-        # Check for exit code marker regardless of _waiting_for_result.
-        # This handles commands from bash readline (up-arrow, etc.) that bypass the router.
         if tracker.has_exit_code():
-            # Add shell history to context when tracking a command
-            if self._waiting_for_result and self.shell and self._current_command:
+            command = self._current_command or tracker.last_command
+            result_key = (command, tracker.last_exit_code)
+            if self.shell and command and self._last_recorded_result != result_key:
                 self.shell.add_shell_history(
-                    command=self._current_command,
+                    command=command,
                     returncode=tracker.last_exit_code,
                     stdout="",
                     stderr="",
                     offload={"status": "inline", "source": "pty"},
                 )
+                self._last_recorded_result = result_key
 
             error_info = tracker.consume_error()
             if error_info is not None:

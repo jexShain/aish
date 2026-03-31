@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import sys
 import threading
-from typing import TYPE_CHECKING, Optional
+import time
+from typing import TYPE_CHECKING, Callable, Optional
 
 from wcwidth import wcwidth
 
@@ -60,6 +61,9 @@ class InputRouter:
     )
 
     ESC = "\x1b"
+    BRACKETED_PASTE_START = b"\x1b[200~"
+    BRACKETED_PASTE_END = b"\x1b[201~"
+    BRACKETED_PASTE_STALE_SECONDS = 2.0
 
     def __init__(
         self,
@@ -68,6 +72,7 @@ class InputRouter:
         output_processor: Optional["OutputProcessor"] = None,
         placeholder_manager: Optional["PlaceholderManager"] = None,
         interruption_manager: Optional["InterruptionManager"] = None,
+        command_submit_callback: Optional[Callable[[str], int]] = None,
         history_manager=None,
     ):
         self.pty_manager = pty_manager
@@ -75,6 +80,7 @@ class InputRouter:
         self.output_processor = output_processor
         self.placeholder_manager = placeholder_manager
         self.interruption_manager = interruption_manager
+        self.command_submit_callback = command_submit_callback
         self._buffer = ""
         self._at_line_start = True
         self._in_ai_mode = False
@@ -82,17 +88,23 @@ class InputRouter:
         self._current_cmd = ""
         self._in_bracketed_paste = False
         self._paste_buffer = b""
+        self._paste_started_at = 0.0
         self._placeholder_cleared = False
         self._placeholder_refresh_timer: Optional[threading.Timer] = None
         self._suggestion_engine = SuggestionEngine(history_manager=history_manager)
+        self._cursor_tracking_dirty = False
 
     def handle_input(self, data: bytes) -> None:
         """Process input bytes and route to PTY or AI."""
+        if not data:
+            return
+
         if self._in_bracketed_paste:
-            if b"\x1b[201~" in data:
-                parts = data.split(b"\x1b[201~", 1)
+            if self.BRACKETED_PASTE_END in data:
+                parts = data.split(self.BRACKETED_PASTE_END, 1)
                 self._paste_buffer += parts[0]
                 self._in_bracketed_paste = False
+                self._paste_started_at = 0.0
                 pasted = self._paste_buffer
                 self._paste_buffer = b""
                 if pasted:
@@ -100,18 +112,39 @@ class InputRouter:
                 if parts[1]:
                     self.handle_input(parts[1])
                 return
+
+            now = time.monotonic()
+            stale = (
+                self._paste_started_at > 0
+                and (now - self._paste_started_at) > self.BRACKETED_PASTE_STALE_SECONDS
+            )
+            if stale or self._looks_like_interactive_key(data):
+                buffered = self._paste_buffer + data
+                self._in_bracketed_paste = False
+                self._paste_buffer = b""
+                self._paste_started_at = 0.0
+                if buffered:
+                    self._process_normal_input(buffered)
+                return
+
             self._paste_buffer += data
             return
 
-        if data.startswith(b"\x1b[200~"):
+        if self.BRACKETED_PASTE_START in data:
+            before, after = data.split(self.BRACKETED_PASTE_START, 1)
+            if before:
+                self._process_normal_input(before)
             self._in_bracketed_paste = True
             self._paste_buffer = b""
-            remaining = data[6:]
+            self._paste_started_at = time.monotonic()
+            remaining = after
             if remaining:
                 self.handle_input(remaining)
             return
 
         if len(data) > 0 and data[0] == 0x1B:
+            if not self._in_ai_mode and self.placeholder_manager and not self._placeholder_cleared:
+                self._clear_placeholder()
             if not self._in_ai_mode and data == b"\x1b[C":
                 suffix = self._suggestion_engine.accept()
                 if suffix:
@@ -122,10 +155,23 @@ class InputRouter:
                     return
             if self._in_ai_mode:
                 return
+            self._cursor_tracking_dirty = True
+            self._suggestion_engine.clear()
             self.pty_manager.send(data)
             return
 
         self._process_normal_input(data)
+
+    @staticmethod
+    def _looks_like_interactive_key(data: bytes) -> bool:
+        """Heuristic to recover if bracketed paste markers are truncated."""
+        if len(data) > 8:
+            return False
+        if data in (b"\r", b"\n", b"\x03", b"\x04", b"\x7f"):
+            return True
+        if data.startswith(b"\x1b"):
+            return True
+        return False
 
     def _process_normal_input(self, data: bytes) -> None:
         """Process normal (non-escape) input."""
@@ -175,6 +221,8 @@ class InputRouter:
                 self._suggestion_engine.clear()
                 if self._current_cmd.strip():
                     cmd_stripped = self._current_cmd.strip()
+                    if self.command_submit_callback is not None:
+                        self.command_submit_callback(cmd_stripped)
                     self.pty_manager.exit_tracker.set_last_command(cmd_stripped)
                     is_exit_cmd = cmd_stripped in (
                         "exit",
@@ -191,6 +239,8 @@ class InputRouter:
                 self.pty_manager.send(b"\r")
                 self._at_line_start = True
                 self._current_cmd = ""
+
+            self._cursor_tracking_dirty = False
 
             if self.placeholder_manager:
                 self.placeholder_manager.reset_for_new_line()
@@ -217,6 +267,7 @@ class InputRouter:
 
                 self.pty_manager.send(char.encode())
                 self._current_cmd = ""
+                self._cursor_tracking_dirty = False
 
                 if action == InterruptAction.CONFIRM_EXIT:
                     if self._placeholder_refresh_timer:
@@ -234,7 +285,15 @@ class InputRouter:
 
             self.pty_manager.send(char.encode())
             self._current_cmd = ""
+            self._cursor_tracking_dirty = False
             return
+
+        if char in ("\x01", "\x02", "\x05", "\x06"):
+            if not self._in_ai_mode:
+                self._cursor_tracking_dirty = True
+                self._suggestion_engine.clear()
+                self.pty_manager.send(char.encode())
+                return
 
         if char in ("\x7f", "\x08"):
             if self._in_ai_mode:
@@ -257,6 +316,8 @@ class InputRouter:
                 return
 
             self.pty_manager.send(char.encode())
+            if self._cursor_tracking_dirty:
+                return
             if self._current_cmd:
                 self._current_cmd = self._current_cmd[:-1]
                 if not self._current_cmd:
@@ -292,21 +353,18 @@ class InputRouter:
             return
 
         self.pty_manager.send(char.encode())
-        # Control characters (< 0x20) are readline commands (Ctrl+R, Ctrl+W, etc.)
-        # They should NOT be tracked as part of the command text
+        if self._cursor_tracking_dirty:
+            self._at_line_start = False
+            return
         if ord(char) >= 0x20 and char != "\x7f":
             self._current_cmd += char
             self._at_line_start = False
             self._suggestion_engine.update(self._current_cmd)
         else:
-            # Control char like Ctrl+R/Ctrl+W/Ctrl+U invalidates command tracking
-            # since readline modifies the line internally in ways we can't observe
             self._current_cmd = ""
             self._at_line_start = True
+            self._cursor_tracking_dirty = True
             self._suggestion_engine.clear()
-            # For readline control chars, clear to end of line to give readline
-            # a clean slate. Using \x1b[K is safer than cursor movement because
-            # readline will immediately redraw with its own escape sequences.
             sys.stdout.write("\x1b[K")
             sys.stdout.flush()
 

@@ -396,8 +396,8 @@ Please analyze the error and suggest a fix. Check the shell history context abov
             f"{t('shell.error_correction.confirm_execute_prefix')}\033[1;36m{command}\033[0m{t('shell.error_correction.confirm_execute_suffix')}"
         )
         if confirmed:
-            self.pty_manager.exit_tracker.set_last_command(command)
-            self.pty_manager.send((command + "\r").encode())
+            shell = self._require_shell()
+            shell.submit_backend_command(command)
             try:
                 ready, _, _ = select.select([self.pty_manager._master_fd], [], [], 0.1)
                 if ready:
