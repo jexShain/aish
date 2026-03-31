@@ -72,13 +72,13 @@ class OutputProcessor:
                         data = data + placeholder_seq
                     break
 
-        if not self._waiting_for_result:
-            return data
-
         tracker = self.pty_manager.exit_tracker
+
+        # Check for exit code marker regardless of _waiting_for_result.
+        # This handles commands from bash readline (up-arrow, etc.) that bypass the router.
         if tracker.has_exit_code():
-            # Add shell history to context
-            if self.shell and self._current_command:
+            # Add shell history to context when tracking a command
+            if self._waiting_for_result and self.shell and self._current_command:
                 self.shell.add_shell_history(
                     command=self._current_command,
                     returncode=tracker.last_exit_code,

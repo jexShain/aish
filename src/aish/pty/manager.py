@@ -145,6 +145,10 @@ PS1=""  # Will be set by PROMPT_COMMAND
         # Lock for thread-safe operations
         self._lock = threading.Lock()
 
+        # exec mode: when active, output thread buffers instead of forwarding
+        self._exec_mode = threading.Event()
+        self._exec_buffer: bytearray = bytearray()
+
     @property
     def is_running(self) -> bool:
         """Check if PTY is active."""
@@ -257,12 +261,17 @@ PS1=""  # Will be set by PROMPT_COMMAND
                 # Parse exit code markers and clean output
                 cleaned = self._exit_tracker.parse_and_update(data)
 
-                # Forward cleaned output to callback
-                if cleaned and self._output_callback:
-                    try:
-                        self._output_callback(cleaned)
-                    except Exception:
-                        pass
+                # In exec mode, buffer output instead of forwarding
+                if self._exec_mode.is_set():
+                    if cleaned:
+                        self._exec_buffer.extend(cleaned)
+                else:
+                    # Forward cleaned output to callback
+                    if cleaned and self._output_callback:
+                        try:
+                            self._output_callback(cleaned)
+                        except Exception:
+                            pass
 
             except OSError:
                 self._running = False
@@ -293,6 +302,149 @@ PS1=""  # Will be set by PROMPT_COMMAND
             self._rows = rows
             self._cols = cols
             set_winsize(self._master_fd, rows, cols)
+
+    @staticmethod
+    def _clean_pty_output(raw: bytes, command: str) -> str:
+        """Clean PTY output: strip ANSI, echo, prompt, exit markers."""
+        import re as _re
+
+        text = raw.decode("utf-8", errors="replace")
+
+        # Remove ANSI escape sequences (including CSI ? and ; variants)
+        text = _re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", text)
+        text = _re.sub(r"\x1b\].*?\x07", "", text)
+
+        # Remove carriage returns (keep newlines)
+        text = text.replace("\r\n", "\n").replace("\r", "")
+
+        # Remove command echo: lines containing the command itself
+        cmd_escaped = _re.escape(command.strip())
+        text = _re.sub(
+            rf"^.*{cmd_escaped}\s*$\n?",
+            "",
+            text,
+            count=1,
+            flags=_re.MULTILINE,
+        )
+
+        # Remove trailing prompt line (contains prompt symbols)
+        lines = text.rstrip().split("\n")
+        if lines:
+            last = lines[-1]
+            if "\u279c" in last or _re.match(r"^.*\S+.*\s*[#$>]\s*$", last):
+                lines = lines[:-1]
+        text = "\n".join(lines)
+
+        return text.strip()
+
+    def execute_command(
+        self, command: str, timeout: float = 30.0
+    ) -> tuple[str, int]:
+        """Execute a command via PTY and return (output, exit_code).
+
+        Sends command to bash, buffers output until exit code marker appears,
+        then returns cleaned output. During execution, the output thread
+        buffers instead of forwarding to the display callback.
+        """
+        if not self.is_running:
+            return "", -1
+
+        # Clear any stale exit code state
+        self._exit_tracker.clear_exit_available()
+
+        if self._use_output_thread:
+            return self._exec_via_thread(command, timeout)
+        else:
+            return self._exec_via_poll(command, timeout)
+
+    def _exec_via_thread(
+        self, command: str, timeout: float
+    ) -> tuple[str, int]:
+        """Execute using background output thread for I/O."""
+        # Enter exec mode: output thread will buffer
+        self._exec_buffer.clear()
+        self._exec_mode.set()
+
+        # Send command
+        self.send_command(command)
+
+        # Wait for exit code with timeout
+        deadline = time.monotonic() + timeout
+        result = None
+        while time.monotonic() < deadline:
+            result = self._exit_tracker.consume_exit_code()
+            if result is not None:
+                break
+            time.sleep(0.05)
+
+        # Exit exec mode
+        self._exec_mode.clear()
+
+        # Grab buffered output
+        raw_output = bytes(self._exec_buffer)
+        self._exec_buffer.clear()
+
+        if result is None:
+            # Timeout - send Ctrl+C
+            self.send(b"\x03")
+            cleaned = self._clean_pty_output(raw_output, command)
+            return cleaned, -1
+
+        _cmd, exit_code = result
+        cleaned = self._clean_pty_output(raw_output, command)
+        return cleaned, exit_code
+
+    def _exec_via_poll(
+        self, command: str, timeout: float
+    ) -> tuple[str, int]:
+        """Execute by directly polling PTY fd (when no output thread)."""
+        # First, drain any existing output from PTY to avoid confusion
+        # with previous command's exit code marker
+        try:
+            while True:
+                ready, _, _ = select.select([self._master_fd], [], [], 0)
+                if not ready:
+                    break
+                try:
+                    os.read(self._master_fd, 4096)
+                except OSError:
+                    break
+        except (ValueError, OSError):
+            pass
+
+        # Clear any stale exit code state
+        self._exit_tracker.clear_exit_available()
+
+        # Send command
+        self.send_command(command)
+
+        # Read output directly from PTY fd until exit code appears
+        deadline = time.monotonic() + timeout
+        raw_output = bytearray()
+
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([self._master_fd], [], [], 0.05)
+            if ready:
+                try:
+                    data = os.read(self._master_fd, 4096)
+                    if data:
+                        # Parse exit code markers, get cleaned data
+                        cleaned = self._exit_tracker.parse_and_update(data)
+                        raw_output.extend(cleaned)
+                except OSError:
+                    break
+
+            # Check if exit code arrived
+            result = self._exit_tracker.consume_exit_code()
+            if result is not None:
+                _cmd, exit_code = result
+                cleaned_output = self._clean_pty_output(bytes(raw_output), command)
+                return cleaned_output, exit_code  # type: ignore[return-value]
+
+        # Timeout - send Ctrl+C
+        self.send(b"\x03")
+        cleaned_output = self._clean_pty_output(bytes(raw_output), command)
+        return cleaned_output, -1  # type: ignore[return-value]
 
     def stop(self) -> None:
         """Stop bash and close PTY."""

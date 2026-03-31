@@ -94,12 +94,18 @@ __aish_git_info() {
 __aish_generate_prompt() {
     local exit_code=$?
     __aish_last_exit_code=$exit_code
-    printf "[AISH_EXIT:%s]" "$exit_code"
+    # Get last command from history (works for up-arrow and normal input)
+    local cmd=$(HISTTIMEFORMAT='' history 1 2>/dev/null | sed 's/^\s*[0-9]\+\s*//')
+    # Encode ] as %5D to avoid breaking marker parsing
+    cmd="${cmd//]/%5D}"
+    printf "[AISH_EXIT:%s:%s]" "$exit_code" "$cmd"
 
     local p=""
 
     # Path (abbreviated, blue)
-    p=":${__AISH_BL}$(__aish_abbrev_path "$PWD")${__AISH_R}"
+    # Wrap ANSI sequences with \[...\] so readline correctly calculates visible prompt width.
+    # Without this, Ctrl+R reverse-i-search leaves ghost text after accepting a result.
+    p=":\[${__AISH_BL}\]$(__aish_abbrev_path "$PWD")\[${__AISH_R}\]"
 
     # Git info
     local git_info
@@ -109,32 +115,32 @@ __aish_generate_prompt() {
 
         # Branch color
         if [[ "$branch" == "HEAD" ]]; then
-            p+="|${__AISH_D}$branch${__AISH_R}"
+            p+="|\[${__AISH_D}\]$branch\[${__AISH_R}\]"
         else
-            p+="|${__AISH_M}$branch${__AISH_R}"
+            p+="|\[${__AISH_M}\]$branch\[${__AISH_R}\]"
         fi
 
         # Status colors
         if [[ "$staged" != "0" ]]; then
-            p+="${__AISH_Y}●${__AISH_R} ${__AISH_Y}+$staged${__AISH_R}"
+            p+="\[${__AISH_Y}\]●\[${__AISH_R}\] \[${__AISH_Y}\]+$staged\[${__AISH_R}\]"
         elif [[ "$modified" != "0" ]]; then
-            p+="${__AISH_RD}●${__AISH_R} ${__AISH_RD}~$modified${__AISH_R}"
+            p+="\[${__AISH_RD}\]●\[${__AISH_R}\] \[${__AISH_RD}\]~$modified\[${__AISH_R}\]"
         elif [[ "$untracked" != "0" ]]; then
-            p+="${__AISH_C}●${__AISH_R} ${__AISH_D}?$untracked${__AISH_R}"
+            p+="\[${__AISH_C}\]●\[${__AISH_R}\] \[${__AISH_D}\]?$untracked\[${__AISH_R}\]"
         else
-            p+="${__AISH_G}●${__AISH_R}"
+            p+="\[${__AISH_G}\]●\[${__AISH_R}\]"
         fi
 
         # Ahead/behind
-        [[ -n "$ahead" && "$ahead" != "0" ]] && p+=" ${__AISH_C}↑$ahead${__AISH_R}"
-        [[ -n "$behind" && "$behind" != "0" ]] && p+=" ${__AISH_C}↓$behind${__AISH_R}"
+        [[ -n "$ahead" && "$ahead" != "0" ]] && p+=" \[${__AISH_C}\]↑$ahead\[${__AISH_R}\]"
+        [[ -n "$behind" && "$behind" != "0" ]] && p+=" \[${__AISH_C}\]↓$behind\[${__AISH_R}\]"
     fi
 
     # Prompt symbol
     if [[ "$exit_code" != "0" ]]; then
-        p+=" ${__AISH_RD}➜➜${__AISH_R} "
+        p+=" \[${__AISH_RD}\]➜➜\[${__AISH_R}\] "
     else
-        p+=" ${__AISH_G}➜${__AISH_R} "
+        p+=" \[${__AISH_G}\]➜\[${__AISH_R}\] "
     fi
 
     PS1="$p"

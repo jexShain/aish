@@ -105,6 +105,11 @@ class AIHandler:
             try:
                 return loop.run_until_complete(coro)
             finally:
+                # Cancel all pending tasks before closing the loop to avoid
+                # "Task pending" warnings from streaming async generators
+                for task in asyncio.all_tasks(loop):
+                    task.cancel()
+                loop.run_until_complete(asyncio.sleep(0))
                 loop.close()
 
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -136,13 +141,7 @@ class AIHandler:
         """Handle error correction."""
         tracker = self.pty_manager.exit_tracker
 
-        # Debug output
-        import sys
-        sys.stderr.write(f"[DEBUG handle_error_correction] has_error={tracker.has_error}, last_exit_code={tracker.last_exit_code}, last_command={tracker.last_command!r}\n")
-        sys.stderr.flush()
-
-        # Check has_error flag which tracks if last command had non-zero exit
-        if not tracker.has_error:
+        if tracker.last_exit_code == 0:
             print("\r\033[KNo previous error to fix.")
             self._trigger_prompt_redraw()
             self._set_raw_mode()
@@ -172,12 +171,14 @@ class AIHandler:
                     prompt = f"""<command_result>
 Command: {cmd}
 Exit code: {tracker.last_exit_code}
-</command_result>"""
+</command_result>
 
-                    response = await self.llm_session.completion(
+Please analyze the error and suggest a fix. Check the shell history context above for the actual error output."""
+
+                    response = await self.llm_session.process_input(
                         prompt,
+                        context_manager=self.context_manager,
                         system_message=system_message,
-                        emit_events=True,
                         stream=True,
                     )
                     return response
@@ -190,6 +191,14 @@ Exit code: {tracker.last_exit_code}
 
             shell.interruption_manager.set_state(ShellState.AI_THINKING)
             shell.operation_in_progress = True
+
+            # Record error correction to history
+            try:
+                shell.history_manager._add_entry_sync(
+                    command=f"[error_fix] {cmd}", source="ai"
+                )
+            except Exception:
+                pass
 
             try:
                 response = self._run_async_in_thread(_fix())
@@ -271,6 +280,14 @@ Exit code: {tracker.last_exit_code}
 
             shell.interruption_manager.set_state(ShellState.AI_THINKING)
             shell.operation_in_progress = True
+
+            # Record AI question to history
+            try:
+                shell.history_manager._add_entry_sync(
+                    command=question, source="ai"
+                )
+            except Exception:
+                pass
 
             try:
                 response = self._run_async_in_thread(_ask())

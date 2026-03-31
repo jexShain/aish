@@ -143,11 +143,15 @@ class BashTool(ToolBase):
         cancellation_token_ref=None,
         history_manager=None,
         offload_settings: Optional[BashOutputOffloadSettings | dict] = None,
+        pty_manager=None,
+        context_manager=None,
     ):
         """
         Args:
             cancellation_token_ref: A callable that returns the current cancellation token
             history_manager: HistoryManager instance for recording command history
+            pty_manager: PTYManager for shared bash session execution
+            context_manager: ContextManager for recording LLM context
         """
         super().__init__(
             name="bash_exec",
@@ -195,6 +199,12 @@ class BashTool(ToolBase):
             history_manager=None,
         )
 
+        # PTY manager for shared bash session execution
+        self.pty_manager = pty_manager
+
+        # Context manager for LLM context
+        self.context_manager = context_manager
+
         # 使用可调用对象来获取当前的 token，而不是直接保存引用
         # 这样当 LLMSession 重置 token 时，BashTool 能看到新的 token
         if callable(cancellation_token_ref):
@@ -204,6 +214,74 @@ class BashTool(ToolBase):
             self._get_cancellation_token = lambda: cancellation_token_ref
         else:
             self._get_cancellation_token = lambda: None
+
+    def _add_to_context(
+        self, command: str, returncode: int, stdout: str, stderr: str
+    ) -> None:
+        """Add command execution result to LLM context."""
+        from aish.context_manager import MemoryType
+
+        # Get preview bytes from config (default to 1024 if not configured)
+        preview_bytes = 1024
+        if self.offload_settings and hasattr(self.offload_settings, "preview_bytes"):
+            try:
+                preview_bytes = int(self.offload_settings.preview_bytes)
+                if preview_bytes <= 0:
+                    preview_bytes = 1024
+            except (TypeError, ValueError):
+                preview_bytes = 1024
+
+        # Truncate stdout/stderr to preview size
+        def truncate_preview(text: str, limit: int) -> tuple[str, bool]:
+            if not text:
+                return "", False
+            if limit <= 0:
+                return "", True
+            raw = text.encode("utf-8")
+            if len(raw) <= limit:
+                return text, False
+            return raw[:limit].decode("utf-8", errors="ignore"), True
+
+        stdout_preview, stdout_truncated = truncate_preview(stdout or "", preview_bytes)
+        stderr_preview, stderr_truncated = truncate_preview(stderr or "", preview_bytes)
+
+        if not stdout_preview:
+            stdout_preview = ""
+        if not stderr_preview:
+            stderr_preview = ""
+
+        if stdout_truncated:
+            stdout_preview += f"\n... [stdout preview truncated to {preview_bytes} bytes]"
+        if stderr_truncated:
+            stderr_preview += f"\n... [stderr preview truncated to {preview_bytes} bytes]"
+
+        status_symbol = "\u2713" if returncode == 0 else "\u2717"
+        summary = f"$ {command} \u2192 {status_symbol} (exit {returncode})"
+
+        # Build offload payload
+        offload_payload = {"status": "inline", "reason": "not_offloaded"}
+        offload_json = json.dumps(
+            offload_payload, ensure_ascii=False, separators=(",", ":")
+        )
+
+        history_entry = "\n".join(
+            [
+                summary,
+                "<stdout>",
+                stdout_preview,
+                "</stdout>",
+                "<stderr>",
+                stderr_preview,
+                "</stderr>",
+                "<return_code>",
+                str(returncode),
+                "</return_code>",
+                "<offload>",
+                offload_json,
+                "</offload>",
+            ]
+        )
+        self.context_manager.add_memory(MemoryType.SHELL, history_entry)
 
     def need_confirm_before_exec(self, code: Optional[str] = None) -> bool:
         """Override ToolBase method to integrate security check"""
@@ -422,10 +500,22 @@ class BashTool(ToolBase):
         if self.interruption_manager:
             self.interruption_manager.set_state(ShellState.COMMAND_EXEC)
 
-        # 使用统一执行器执行命令（自动检测状态变化）
-        success, stdout, stderr, returncode, changes = self.executor.execute(
-            code, source="ai"
-        )
+        # Choose execution backend
+        if self.pty_manager and self.pty_manager.is_running:
+            # PTY execution: share user's bash session
+            pty_stdout, pty_rc = self.pty_manager.execute_command(code)
+            stdout = pty_stdout
+            stderr = ""
+            returncode = pty_rc
+            # Add to LLM context
+            if self.context_manager:
+                self._add_to_context(code, returncode, stdout, stderr)
+        else:
+            # Subprocess execution (fallback)
+            success, stdout, stderr, returncode, _changes = self.executor.execute(
+                code, source="ai"
+            )
+            pty_rc = returncode
 
         # 恢复状态
         if self.interruption_manager:
@@ -499,7 +589,7 @@ class BashTool(ToolBase):
         )
 
         # 构造返回结果
-        if success:
+        if returncode == 0:
             return ToolResult(ok=True, output=output)
 
         return ToolResult(

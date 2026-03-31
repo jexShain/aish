@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import anyio
+import datetime as dt
+import getpass
 import os
 import select
 import shutil
@@ -12,16 +14,21 @@ import termios
 import threading
 import time
 import tty
+import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from rich.console import Console
 from rich.live import Live
 
-from ...config import Config, ConfigModel, ToolArgPreviewSettings
+from ...config import Config, ConfigModel, ToolArgPreviewSettings, get_default_session_db_path
 from ...context_manager import ContextManager, MemoryType
+from ...history_manager import HistoryManager
 from ...i18n import t
+from ...logging_utils import set_session_uuid
 from ...prompts import PromptManager
 from ...pty import PTYManager
+from ...session_store import SessionRecord, SessionStore
 from ...skills.hotreload import SkillHotReloadService
 from ...utils import (
     get_current_env_info,
@@ -58,6 +65,18 @@ class PTYAIShell:
         self.skill_manager = skill_manager
         self.config_manager = config_manager
         self.console = console or Console()
+
+        # Session persistence
+        self.session_record: Optional[SessionRecord] = None
+        self._create_new_session_record()
+        if self.session_record:
+            set_session_uuid(self.session_record.session_uuid)
+
+        # History manager
+        self.history_manager = HistoryManager(
+            db_path=self._resolve_session_db_path(),
+            session_uuid=self.session_record.session_uuid if self.session_record else str(uuid.uuid4()),
+        )
 
         self._pty_manager: Optional[PTYManager] = None
         self._input_router: Optional[InputRouter] = None
@@ -202,6 +221,48 @@ class PTYAIShell:
                     encoded = encoded[:-1]
             return ""
 
+    def _resolve_session_db_path(self) -> Path:
+        """Resolve session database path from config or default."""
+        db_path_value = getattr(self.config, "session_db_path", "")
+        if not str(db_path_value).strip():
+            db_path_value = get_default_session_db_path()
+        return Path(db_path_value).expanduser()
+
+    def _create_new_session_record(self) -> None:
+        """Create a new persisted session record."""
+        db_path = self._resolve_session_db_path()
+
+        store: Optional[SessionStore] = None
+        try:
+            store = SessionStore(db_path)
+            self.session_record = store.create_session(
+                model=self.config.model,
+                api_base=getattr(self.config, "api_base", None),
+                run_user=getpass.getuser(),
+                state={
+                    "temperature": getattr(self.config, "temperature", None),
+                    "max_tokens": getattr(self.config, "max_tokens", None),
+                },
+            )
+        except Exception:
+            self.session_record = SessionRecord(
+                session_uuid=str(uuid.uuid4()),
+                created_at=dt.datetime.utcnow(),
+                model=self.config.model,
+                api_base=getattr(self.config, "api_base", None),
+                run_user=getpass.getuser(),
+                state={
+                    "temperature": getattr(self.config, "temperature", None),
+                    "max_tokens": getattr(self.config, "max_tokens", None),
+                },
+            )
+        finally:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    pass
+
     def _create_llm_session(self) -> "LLMSession":
         """Create LLMSession with all necessary dependencies."""
         import logging
@@ -221,7 +282,7 @@ class PTYAIShell:
             env_manager=None,
             interruption_manager=interruption_manager,
             is_command_approved=None,
-            history_manager=None,
+            history_manager=getattr(self, "history_manager", None),
         )
 
         def init_litellm_in_background() -> None:
@@ -893,7 +954,13 @@ class PTYAIShell:
             self._output_processor,
             placeholder_manager=self._placeholder_manager,
             interruption_manager=self.interruption_manager,
+            history_manager=self.history_manager,
         )
+
+        # Wire PTY manager and context manager to BashTool for AI tool execution
+        if self.llm_session and hasattr(self.llm_session, "bash_tool"):
+            self.llm_session.bash_tool.pty_manager = self._pty_manager
+            self.llm_session.bash_tool.context_manager = self.context_manager
 
     def _handle_stdin(self) -> None:
         try:
@@ -929,9 +996,22 @@ class PTYAIShell:
                                 stderr="",
                             )
             else:
-                self._running = False
+                # PTY slave closed (bash exited)
+                if self._user_requested_exit:
+                    # User typed exit/logout — honor it
+                    self._running = False
+                elif self._restart_pty():
+                    return
+                else:
+                    self._running = False
         except OSError:
-            self._running = False
+            # PTY error - try to restart
+            if self._user_requested_exit:
+                self._running = False
+            elif self._restart_pty():
+                return
+            else:
+                self._running = False
 
     def add_shell_history(
         self,
@@ -983,6 +1063,18 @@ class PTYAIShell:
         )
         self.context_manager.add_memory(MemoryType.SHELL, history_entry)
 
+        # Persist to database
+        try:
+            self.history_manager._add_entry_sync(
+                command=command,
+                source="user",
+                returncode=returncode,
+                stdout=stdout_preview[:1024] if stdout_preview else None,
+                stderr=stderr_preview[:1024] if stderr_preview else None,
+            )
+        except Exception:
+            pass
+
     def _truncate_utf8_preview(self, text: str, max_bytes: int) -> tuple[str, bool]:
         """Truncate text to fit within max_bytes while preserving valid UTF-8."""
         if not text:
@@ -1002,6 +1094,54 @@ class PTYAIShell:
 
         return decoded, True
 
+    def _restart_pty(self) -> bool:
+        """Restart the PTY after the bash process died (e.g. via exec command).
+
+        Returns True if restart succeeded, False otherwise.
+        """
+        try:
+            # Save current directory before stopping
+            old_cwd = os.getcwd()
+
+            # Stop the old PTY
+            if self._pty_manager:
+                self._pty_manager.stop()
+
+            # Get terminal size
+            try:
+                size = shutil.get_terminal_size()
+                rows, cols = size.lines, size.columns
+            except Exception:
+                rows, cols = 24, 80
+
+            # Create new PTY
+            self._pty_manager = PTYManager(
+                rows=rows, cols=cols, cwd=old_cwd, use_output_thread=False
+            )
+            self._pty_manager.start()
+            time.sleep(0.2)
+
+            # Reconnect components to new PTY manager
+            if self._ai_handler:
+                self._ai_handler.pty_manager = self._pty_manager
+            if self._output_processor:
+                self._output_processor.pty_manager = self._pty_manager
+            if self._input_router:
+                self._input_router.pty_manager = self._pty_manager
+            if self.llm_session and hasattr(self.llm_session, "bash_tool"):
+                self.llm_session.bash_tool.pty_manager = self._pty_manager
+
+            # Notify user
+            self._restore_terminal()
+            self.console.print(
+                "\033[33m[Shell restarted - previous session exited]\033[0m"
+            )
+            sys.stdout.flush()
+
+            return True
+        except Exception:
+            return False
+
     def _cleanup(self) -> None:
         if not self._running and hasattr(self, "_cleanup_done"):
             return
@@ -1013,6 +1153,12 @@ class PTYAIShell:
 
         if self._pty_manager:
             self._pty_manager.stop()
+
+        if hasattr(self, "history_manager"):
+            try:
+                self.history_manager.close()
+            except Exception:
+                pass
 
         self._restore_terminal()
         self.console.print(t("cli.startup.goodbye"))
