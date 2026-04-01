@@ -9,6 +9,11 @@ class ExitCodeTracker:
 
     The marker format is: [AISH_EXIT:N] or [AISH_EXIT:N:command].
     This is injected via PROMPT_COMMAND in bash initialization.
+
+    Error correction hints are ONLY shown for user-initiated commands:
+    - Explicitly typed commands (router calls set_last_command)
+    - Arrow-key history selections (detected via different command text in marker)
+    Backend/AI commands never trigger hints.
     """
 
     # Format: [AISH_EXIT:code] or [AISH_EXIT:code:command]
@@ -20,8 +25,15 @@ class ExitCodeTracker:
         self._has_error: bool = False
         self._exit_code_available: bool = False
         # Prevents repeated error hints on prompt redraws.
-        # Set True after consume_error() returns info; reset when a new command is detected.
+        # Set True after consume_error() returns info; reset when a new
+        # user-initiated command is detected.
         self._error_hint_shown: bool = False
+        # Set True by set_last_command() before execution; cleared after
+        # marker processing.  Distinguishes a genuine new user-typed command
+        # from prompt redraws.
+        self._command_initiated: bool = False
+        # When True, this is a backend/AI command — never trigger hints.
+        self._suppress_error: bool = False
 
     @property
     def last_exit_code(self) -> int:
@@ -39,9 +51,23 @@ class ExitCodeTracker:
         return self._last_command
 
     def set_last_command(self, command: str) -> None:
-        """Set the command that's about to be executed."""
+        """Set the command that's about to be executed (user-initiated).
+
+        Resets error hint state so the next failure can trigger a hint.
+        """
         self._last_command = command
         self._error_hint_shown = False
+        self._command_initiated = True
+
+    def set_backend_command(self, command: str) -> None:
+        """Set command from a backend/AI source.
+
+        Records the command for exit code tracking but does NOT
+        reset error hint state — AI tool failures should not trigger
+        error correction hints.
+        """
+        self._last_command = command
+        self._suppress_error = True
 
     def parse_and_update(self, data: bytes) -> bytes:
         """Parse exit code marker from PTY output, update state, return cleaned output."""
@@ -53,7 +79,10 @@ class ExitCodeTracker:
             self._last_exit_code = exit_code
             self._exit_code_available = True
 
-            # Extract command from marker if present
+            # Detect whether this marker represents a new user-initiated
+            # command, before updating _last_command.
+            is_new_user_command = self._command_initiated
+
             command_in_marker = last_marker.group(2)
             if command_in_marker:
                 # Decode %5D back to ] (encoded in bash_rc_wrapper.sh)
@@ -61,20 +90,42 @@ class ExitCodeTracker:
                     "utf-8", errors="replace"
                 ).replace("%5D", "]")
                 if decoded:
-                    # New command detected via marker — reset hint flag
+                    # A different command text in the marker means a new
+                    # command was executed (e.g., arrow-key history selection
+                    # that bypasses the router).
                     if decoded != self._last_command:
+                        is_new_user_command = True
+                    if is_new_user_command:
                         self._error_hint_shown = False
                     self._last_command = decoded
 
-            # Only set _has_error if we haven't already shown the hint for this error.
-            # This prevents repeated hints on prompt redraws where $? is unchanged.
+            # Only set _has_error for user-initiated commands that haven't
+            # been hinted yet.  Backend commands and prompt redraws are
+            # suppressed.  NOTE: the `and` chain order matters —
+            # `_suppress_error` is checked before `is_new_user_command` so
+            # that a backend command whose marker text differs from
+            # _last_command (setting is_new_user_command=True) is still
+            # correctly suppressed.
             if exit_code != 0:
-                if not self._error_hint_shown:
+                if (
+                    not self._error_hint_shown
+                    and not self._suppress_error
+                    and is_new_user_command
+                ):
                     self._has_error = True
+                else:
+                    self._has_error = False
+                    # Backend commands: mark hint as "shown" so redraws
+                    # don't accidentally trigger it later.
+                    if self._suppress_error:
+                        self._error_hint_shown = True
             else:
                 # Success clears error state
                 self._has_error = False
                 self._error_hint_shown = False
+
+            self._command_initiated = False
+            self._suppress_error = False
 
             cleaned = self.MARKER_PATTERN.sub(b"", data)
             return cleaned
@@ -108,6 +159,29 @@ class ExitCodeTracker:
         self._has_error = False
         self._error_hint_shown = False
 
+    def clear_error_correction(self) -> None:
+        """Clear error state so subsequent prompt redraws do not re-trigger
+        the correction hint.
+
+        Called when the user presses Enter on empty line.  Keeps
+        _last_command intact so that the next PROMPT_COMMAND marker
+        (which still contains the same command from bash history) is
+        NOT mis-detected as a new user command.
+        """
+        self._has_error = False
+        self._error_hint_shown = True
+
+    def mark_backend_error_suppressed(self) -> None:
+        """Mark that a backend command's error has been suppressed.
+
+        Ensures subsequent prompt redraws will NOT show the error
+        correction hint. Called after execute_command() completes
+        for AI/backend tool execution.
+        """
+        self._has_error = False
+        self._error_hint_shown = True
+        self._suppress_error = False
+
     def has_exit_code(self) -> bool:
         """Check if exit code is available."""
         return self._exit_code_available
@@ -119,3 +193,5 @@ class ExitCodeTracker:
         self._has_error = False
         self._exit_code_available = False
         self._error_hint_shown = False
+        self._command_initiated = False
+        self._suppress_error = False

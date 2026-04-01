@@ -1022,6 +1022,11 @@ class PTYAIShell:
                 self._pending_command_seq = None
                 self._pending_command_text = None
                 self._shell_phase = "editing"
+                # Ensure backend command errors never trigger hints on
+                # subsequent prompt redraws.
+                pty_mgr = getattr(self, "_pty_manager", None)
+                if pty_mgr is not None:
+                    pty_mgr.exit_tracker.mark_backend_error_suppressed()
         elif event.type == "shell_exiting":
             self._shell_phase = "recovery_exit"
             self._running = False

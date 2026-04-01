@@ -20,7 +20,9 @@ class _FakeTracker:
         self.last_exit_code = 0
         self.last_command = ""
         self.clear_exit_available = Mock()
+        self.clear_error_correction = Mock()
         self.set_last_command = Mock(side_effect=self._remember_command)
+        self.set_backend_command = Mock(side_effect=self._remember_command)
 
     def _remember_command(self, command: str) -> None:
         self.last_command = command
@@ -244,5 +246,121 @@ def test_pty_manager_send_command_injects_command_seq():
 
     PTYManager.send_command(manager, "echo hi", command_seq=7)
 
-    assert sent == [b"echo hi\n"]
+    assert sent == [b"__AISH_ACTIVE_COMMAND_SEQ=7; echo hi\n"]
     assert manager._exit_tracker.last_command == "echo hi"
+
+
+def test_shell_tracks_command_seq_and_returns_to_editing_on_prompt_ready():
+    shell = object.__new__(PTYAIShell)
+    shell._backend_protocol_events = []
+    shell._backend_protocol_errors = []
+    shell._last_backend_event = None
+    shell._backend_session_ready = False
+    shell._shell_phase = "booting"
+    shell._next_command_seq = 1
+    shell._pending_command_seq = None
+    shell._pending_command_text = None
+    shell._running = True
+    shell._output_processor = Mock()
+
+    seq = PTYAIShell._register_submitted_command(shell, "pwd")
+
+    assert seq == 1
+    assert shell._shell_phase == "command_submitted"
+    assert shell._pending_command_seq == 1
+
+    started = BackendControlEvent(
+        version=1,
+        type="command_started",
+        ts=1,
+        payload={"command_seq": 1, "command": "pwd"},
+    )
+    PTYAIShell._track_backend_event(shell, started)
+    assert shell._shell_phase == "running_passthrough"
+
+    ready = BackendControlEvent(
+        version=1,
+        type="prompt_ready",
+        ts=2,
+        payload={"command_seq": 1, "exit_code": 0},
+    )
+    PTYAIShell._track_backend_event(shell, ready)
+
+    assert shell._shell_phase == "editing"
+    assert shell._pending_command_seq is None
+    assert shell._pending_command_text is None
+    assert shell._output_processor.handle_backend_event.call_count == 2
+
+
+def test_backend_error_suppressed_prevents_repeated_hints(capsys):
+    """After execute_command(), mark_backend_error_suppressed() must prevent
+    repeated error hints on subsequent prompt redraws."""
+    from aish.pty.exit_tracker import ExitCodeTracker
+
+    tracker = ExitCodeTracker()
+
+    # Simulate backend command execution (like AI tool calling bash_exec)
+    tracker.set_backend_command("ipaw")
+    assert tracker._suppress_error is True
+
+    # Process exit marker from PTY (command failed)
+    marker = b"[AISH_EXIT:127:ipaw]"
+    tracker.parse_and_update(marker)
+    assert tracker._exit_code_available is True
+    # Backend commands should NOT set _has_error
+    assert tracker._has_error is False
+    # _error_hint_shown should be set by the suppress logic
+    assert tracker._error_hint_shown is True
+
+    # Consume exit code (as _exec_via_poll does)
+    result = tracker.consume_exit_code()
+    assert result is not None
+    assert result[1] == 127
+
+    # Suppress error hint after backend execution
+    tracker.mark_backend_error_suppressed()
+
+    # Simulate prompt redraw sending the same marker again
+    tracker.parse_and_update(marker)
+    assert tracker._exit_code_available is True
+    # Should still NOT have error
+    assert tracker._has_error is False
+
+    # OutputProcessor.process() should NOT show the hint
+    processor = OutputProcessor(_FakePTYManager(tracker=tracker))
+    processor.process(b"prompt$ ")
+    captured = capsys.readouterr()
+    assert t("shell.error_correction.press_semicolon_hint") not in captured.out
+
+
+def test_user_command_error_shows_hint_exactly_once(capsys):
+    """User-typed commands should show error hint exactly once, not repeated."""
+    from aish.pty.exit_tracker import ExitCodeTracker
+
+    tracker = ExitCodeTracker()
+
+    # Simulate user-typed command
+    tracker.set_last_command("bad_cmd")
+    assert tracker._error_hint_shown is False
+
+    # Process exit marker (command failed)
+    marker = b"[AISH_EXIT:1:bad_cmd]"
+    tracker.parse_and_update(marker)
+    assert tracker._has_error is True
+
+    # First process() - should show hint
+    processor = OutputProcessor(_FakePTYManager(tracker=tracker))
+    processor._waiting_for_result = True
+    processor.process(b"output")
+    captured = capsys.readouterr()
+    assert t("shell.error_correction.press_semicolon_hint") in captured.out
+    assert tracker._error_hint_shown is True
+
+    # Second marker from prompt redraw - should NOT show hint again
+    tracker.parse_and_update(b"[AISH_EXIT:1:bad_cmd]")
+    assert tracker._has_error is False  # Should NOT be re-set
+    assert tracker._exit_code_available is True
+
+    processor.process(b"prompt$ ")
+    captured = capsys.readouterr()
+    assert t("shell.error_correction.press_semicolon_hint") not in captured.out

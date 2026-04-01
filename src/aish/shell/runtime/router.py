@@ -240,6 +240,11 @@ class InputRouter:
                             shell = self.ai_handler.shell if self.ai_handler else None
                             if shell is not None:
                                 shell._user_requested_exit = True
+                else:
+                    # Empty command line — clear error correction state.
+                    # The user chose not to correct; disable ;  hint and
+                    # correction for this cycle.
+                    self.pty_manager.exit_tracker.clear_error_correction()
                 self.pty_manager.send(b"\r")
                 self._at_line_start = True
                 self._current_cmd = ""
@@ -307,7 +312,7 @@ class InputRouter:
                     if shell is not None:
                         shell._running = False
                 elif action == InterruptAction.REQUEST_EXIT:
-                    sys.stdout.write("\r\n\x1b[33m<press Ctrl+C again to exit>\x1b[0m\r\n")
+                    sys.stdout.write("\r\n\x1b[2m\x1b[37m<press Ctrl+C again to exit>\x1b[0m\r\n")
                     sys.stdout.flush()
                     if self.interruption_manager:
                         self._schedule_placeholder_refresh(

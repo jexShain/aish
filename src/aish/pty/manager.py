@@ -299,9 +299,17 @@ PS1=""  # Will be set by PROMPT_COMMAND
                 return 0
 
     def send_command(self, command: str, command_seq: int | None = None) -> None:
-        """Send a command (with newline) to bash."""
-        self._exit_tracker.set_last_command(command.strip())
-        self.send((command + "\n").encode())
+        """Send a command (with newline) to bash.
+
+        Uses set_backend_command() so that errors from programmatic
+        command execution (AI tools, backend) do NOT trigger error
+        correction hints.
+        """
+        self._exit_tracker.set_backend_command(command.strip())
+        command_to_send = command
+        if command_seq is not None:
+            command_to_send = f"__AISH_ACTIVE_COMMAND_SEQ={command_seq}; {command}"
+        self.send((command_to_send + "\n").encode())
 
     def resize(self, rows: int, cols: int) -> None:
         """Resize terminal."""
@@ -394,6 +402,8 @@ PS1=""  # Will be set by PROMPT_COMMAND
         raw_output = bytes(self._exec_buffer)
         self._exec_buffer.clear()
 
+        self._exit_tracker.mark_backend_error_suppressed()
+
         if result is None:
             # Timeout - send Ctrl+C
             self.send(b"\x03")
@@ -448,11 +458,15 @@ PS1=""  # Will be set by PROMPT_COMMAND
             result = self._exit_tracker.consume_exit_code()
             if result is not None:
                 _cmd, exit_code = result
+                # Suppress error hint: this is a backend/AI command,
+                # not a user-typed command, so never show correction hints.
+                self._exit_tracker.mark_backend_error_suppressed()
                 cleaned_output = self._clean_pty_output(bytes(raw_output), command)
                 return cleaned_output, exit_code  # type: ignore[return-value]
 
         # Timeout - send Ctrl+C
         self.send(b"\x03")
+        self._exit_tracker.mark_backend_error_suppressed()
         cleaned_output = self._clean_pty_output(bytes(raw_output), command)
         return cleaned_output, -1  # type: ignore[return-value]
 

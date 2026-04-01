@@ -30,6 +30,12 @@ class OutputProcessor:
         self.shell = shell
         self._current_command: str = ""
         self._last_recorded_result: tuple[str, int] | None = None
+        # Two-layer error suppression:
+        # Layer 1 (here): _suppress_error_hint — UI-layer skip for one cycle
+        #   (e.g., after Ctrl+C for exit, suppress the spurious hint).
+        # Layer 2 (ExitCodeTracker): _suppress_error / _error_hint_shown —
+        #   distinguishes user-initiated vs backend/AI commands and prevents
+        #   repeated hints on prompt redraws.  See exit_tracker.py for details.
         self._suppress_error_hint: bool = False
 
     def set_waiting_for_result(self, waiting: bool, command: str = "") -> None:
@@ -107,7 +113,7 @@ class OutputProcessor:
                     self._suppress_error_hint = False
                 else:
                     hint = t("shell.error_correction.press_semicolon_hint")
-                    sys.stdout.write(f"\033[33m<{hint}>\033[0m\r\n")
+                    sys.stdout.write(f"\033[2m\033[37m<{hint}>\033[0m\r\n")
                     sys.stdout.flush()
             self._waiting_for_result = False
             self._current_command = ""
