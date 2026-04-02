@@ -106,6 +106,7 @@ a = Analysis(
         ('src/aish/i18n', 'aish/i18n'),
         ('src/aish/scripts/prompts', 'aish/scripts/prompts'),
         ('src/aish/scripts/templates', 'aish/scripts/templates'),
+        ('src/aish/pty/bash_rc_wrapper.sh', 'aish/pty'),
     ] + tiktoken_datas + litellm_datas + litellm_json_datas + skills_datas,
     hiddenimports=[
         'aish.prompts',
