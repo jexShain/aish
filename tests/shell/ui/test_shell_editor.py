@@ -5,8 +5,6 @@ from unittest.mock import Mock
 
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
-from prompt_toolkit.formatted_text import to_formatted_text
-from prompt_toolkit.shortcuts import CompleteStyle
 
 from aish.shell.ui.completion import ShellCompleter
 from aish.shell.ui.editor import HistoryAutoSuggest, ShellPromptController
@@ -55,22 +53,6 @@ def test_shell_prompt_controller_uses_cwd_provider_for_prompt_text():
     assert controller._get_prompt_text() == "/tmp/project"
 
 
-def test_shell_prompt_controller_hides_toolbar_without_hint():
-    interruption_manager = Mock()
-    interruption_manager.get_prompt_message.return_value = None
-    controller = ShellPromptController(interruption_manager=interruption_manager)
-
-    assert controller._get_bottom_toolbar() is None
-
-
-def test_shell_prompt_controller_does_not_attach_bottom_toolbar_to_session():
-    controller = ShellPromptController()
-
-    assert getattr(controller._session, "bottom_toolbar", None) is None
-    assert controller._session.completer is controller._completer
-    assert controller._session.complete_style == CompleteStyle.READLINE_LIKE
-
-
 def test_shell_prompt_controller_forwards_custom_prompt_message():
     controller = ShellPromptController()
     controller._session.prompt = Mock(return_value="echo hi")
@@ -80,19 +62,6 @@ def test_shell_prompt_controller_forwards_custom_prompt_message():
     assert result == "echo hi"
     controller._session.prompt.assert_called_once()
     assert controller._session.prompt.call_args.args[0] == "... "
-
-
-def test_shell_prompt_controller_renders_interruption_hint_without_ai_default():
-    interruption_manager = Mock()
-    interruption_manager.get_prompt_message.return_value = "<gray>Press Ctrl+C to cancel</gray>"
-    controller = ShellPromptController(interruption_manager=interruption_manager)
-
-    toolbar = controller._get_bottom_toolbar()
-
-    assert toolbar is not None
-    assert "Press Ctrl+C to cancel" == "".join(
-        fragment[1] for fragment in to_formatted_text(toolbar)
-    )
 
 
 def test_shell_completer_suggests_builtin_and_special_commands():

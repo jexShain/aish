@@ -951,7 +951,7 @@ class PTYAIShell:
             rows, cols = 24, 80
 
         self._pty_manager = PTYManager(
-            rows=rows, cols=cols, cwd=self._current_cwd, use_output_thread=False
+            rows=rows, cols=cols, cwd=self._current_cwd, use_output_thread=False,
         )
         self._pty_manager.start()
         time.sleep(0.2)
@@ -978,6 +978,8 @@ class PTYAIShell:
             interruption_manager=self.interruption_manager,
             on_buffer_change=self._set_edit_buffer_text,
             cwd_provider=lambda: self._current_cwd,
+            prompt_theme=self.config.prompt_theme if self.config.enable_scripts else "",
+            exit_code_provider=lambda: self._pty_manager.last_exit_code if self._pty_manager else 0,
         )
 
         # Wire PTY manager and context manager to BashTool for AI tool execution
@@ -1002,8 +1004,22 @@ class PTYAIShell:
             line = self._prompt_controller.prompt()
             line = self._collect_multiline_input(line)
         except KeyboardInterrupt:
+            has_input = bool(self._editing_buffer_text.strip())
             self._editing_buffer_text = ""
-            self.console.print("^C", style="dim")
+
+            from ...interruption import InterruptAction
+
+            action = self.interruption_manager.handle_ctrl_c(has_input)
+
+            if action == InterruptAction.CONFIRM_EXIT:
+                self.console.print("^C", style="dim")
+                self._running = False
+                return None
+            elif action == InterruptAction.REQUEST_EXIT:
+                self.console.print("^C  <press Ctrl+C again to exit>", style="dim")
+                return None
+            else:
+                self.console.print("^C", style="dim")
             return None
         except EOFError:
             self._running = False
@@ -1590,7 +1606,7 @@ class PTYAIShell:
 
             # Create new PTY
             self._pty_manager = PTYManager(
-                rows=rows, cols=cols, cwd=old_cwd, use_output_thread=False
+                rows=rows, cols=cols, cwd=old_cwd, use_output_thread=False,
             )
             self._pty_manager.start()
             time.sleep(0.2)

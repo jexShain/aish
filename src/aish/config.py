@@ -157,6 +157,10 @@ class ConfigModel(BaseModel):
         default=1000, gt=0, description="Maximum tokens for LLM responses"
     )
     prompt_style: str = Field(default="🚀", description="Prompt style character/emoji")
+    prompt_theme: str = Field(
+        default="compact",
+        description="Prompt theme: compact, developer, powerline, minimal, or default (plain prompt)",
+    )
     theme: str = Field(default="dark", description="Shell theme (dark/light)")
     auto_suggest: bool = Field(default=True, description="Enable auto-suggestions")
     history_size: int = Field(default=1000, gt=0, description="Maximum history size")
@@ -370,6 +374,10 @@ class Config:
                     # Add enable_scripts if missing (new field migration)
                     if "enable_scripts" not in config_data:
                         config_data["enable_scripts"] = True
+                        need_save = True
+                    # Add prompt_theme if missing (new field migration)
+                    if "prompt_theme" not in config_data:
+                        config_data["prompt_theme"] = "compact"
                         need_save = True
 
                     if need_save:
@@ -626,6 +634,19 @@ class Config:
         """Set the prompt style"""
         self.config_model.prompt_style = style
         self.save_config()
+
+    def get_prompt_theme(self) -> str:
+        """Get the prompt theme name."""
+        return self.config_model.prompt_theme
+
+    def set_prompt_theme(self, theme: str) -> None:
+        """Set the prompt theme."""
+        self.config_model.prompt_theme = theme
+        self.save_config()
+
+    def get_enable_scripts(self) -> bool:
+        """Get whether scripts system is enabled."""
+        return self.config_model.enable_scripts
 
     def get_output_language(self) -> Optional[str]:
         """Get the output language"""
