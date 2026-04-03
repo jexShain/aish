@@ -7,6 +7,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-03
+
+### Added
+
+- Added a PTY-native interactive shell foundation so AISH can drive full-screen and long-running terminal programs more reliably.
+- Added a pluggable prompt theme system, making shell prompt styling easier to customize without patching core logic.
+- Added provider auth visibility improvements, including clearer model usage status output and configurable OpenAI Codex auth path support.
+
+### Changed
+
+- Changed the shell frontend to a prompt-toolkit based PTY flow with smoother interrupt handling, interaction prompts, and suggestion behavior.
+- Changed release validation coverage to include broader live smoke checks for real-world shell and installation paths.
+
+### Fixed
+
+- Fixed false shell error hints for benign exits such as SIGPIPE-driven pager quits, reducing noisy failure reporting during normal terminal use.
+- Fixed AI cancellation, exit tracking, and Ctrl+C handling so interrupted operations return control to the shell more predictably.
+- Fixed frozen binary packaging to include the bash wrapper assets required for bundled shell startup.
+
+### Security
+
+- Fixed a history command injection vulnerability in the shell execution path.
+
 ## [0.1.3] - 2026-03-19
 
 ### Added
