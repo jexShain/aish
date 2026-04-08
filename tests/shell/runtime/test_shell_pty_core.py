@@ -8,6 +8,8 @@ import threading
 from unittest.mock import Mock
 from unittest.mock import call
 
+from aish.memory.config import MemoryConfig
+from aish.memory.models import MemoryCategory
 from aish.i18n import t
 from aish.pty.command_state import CommandResult, CommandState
 from aish.pty.control_protocol import BackendControlEvent
@@ -139,6 +141,37 @@ def test_ai_handler_marks_cancelled_operation_and_notifies_shell():
     assert response is None
     assert was_cancelled is True
     shell.handle_processing_cancelled.assert_called_once_with()
+
+
+def test_ai_handler_auto_retain_persists_explicit_fact():
+    handler, shell = _make_ai_handler()
+    shell.memory_manager = Mock()
+    shell.config = Mock(memory=MemoryConfig(auto_retain=True))
+
+    handler._auto_retain_memory(
+        "Remember that the production database runs on port 5432.",
+        "Understood.",
+    )
+
+    shell.memory_manager.store.assert_called_once_with(
+        content="the production database runs on port 5432",
+        category=MemoryCategory.ENVIRONMENT,
+        source="auto",
+        importance=0.7,
+    )
+
+
+def test_ai_handler_auto_retain_ignores_regular_questions():
+    handler, shell = _make_ai_handler()
+    shell.memory_manager = Mock()
+    shell.config = Mock(memory=MemoryConfig(auto_retain=True))
+
+    handler._auto_retain_memory(
+        "Why does the production database run on port 5432?",
+        "Because of the current deployment configuration.",
+    )
+
+    shell.memory_manager.store.assert_not_called()
 
 
 def test_ai_handler_refuses_error_correction_for_interactive_session_exit(capsys):

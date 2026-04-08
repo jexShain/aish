@@ -331,6 +331,7 @@ class LLMSession:
         self.model = config.model
         self.api_base = config.api_base
         self.api_key = config.api_key
+        self.memory_manager = memory_manager
 
         self.skill_manager = skill_manager
         self.prompt_manager = PromptManager()
@@ -1147,14 +1148,27 @@ class LLMSession:
         self, context_manager: ContextManager, system_message: Optional[str]
     ) -> list[dict]:
         self._reload_skills_at_safe_point()
+        effective_system_message = system_message
+        if self.memory_manager is not None:
+            memory_prompt = self.memory_manager.get_system_prompt_section()
+            if effective_system_message:
+                effective_system_message = (
+                    f"{effective_system_message}\n\n{memory_prompt}"
+                )
+            else:
+                effective_system_message = memory_prompt
         messages = context_manager.as_messages()
-        if system_message:
+        if effective_system_message:
             if messages and messages[0]["role"] == "system":
                 # Merge: keep knowledge context, append system prompt
                 existing = messages[0]["content"]
-                messages[0]["content"] = f"{existing}\n\n{system_message}"
+                messages[0]["content"] = (
+                    f"{existing}\n\n{effective_system_message}"
+                )
             else:
-                messages.insert(0, {"role": "system", "content": system_message})
+                messages.insert(
+                    0, {"role": "system", "content": effective_system_message}
+                )
         reminder = self._build_skills_reminder_message()
         if reminder is not None:
             messages = self._inject_runtime_messages(messages, [reminder])

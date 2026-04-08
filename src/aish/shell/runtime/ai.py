@@ -28,6 +28,15 @@ class AIHandler:
     """Handle AI questions and error correction using LLMSession directly."""
 
     _SKILL_REF_EXTRACT_RE = re.compile(r"@(\w+)")
+    _AUTO_RETAIN_PATTERNS = [
+        re.compile(r"^(?:please\s+)?remember(?:\s+that)?\s+(?P<fact>.+)$", re.IGNORECASE),
+        re.compile(r"^(?:please\s+)?note(?:\s+that)?\s+(?P<fact>.+)$", re.IGNORECASE),
+        re.compile(r"^(?:for\s+future\s+reference[:,]?\s*)(?P<fact>.+)$", re.IGNORECASE),
+        re.compile(r"^(?P<fact>i\s+prefer.+)$", re.IGNORECASE),
+        re.compile(r"^(?P<fact>my\s+preferred.+)$", re.IGNORECASE),
+        re.compile(r"^(?P<fact>we\s+use.+)$", re.IGNORECASE),
+        re.compile(r"^(?P<fact>our\s+.+\s+(?:is|are).+)$", re.IGNORECASE),
+    ]
 
     def __init__(
         self,
@@ -212,6 +221,79 @@ class AIHandler:
                 )
         except Exception:
             pass  # Memory recall is best-effort
+
+    def _auto_retain_memory(self, question: str, response: str) -> None:
+        """Persist explicit durable facts from the user turn using light heuristics."""
+        if not response.strip():
+            return
+
+        shell = getattr(self, "shell", None)
+        if not shell:
+            return
+        mem_mgr = getattr(shell, "memory_manager", None)
+        if not mem_mgr:
+            return
+        memory_config = getattr(shell.config, "memory", None)
+        if not memory_config or not getattr(memory_config, "auto_retain", False):
+            return
+
+        fact = self._extract_retained_fact(question)
+        if not fact:
+            return
+
+        from aish.memory.models import MemoryCategory
+
+        try:
+            mem_mgr.store(
+                content=fact,
+                category=self._categorize_retained_fact(fact, MemoryCategory),
+                source="auto",
+                importance=0.7,
+            )
+        except Exception:
+            pass
+
+    def _extract_retained_fact(self, question: str) -> str | None:
+        cleaned = " ".join(question.strip().split())
+        if not cleaned:
+            return None
+
+        for pattern in self._AUTO_RETAIN_PATTERNS:
+            match = pattern.match(cleaned)
+            if not match:
+                continue
+            fact = match.group("fact").strip(" .,!;:")
+            if 8 <= len(fact) <= 240:
+                return fact
+        return None
+
+    def _categorize_retained_fact(self, fact: str, memory_category):
+        lowered = fact.casefold()
+        if any(token in lowered for token in ["prefer", "preferred", "default", "always use"]):
+            return memory_category.PREFERENCE
+        if any(token in lowered for token in ["pattern", "convention", "style"]):
+            return memory_category.PATTERN
+        if any(token in lowered for token in ["fix", "solution", "workaround", "resolved"]):
+            return memory_category.SOLUTION
+        if any(
+            token in lowered
+            for token in [
+                "repo",
+                "repository",
+                "branch",
+                "database",
+                "port",
+                "path",
+                "env",
+                "environment",
+                "workspace",
+                "deploy",
+                "server",
+                "service",
+            ]
+        ):
+            return memory_category.ENVIRONMENT
+        return memory_category.OTHER
 
 
     @staticmethod
@@ -399,6 +481,7 @@ Please analyze the error and suggest a fix. Check the shell history context abov
 
             if response:
                 self._display_ai_response(response)
+                self._auto_retain_memory(question, response)
 
         except Exception as error:
             print(f"\r\033[KError: {error}")

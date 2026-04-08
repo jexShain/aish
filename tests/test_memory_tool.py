@@ -37,6 +37,7 @@ def test_search_action(memory_tool):
 def test_store_action(memory_tool):
     result = memory_tool(action="store", content="User prefers dark theme")
     assert "Stored" in str(result) or "stored" in str(result)
+    assert "User prefers dark theme" in memory_tool.memory_manager.memory_md.read_text()
 
 
 def test_list_action(memory_tool):
@@ -66,6 +67,7 @@ def test_forget_action(memory_tool):
         or "forgot" in str(result)
         or "removed" in str(result).lower()
     )
+    assert "Temporary fact" not in memory_tool.memory_manager.memory_md.read_text()
 
 
 def test_invalid_action(memory_tool):
