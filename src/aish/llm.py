@@ -19,7 +19,7 @@ from aish.exception import is_litellm_exception, redact_secrets
 from aish.interaction import InteractionRequest, InteractionResponse, InteractionStatus
 from aish.interruption import ShellState
 from aish.litellm_loader import load_litellm
-from aish.providers.registry import get_provider_for_model
+from aish.providers.registry import get_provider_for_model, get_reasoning_disable_kwargs
 from aish.prompts import PromptManager
 from aish.skills import SkillManager
 from aish.tools.base import (
@@ -154,9 +154,10 @@ def _stream_coerce_message(response: object) -> dict:
 class _LLMEventEmitter:
     """Build and emit structured LLM events with minimal callsite noise."""
 
-    def __init__(self, session: "LLMSession", emit_events: bool):
+    def __init__(self, session: "LLMSession", emit_events: bool, skip_reasoning: bool = False):
         self._session = session
         self._enabled = bool(emit_events)
+        self._skip_reasoning = skip_reasoning
         self.operation: str | None = None
         self.turn_id: str | None = None
         self.generation_id: str | None = None
@@ -204,15 +205,15 @@ class _LLMEventEmitter:
 
     def emit_generation_start(self, *, generation_type: str, stream: bool) -> str:
         self.generation_id = f"gen-{uuid.uuid4().hex[:12]}"
-        self._emit(
-            LLMEventType.GENERATION_START,
-            {
-                "turn_id": self.turn_id,
-                "generation_id": self.generation_id,
-                "generation_type": generation_type,
-                "stream": stream,
-            },
-        )
+        payload: dict = {
+            "turn_id": self.turn_id,
+            "generation_id": self.generation_id,
+            "generation_type": generation_type,
+            "stream": stream,
+        }
+        if self._skip_reasoning:
+            payload["skip_reasoning"] = True
+        self._emit(LLMEventType.GENERATION_START, payload)
         return self.generation_id
 
     def emit_generation_end(
@@ -252,7 +253,7 @@ class _LLMEventEmitter:
         )
 
     def emit_reasoning_start(self) -> None:
-        if self._reasoning_started or not self.generation_id:
+        if self._skip_reasoning or self._reasoning_started or not self.generation_id:
             return
         self._reasoning_started = True
         self._emit(
@@ -261,7 +262,7 @@ class _LLMEventEmitter:
         )
 
     def emit_reasoning_delta(self, *, delta: str, accumulated: str) -> None:
-        if not self.generation_id:
+        if self._skip_reasoning or not self.generation_id:
             return
         if not self._reasoning_started:
             self.emit_reasoning_start()
@@ -276,7 +277,7 @@ class _LLMEventEmitter:
         )
 
     def emit_reasoning_end(self) -> None:
-        if not self._reasoning_started or not self.generation_id:
+        if self._skip_reasoning or not self._reasoning_started or not self.generation_id:
             return
         self._reasoning_started = False
         self._emit(
@@ -418,16 +419,24 @@ class LLMSession:
         self.user_id = "aish-user"  # Can be made configurable later
         self.conversation_count = 0
 
-        # Set up Langfuse callbacks only if enabled in config
+        # Set up Langfuse callbacks only if enabled in config and langfuse is installed
         if self.langfuse_enabled:
             try:
+                import langfuse as _langfuse  # noqa: F401
+
                 litellm = self._get_litellm()
                 if litellm is not None:
                     litellm.success_callback = ["langfuse"]
                     litellm.failure_callback = ["langfuse"]
+            except ImportError:
+                self.langfuse_enabled = False
+                logger.warning(
+                    "Langfuse is enabled but not installed. "
+                    "Install it with: pip install aish[langfuse]"
+                )
             except Exception:
-                # Silently fail if langfuse is not available
-                pass
+                self.langfuse_enabled = False
+                logger.warning("Langfuse initialization failed, disabling langfuse")
 
     def _get_litellm(self):
         """延迟加载 litellm 模块，只在首次使用时导入"""
@@ -1230,12 +1239,13 @@ class LLMSession:
         history: Optional[list[dict]] = None,
         emit_events: bool = True,
         stream: bool = False,
+        skip_reasoning: bool = False,
         **kwargs,
     ) -> str:
         # 确保在首次调用前完成初始化（使用重试机制处理循环导入）
         await self._ensure_initialized_with_retry()
 
-        events = _LLMEventEmitter(self, emit_events)
+        events = _LLMEventEmitter(self, emit_events, skip_reasoning=skip_reasoning)
         events.emit_op_start(operation="process_input", prompt=prompt, stream=stream)
 
         # Add user prompt to context manager first
@@ -1248,6 +1258,13 @@ class LLMSession:
         has_tool_calls = False
         tool_call_count = 0
         output = ""
+
+        # Inject provider-specific kwargs to disable reasoning when requested
+        if skip_reasoning:
+            reasoning_kwargs = get_reasoning_disable_kwargs(self.model)
+            # Drop unsupported params gracefully (e.g. reasoning_effort on
+            # non-reasoning models like GLM routed through openai provider)
+            kwargs = {**reasoning_kwargs, "drop_params": True, **kwargs}
 
         try:
             while True:

@@ -272,7 +272,8 @@ class PTYAIShell:
         self._finalize_content_preview()
         self._reset_reasoning_state()
         self._last_streaming_accumulated = ""
-        self._reasoning_display_enabled = True
+        skip_reasoning = bool(event.data.get("skip_reasoning"))
+        self._reasoning_display_enabled = not skip_reasoning
         return self.handle_thinking_start(event)
 
     def handle_thinking_start(self, event) -> None:

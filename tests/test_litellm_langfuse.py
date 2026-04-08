@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+langfuse = pytest.importorskip("langfuse")
+
 # 添加项目路径
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root / "src"))

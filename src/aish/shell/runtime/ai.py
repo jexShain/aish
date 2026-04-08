@@ -283,6 +283,7 @@ Please analyze the error and suggest a fix. Check the shell history context abov
                         context_manager=self.context_manager,
                         system_message=system_message,
                         stream=True,
+                        skip_reasoning=True,
                     )
                     return response
 

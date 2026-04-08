@@ -233,6 +233,30 @@ def list_auth_capable_provider_ids() -> tuple[str, ...]:
     )
 
 
+_REASONING_DISABLE_MAP: dict[str, dict[str, Any]] = {
+    "anthropic": {"thinking": {"type": "disabled"}},
+    "deepseek": {"extra_body": {"enable_thinking": False}},
+    "qwen": {"extra_body": {"enable_thinking": False}},
+    "openai": {"reasoning_effort": "none"},
+    "gemini": {"extra_body": {"thinkingBudget": 0}},
+    "google": {"extra_body": {"thinkingBudget": 0}},
+    "xai": {"extra_body": {"enable_thinking": False}},
+}
+
+
+def get_reasoning_disable_kwargs(model: str | None) -> dict[str, Any]:
+    """Return API kwargs to disable model thinking/reasoning for a given model.
+
+    Uses the provider inferred from the model name to pick the right
+    parameter set.  Returns an empty dict when the provider has no known
+    mechanism or the provider cannot be determined.
+    """
+    provider_id = _infer_provider_id_from_model(model)
+    if provider_id is None:
+        return {}
+    return _REASONING_DISABLE_MAP.get(provider_id, {})
+
+
 def resolve_provider_metadata(
     model: str | None,
     api_base: str | None = None,

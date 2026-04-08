@@ -8,7 +8,6 @@ requires-python = ">=3.10"
 dependencies = [
     "anyio>=4.9.0",
     "httpx[socks]>=0.24.0",
-    "langfuse==2.60.3",
     "litellm==1.74.3",
     "prompt-toolkit>=3.0.51",
     "pydantic>=2.0.0",
@@ -20,6 +19,9 @@ dependencies = [
     "watchfiles>=0.22.0",
     "wcwidth>=0.2.13",
 ]
+
+[project.optional-dependencies]
+langfuse = ["langfuse>=4.0.0"]
 
 [project.scripts]
 aish = "aish.cli:main"
