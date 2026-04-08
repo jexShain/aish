@@ -243,15 +243,45 @@ _REASONING_DISABLE_MAP: dict[str, dict[str, Any]] = {
     "xai": {"extra_body": {"enable_thinking": False}},
 }
 
+# Providers that act as gateways / routers — their prefix should be stripped
+# to discover the actual upstream provider for reasoning-disable purposes.
+_GATEWAY_PROVIDER_IDS: frozenset[str] = frozenset({
+    "openrouter", "ai_gateway", "together", "huggingface",
+})
+
+
+def _resolve_upstream_provider_id(model: str | None) -> str | None:
+    """Resolve the *upstream* provider id, stripping gateway prefixes.
+
+    For ``openrouter/anthropic/claude-3.7`` this returns ``"anthropic"``;
+    for plain ``deepseek-chat`` it returns ``"deepseek"``.
+    """
+    raw = (model or "").strip().lower()
+    if not raw:
+        return None
+
+    # Check if model has a gateway prefix (e.g. "openrouter/anthropic/claude-3.7")
+    if "/" in raw:
+        parts = raw.split("/")
+        prefix = _canonicalize_provider_id(parts[0])
+        if prefix in _GATEWAY_PROVIDER_IDS and len(parts) >= 2:
+            # Re-infer from the remaining path after stripping gateway prefix
+            remainder = "/".join(parts[1:])
+            upstream = _infer_provider_id_from_model(remainder)
+            if upstream is not None:
+                return upstream
+
+    return _infer_provider_id_from_model(model)
+
 
 def get_reasoning_disable_kwargs(model: str | None) -> dict[str, Any]:
     """Return API kwargs to disable model thinking/reasoning for a given model.
 
-    Uses the provider inferred from the model name to pick the right
-    parameter set.  Returns an empty dict when the provider has no known
-    mechanism or the provider cannot be determined.
+    Resolves the upstream provider (stripping gateway prefixes like
+    ``openrouter/``) and returns the matching parameter set.  Returns an
+    empty dict when the provider has no known mechanism.
     """
-    provider_id = _infer_provider_id_from_model(model)
+    provider_id = _resolve_upstream_provider_id(model)
     if provider_id is None:
         return {}
     return _REASONING_DISABLE_MAP.get(provider_id, {})

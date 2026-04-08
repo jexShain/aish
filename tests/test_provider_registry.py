@@ -6,7 +6,7 @@ from aish.config import ConfigModel
 from aish.context_manager import ContextManager
 from aish.llm import LLMSession
 from aish.providers.interface import ProviderAuthConfig, ProviderMetadata
-from aish.providers.registry import resolve_provider_metadata
+from aish.providers.registry import get_reasoning_disable_kwargs, resolve_provider_metadata
 from aish.skills import SkillManager
 
 
@@ -115,3 +115,42 @@ def test_resolve_provider_metadata_uses_configured_api_base_for_local_provider()
     assert metadata.provider_id == "ollama"
     assert metadata.display_name == "Ollama"
     assert metadata.dashboard_url == "http://192.168.1.20:11434"
+
+
+# --- get_reasoning_disable_kwargs ---
+
+
+def test_reasoning_disable_direct_model():
+    assert get_reasoning_disable_kwargs("deepseek-chat") == {
+        "extra_body": {"enable_thinking": False}
+    }
+    assert get_reasoning_disable_kwargs("claude-sonnet-4-6") == {
+        "thinking": {"type": "disabled"}
+    }
+    assert get_reasoning_disable_kwargs("qwen-plus") == {
+        "extra_body": {"enable_thinking": False}
+    }
+
+
+def test_reasoning_disable_gateway_strips_prefix():
+    # openrouter routing anthropic → should use anthropic's params
+    result = get_reasoning_disable_kwargs("openrouter/anthropic/claude-3.7")
+    assert result == {"thinking": {"type": "disabled"}}
+
+    # openrouter routing deepseek → should use deepseek's params
+    result = get_reasoning_disable_kwargs("openrouter/deepseek/deepseek-r1")
+    assert result == {"extra_body": {"enable_thinking": False}}
+
+    # openrouter routing openai model
+    result = get_reasoning_disable_kwargs("openrouter/openai/o3-mini")
+    assert result == {"reasoning_effort": "none"}
+
+
+def test_reasoning_disable_unknown_model_returns_empty():
+    assert get_reasoning_disable_kwargs("unknown-model") == {}
+    assert get_reasoning_disable_kwargs(None) == {}
+
+
+def test_reasoning_disable_non_gateway_prefix_unchanged():
+    # A non-gateway prefix like "ollama/llama3" should infer normally
+    assert get_reasoning_disable_kwargs("ollama/llama3") == {}

@@ -242,3 +242,83 @@ async def test_process_input_litellm_error_uses_raw_message():
         text = str(details)
         assert "THIS_SHOULD_NOT_LEAK" not in text
         assert "sk-THIS_SHOULD_NOT_LEAK" not in text
+
+
+@pytest.mark.anyio
+async def test_process_input_skip_reasoning_injects_kwargs():
+    config = ConfigModel(model="claude-sonnet-4-6", api_key="test-key")
+    session = LLMSession(config=config, skill_manager=SkillManager())
+
+    captured_kwargs = {}
+
+    async def fake_acompletion(**kwargs):
+        captured_kwargs.update(kwargs)
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "fixed"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+    context_manager = ContextManager()
+
+    with (
+        patch.object(session, "_get_acompletion", return_value=fake_acompletion),
+        patch.object(session, "_trim_messages", side_effect=lambda msgs: msgs),
+        patch.object(session, "_get_tools_spec", return_value=[]),
+    ):
+        result = await session.process_input(
+            prompt="hi",
+            context_manager=context_manager,
+            system_message="sys",
+            skip_reasoning=True,
+        )
+
+    assert result == "fixed"
+    # Verify reasoning-disable kwargs were passed through to the completion call
+    assert captured_kwargs.get("thinking") == {"type": "disabled"}
+    assert captured_kwargs.get("drop_params") is True
+
+
+@pytest.mark.anyio
+async def test_process_input_skip_reasoning_sets_generation_event_flag():
+    config = ConfigModel(model="test-model", api_key="test-key")
+    session = LLMSession(config=config, skill_manager=SkillManager())
+
+    events = []
+
+    def event_callback(event):
+        events.append(event)
+        return LLMCallbackResult.CONTINUE
+
+    session.event_callback = event_callback
+
+    async def fake_acompletion(**kwargs):
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+    context_manager = ContextManager()
+
+    with (
+        patch.object(session, "_get_acompletion", return_value=fake_acompletion),
+        patch.object(session, "_trim_messages", side_effect=lambda msgs: msgs),
+        patch.object(session, "_get_tools_spec", return_value=[]),
+    ):
+        await session.process_input(
+            prompt="hi",
+            context_manager=context_manager,
+            system_message="sys",
+            skip_reasoning=True,
+        )
+
+    gen_start_events = [e for e in events if e.event_type == LLMEventType.GENERATION_START]
+    assert len(gen_start_events) == 1
+    assert gen_start_events[0].data.get("skip_reasoning") is True
