@@ -22,6 +22,8 @@ from .llm.providers.registry import (
 )
 from .state.logging import init_logging
 from .skills import SkillManager
+from .uninstall_manager import UninstallManager
+from .update_manager import UpdateManager
 from .wizard.setup_wizard import (
     needs_interactive_setup as needs_interactive_setup,
     run_interactive_setup as run_interactive_setup,
@@ -402,6 +404,107 @@ def setup(
     if result is None:
         console.print(t("cli.setup.cancelled"), style="yellow")
         sys.exit(1)
+
+
+@app.command(help=t("cli.update_command_help"), cls=I18nTyperCommand)
+def update(
+    check_only: bool = typer.Option(
+        False,
+        "--check-only",
+        "-c",
+        help=t("cli.update.check_only"),
+    ),
+):
+    """Update aish to the latest version."""
+    with UpdateManager() as manager:
+        # Check for updates
+        console.print(f"[bold cyan]{t('cli.update.checking')}[/bold cyan]")
+        update_info = manager.check_for_updates()
+
+        if not update_info:
+            console.print(f"[green]{t('cli.update.already_latest')}[/green]")
+            return
+
+        # Show update info
+        console.print(
+            f"[bold yellow]{t('cli.update.update_available', version=update_info['latest_version'])}[/bold yellow]"
+        )
+        console.print(f"[dim]{t('cli.update.current_version', version=update_info['current_version'])}[/dim]")
+
+        if check_only:
+            return
+
+        # Ask for confirmation
+        from rich.prompt import Confirm
+        if not Confirm.ask(t("cli.update.confirm")):
+            console.print(f"[yellow]{t('cli.update.cancelled')}[/yellow]")
+            return
+
+        # Download
+        archive_path = manager.download_release(update_info["tag_name"])
+        if not archive_path:
+            console.print(f"[red]{t('cli.update.download_failed')}[/red]")
+            raise typer.Exit(1)
+
+        # Install
+        if manager.install_release(archive_path):
+            console.print(f"[green]{t('cli.update.install_complete')}[/green]")
+            console.print(f"[yellow]{t('cli.update.restart_hint')}[/yellow]")
+        else:
+            console.print(f"[red]{t('cli.update.install_failed')}[/red]")
+            raise typer.Exit(1)
+
+
+@app.command(help=t("cli.uninstall_command_help"), cls=I18nTyperCommand)
+def uninstall(
+    purge: bool = typer.Option(
+        False,
+        "--purge",
+        help=t("cli.uninstall.purge_help"),
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help=t("cli.uninstall.yes_help"),
+    ),
+):
+    """Uninstall aish."""
+    manager = UninstallManager()
+
+    # Show what will be done
+    console.print(f"[bold cyan]{t('cli.uninstall.detecting')}[/bold cyan]")
+    method = manager.detect_installation_method()
+    # Show friendly method name
+    if method == "archive":
+        method_display = t("cli.uninstall.method_archive")
+    else:
+        method_display = method
+    console.print(f"[dim]{t('cli.uninstall.install_method', method=method_display)}[/dim]")
+    console.print(f"[dim]{t('cli.uninstall.will_uninstall')}[/dim]")
+
+    if purge:
+        console.print(f"[bold red]{t('cli.uninstall.purge_warning')}[/bold red]")
+
+    # Ask for confirmation
+    if not yes:
+        from rich.prompt import Confirm
+        if not Confirm.ask(f"{t('cli.uninstall.confirm')}"):
+            console.print(f"[yellow]{t('cli.uninstall.cancelled')}[/yellow]")
+            raise typer.Exit(0)
+
+    # Uninstall
+    console.print(f"[bold cyan]{t('cli.uninstall.uninstalling')}[/bold cyan]")
+    if not manager.uninstall_package(method=method):
+        console.print(f"[red]{t('cli.uninstall.failed')}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]{t('cli.uninstall.uninstall_complete')}[/green]")
+
+    # Purge if requested
+    if purge:
+        if manager.purge_data():
+            console.print(f"[green]{t('cli.uninstall.purge_complete')}[/green]")
 
 
 @models_auth_app.callback(invoke_without_command=True)
