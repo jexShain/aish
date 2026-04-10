@@ -23,7 +23,7 @@ from aish.llm.providers.registry import (
 from aish.state.logging import init_logging
 from aish.skills import SkillManager
 from .uninstall_manager import UninstallManager
-from .update_manager import UpdateManager
+from .update_manager import UpdateCheckError, UpdateManager
 from aish.wizard.setup_wizard import (
     needs_interactive_setup as needs_interactive_setup,
     run_interactive_setup as run_interactive_setup,
@@ -419,7 +419,11 @@ def update(
     with UpdateManager() as manager:
         # Check for updates
         console.print(f"[bold cyan]{t('cli.update.checking')}[/bold cyan]")
-        update_info = manager.check_for_updates()
+        try:
+            update_info = manager.check_for_updates()
+        except UpdateCheckError as e:
+            console.print(f"[red]Update check failed: {e}[/red]")
+            raise typer.Exit(1)
 
         if not update_info:
             console.print(f"[green]{t('cli.update.already_latest')}[/green]")
@@ -495,7 +499,7 @@ def uninstall(
 
     # Uninstall
     console.print(f"[bold cyan]{t('cli.uninstall.uninstalling')}[/bold cyan]")
-    if not manager.uninstall_package(method=method):
+    if not manager.uninstall_package(method=method, purge=purge):
         console.print(f"[red]{t('cli.uninstall.failed')}[/red]")
         raise typer.Exit(1)
 

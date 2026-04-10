@@ -81,11 +81,14 @@ class UninstallManager:
         except OSError:
             return False
 
-    def uninstall_package(self, method: str | None = None) -> bool:
+    def uninstall_package(
+        self, method: str | None = None, purge: bool = False
+    ) -> bool:
         """Uninstall aish package.
 
         Args:
             method: Pre-detected installation method. If None, auto-detect.
+            purge: If True, also remove system-level config files.
 
         Returns:
             True if successful, False otherwise.
@@ -94,27 +97,33 @@ class UninstallManager:
             method = self.detect_installation_method()
 
         if method == "archive":
-            return self._uninstall_archive()
+            return self._uninstall_archive(purge=purge)
         elif method == "pip":
             return self._uninstall_pip()
         elif method == "system":
-            return self._uninstall_system()
+            return self._uninstall_system(purge=purge)
         else:
             self.console.print("[yellow]Could not detect installation method[/yellow]")
             self.console.print("[dim]Please uninstall manually[/dim]")
             return False
 
-    def _uninstall_archive(self) -> bool:
+    def _uninstall_archive(self, purge: bool = False) -> bool:
         """Uninstall archive/script installation.
 
         Uses the bundled aish-uninstall script if available,
         otherwise removes files manually.
+
+        Args:
+            purge: If True, pass --purge-config to remove system-level config.
         """
         uninstall_script = _ARCHIVE_BIN_DIR / "aish-uninstall"
         if uninstall_script.exists():
             try:
+                cmd = ["sudo", str(uninstall_script)]
+                if purge:
+                    cmd.append("--purge-config")
                 result = subprocess.run(
-                    ["sudo", str(uninstall_script)],
+                    cmd,
                     capture_output=True,
                     text=True,
                 )
@@ -178,8 +187,12 @@ class UninstallManager:
             self.console.print(f"[red]Uninstall failed: {e}[/red]")
             return False
 
-    def _uninstall_system(self) -> bool:
-        """Uninstall via system package manager."""
+    def _uninstall_system(self, purge: bool = False) -> bool:
+        """Uninstall via system package manager.
+
+        Args:
+            purge: If True, also remove system config files after removal.
+        """
         has_dpkg = shutil.which("dpkg") is not None
         has_rpm = shutil.which("rpm") is not None
 
@@ -190,6 +203,8 @@ class UninstallManager:
                     capture_output=True,
                     text=True,
                 )
+                if result.returncode == 0 and purge:
+                    self._purge_system_config()
                 return result.returncode == 0
             except FileNotFoundError:
                 pass
@@ -201,11 +216,27 @@ class UninstallManager:
                     capture_output=True,
                     text=True,
                 )
+                if result.returncode == 0 and purge:
+                    self._purge_system_config()
                 return result.returncode == 0
             except FileNotFoundError:
                 pass
 
         return False
+
+    def _purge_system_config(self) -> None:
+        """Remove system-level config files (e.g. /etc/aish/security_policy.yaml)."""
+        etc_aish = Path("/etc/aish")
+        if etc_aish.exists():
+            try:
+                subprocess.run(
+                    ["sudo", "rm", "-rf", str(etc_aish)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+            except subprocess.CalledProcessError:
+                pass
 
     def get_data_directories(self) -> dict[str, Path]:
         """Get paths to aish data directories.

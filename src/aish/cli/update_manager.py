@@ -25,6 +25,11 @@ from rich.progress import (
 
 from aish import __version__
 
+
+class UpdateCheckError(Exception):
+    """Raised when update check fails due to network/API errors."""
+
+
 # Constants
 GITHUB_API_LATEST = "https://api.github.com/repos/AI-Shell-Team/aish/releases/latest"
 GITHUB_API_LIST = "https://api.github.com/repos/AI-Shell-Team/aish/releases"
@@ -103,7 +108,7 @@ class UpdateManager:
                 response.raise_for_status()
                 releases = response.json()
                 if not releases:
-                    return None
+                    raise UpdateCheckError("No releases found on GitHub")
                 data = releases[0]
             else:
                 response = self.client.get(GITHUB_API_LATEST)
@@ -112,7 +117,7 @@ class UpdateManager:
 
             tag_name = data.get("tag_name")
             if not tag_name:
-                return None
+                raise UpdateCheckError("Release missing tag_name in API response")
 
             return {
                 "tag_name": tag_name,
@@ -122,11 +127,9 @@ class UpdateManager:
                 "assets": data.get("assets", []),
             }
         except httpx.HTTPError as e:
-            self.console.print(f"[red]Failed to fetch release info: {e}[/red]")
-            return None
+            raise UpdateCheckError(f"Failed to fetch release info: {e}") from e
         except Exception as e:
-            self.console.print(f"[red]Unexpected error: {e}[/red]")
-            return None
+            raise UpdateCheckError(f"Unexpected error: {e}") from e
 
     def check_for_updates(self, include_pre_release: bool = False) -> Optional[dict]:
         """Check if there's a newer version available.
@@ -145,9 +148,6 @@ class UpdateManager:
         """
         current = self.get_current_version()
         release_info = self.get_latest_release(include_pre_release)
-
-        if not release_info:
-            return None
 
         latest_tag = release_info["tag_name"]
         latest_version_str = latest_tag.lstrip("v")
@@ -276,6 +276,18 @@ class UpdateManager:
                                 f"[red]Security: path traversal detected: {member.name}[/red]"
                             )
                             return False
+                        # Also validate symlink targets
+                        if member.issym():
+                            link_target = (
+                                extract_dir / member.name
+                            ).parent / member.linkname
+                            if not link_target.resolve().is_relative_to(
+                                extract_dir.resolve()
+                            ):
+                                self.console.print(
+                                    f"[red]Security: symlink target escapes extract dir: {member.name} -> {member.linkname}[/red]"
+                                )
+                                return False
                     tar.extractall(extract_dir)
 
             # Find install.sh
