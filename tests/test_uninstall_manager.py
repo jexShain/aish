@@ -2,7 +2,7 @@
 
 import pytest
 from unittest.mock import Mock, patch
-from aish.uninstall_manager import UninstallManager
+from aish.cli.uninstall_manager import UninstallManager
 
 
 @pytest.fixture
@@ -36,7 +36,7 @@ def test_is_elf_binary(tmp_path):
 
 
 @pytest.mark.timeout(5)
-@patch("aish.uninstall_manager._ARCHIVE_BIN_DIR")
+@patch("aish.cli.uninstall_manager._ARCHIVE_BIN_DIR")
 def test_detect_installation_method_archive(mock_bin_dir, uninstall_manager):
     """Test detecting archive installation when ELF binary exists."""
     mock_aish = Mock()
@@ -50,8 +50,8 @@ def test_detect_installation_method_archive(mock_bin_dir, uninstall_manager):
 
 @pytest.mark.timeout(5)
 @patch.object(UninstallManager, "_is_elf_binary", return_value=False)
-@patch("aish.uninstall_manager.sys")
-@patch("aish.uninstall_manager.subprocess.run")
+@patch("aish.cli.uninstall_manager.sys")
+@patch("aish.cli.uninstall_manager.subprocess.run")
 def test_detect_installation_method_pip(
     mock_run, mock_sys, mock_elf, uninstall_manager
 ):
@@ -69,8 +69,8 @@ def test_detect_installation_method_pip(
 
 @pytest.mark.timeout(5)
 @patch.object(UninstallManager, "_is_elf_binary", return_value=False)
-@patch("aish.uninstall_manager.sys")
-@patch("aish.uninstall_manager.subprocess.run")
+@patch("aish.cli.uninstall_manager.sys")
+@patch("aish.cli.uninstall_manager.subprocess.run")
 def test_detect_installation_method_system_dpkg(
     mock_run, mock_sys, mock_elf, uninstall_manager
 ):
@@ -89,8 +89,8 @@ def test_detect_installation_method_system_dpkg(
 
 @pytest.mark.timeout(5)
 @patch.object(UninstallManager, "_is_elf_binary", return_value=False)
-@patch("aish.uninstall_manager.sys")
-@patch("aish.uninstall_manager.subprocess.run")
+@patch("aish.cli.uninstall_manager.sys")
+@patch("aish.cli.uninstall_manager.subprocess.run")
 def test_detect_installation_method_unknown(
     mock_run, mock_sys, mock_elf, uninstall_manager
 ):
@@ -105,8 +105,8 @@ def test_detect_installation_method_unknown(
 
 @pytest.mark.timeout(5)
 @patch.object(UninstallManager, "_is_elf_binary", return_value=False)
-@patch("aish.uninstall_manager.sys")
-@patch("aish.uninstall_manager.subprocess.run")
+@patch("aish.cli.uninstall_manager.sys")
+@patch("aish.cli.uninstall_manager.subprocess.run")
 def test_detect_installation_method_venv_skips_pip(
     mock_run, mock_sys, mock_elf, uninstall_manager
 ):
@@ -127,10 +127,10 @@ def test_detect_installation_method_venv_skips_pip(
 
 
 @pytest.mark.timeout(5)
-@patch("aish.uninstall_manager.subprocess.run")
+@patch("aish.cli.uninstall_manager.subprocess.run")
 def test_uninstall_archive_with_script(mock_run, uninstall_manager):
     """Test archive uninstall using aish-uninstall script."""
-    with patch("aish.uninstall_manager._ARCHIVE_BIN_DIR") as mock_bin_dir:
+    with patch("aish.cli.uninstall_manager._ARCHIVE_BIN_DIR") as mock_bin_dir:
         mock_bin_dir.__truediv__ = Mock(
             return_value=Mock(exists=Mock(return_value=True))
         )
@@ -143,7 +143,7 @@ def test_uninstall_archive_with_script(mock_run, uninstall_manager):
 
 
 @pytest.mark.timeout(5)
-@patch("aish.uninstall_manager.subprocess.run")
+@patch("aish.cli.uninstall_manager.subprocess.run")
 def test_uninstall_pip_success(mock_run, uninstall_manager):
     """Test successful pip uninstall."""
     mock_result = Mock()
@@ -155,7 +155,7 @@ def test_uninstall_pip_success(mock_run, uninstall_manager):
 
 
 @pytest.mark.timeout(5)
-@patch("aish.uninstall_manager.subprocess.run")
+@patch("aish.cli.uninstall_manager.subprocess.run")
 def test_uninstall_pip_failure(mock_run, uninstall_manager):
     """Test failed pip uninstall."""
     mock_result = Mock()
@@ -170,7 +170,7 @@ def test_uninstall_pip_failure(mock_run, uninstall_manager):
 
 
 @pytest.mark.timeout(5)
-@patch("aish.uninstall_manager.subprocess.run")
+@patch("aish.cli.uninstall_manager.subprocess.run")
 def test_uninstall_pip_externally_managed(mock_run, uninstall_manager):
     """Test pip uninstall retries with --break-system-packages."""
     # First call: fails with externally-managed-environment
@@ -188,8 +188,8 @@ def test_uninstall_pip_externally_managed(mock_run, uninstall_manager):
 
 
 @pytest.mark.timeout(5)
-@patch("aish.uninstall_manager.shutil.which")
-@patch("aish.uninstall_manager.subprocess.run")
+@patch("aish.cli.uninstall_manager.shutil.which")
+@patch("aish.cli.uninstall_manager.subprocess.run")
 def test_uninstall_system_dpkg(mock_run, mock_which, uninstall_manager):
     """Test system uninstall via dpkg/apt."""
     mock_which.side_effect = lambda cmd: "/usr/bin/" + cmd if cmd == "dpkg" else None
@@ -207,8 +207,8 @@ def test_uninstall_system_dpkg(mock_run, mock_which, uninstall_manager):
 
 
 @pytest.mark.timeout(5)
-@patch("aish.uninstall_manager.shutil.which")
-@patch("aish.uninstall_manager.subprocess.run")
+@patch("aish.cli.uninstall_manager.shutil.which")
+@patch("aish.cli.uninstall_manager.subprocess.run")
 def test_uninstall_system_rpm(mock_run, mock_which, uninstall_manager):
     """Test system uninstall via rpm/dnf."""
     mock_which.side_effect = lambda cmd: "/usr/bin/" + cmd if cmd == "rpm" else None
@@ -233,7 +233,7 @@ def test_uninstall_unknown_method(uninstall_manager):
 
 
 @pytest.mark.timeout(5)
-@patch("aish.uninstall_manager.shutil.rmtree")
+@patch("aish.cli.uninstall_manager.shutil.rmtree")
 def test_purge_data_success(mock_rmtree, uninstall_manager):
     """Test successful data purge."""
     dirs = uninstall_manager.get_data_directories()
@@ -244,8 +244,8 @@ def test_purge_data_success(mock_rmtree, uninstall_manager):
 
 @pytest.mark.timeout(5)
 @patch.object(UninstallManager, "_is_elf_binary", return_value=False)
-@patch("aish.uninstall_manager.sys")
-@patch("aish.uninstall_manager.subprocess.run")
+@patch("aish.cli.uninstall_manager.sys")
+@patch("aish.cli.uninstall_manager.subprocess.run")
 def test_uninstall_package_auto_detect(mock_run, mock_sys, mock_elf, uninstall_manager):
     """Test uninstall_package auto-detects when method is None."""
     mock_sys.prefix = "/usr"

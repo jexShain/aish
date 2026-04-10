@@ -3,7 +3,7 @@
 import httpx
 import pytest
 from unittest.mock import Mock, patch
-from aish.update_manager import UpdateManager
+from aish.cli.update_manager import UpdateManager
 
 
 @pytest.fixture
@@ -45,7 +45,7 @@ def test_detect_platform(update_manager):
 
 
 @pytest.mark.timeout(5)
-@patch("aish.update_manager.httpx.Client")
+@patch("aish.cli.update_manager.httpx.Client")
 def test_get_latest_release_success(
     mock_client_class, update_manager, mock_github_response
 ):
@@ -65,7 +65,7 @@ def test_get_latest_release_success(
 
 
 @pytest.mark.timeout(5)
-@patch("aish.update_manager.httpx.Client")
+@patch("aish.cli.update_manager.httpx.Client")
 def test_get_latest_release_http_error(mock_client_class, update_manager):
     """Test handling of HTTP error."""
     mock_client_instance = mock_client_class.return_value
@@ -78,7 +78,7 @@ def test_get_latest_release_http_error(mock_client_class, update_manager):
 
 
 @pytest.mark.timeout(5)
-@patch("aish.update_manager.httpx.Client")
+@patch("aish.cli.update_manager.httpx.Client")
 def test_check_for_updates_available(
     mock_client_class, update_manager, mock_github_response
 ):
@@ -98,7 +98,7 @@ def test_check_for_updates_available(
 
 
 @pytest.mark.timeout(5)
-@patch("aish.update_manager.httpx.Client")
+@patch("aish.cli.update_manager.httpx.Client")
 def test_check_for_updates_none_available(mock_client_class, update_manager):
     """Test checking when no update available."""
     old_response = {
@@ -122,7 +122,7 @@ def test_check_for_updates_none_available(mock_client_class, update_manager):
 
 
 @pytest.mark.timeout(5)
-@patch("aish.update_manager.httpx.Client")
+@patch("aish.cli.update_manager.httpx.Client")
 def test_download_release_success(mock_client_class, update_manager, tmp_path):
     """Test successful download."""
     mock_response = Mock()
@@ -143,8 +143,8 @@ def test_download_release_success(mock_client_class, update_manager, tmp_path):
 
 
 @pytest.mark.timeout(5)
-@patch("aish.update_manager.subprocess.run")
-@patch("aish.update_manager.tarfile.open")
+@patch("aish.cli.update_manager.subprocess.run")
+@patch("aish.cli.update_manager.tarfile.open")
 def test_install_release_success(mock_tarfile, mock_run, update_manager, tmp_path):
     """Test successful installation."""
     extract_dir = update_manager.temp_dir / "extract"
@@ -173,7 +173,7 @@ def test_install_release_success(mock_tarfile, mock_run, update_manager, tmp_pat
 
 
 @pytest.mark.timeout(5)
-@patch("aish.update_manager.httpx.Client")
+@patch("aish.cli.update_manager.httpx.Client")
 def test_get_latest_release_with_pre_release(mock_client_class, update_manager):
     """Test fetching pre-release uses list endpoint."""
     pre_release_response = [

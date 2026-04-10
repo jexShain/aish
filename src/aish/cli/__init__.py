@@ -10,21 +10,21 @@ import yaml
 from rich.console import Console
 from rich.panel import Panel
 
-from .config import Config, ConfigModel
-from .i18n import t
-from .i18n.typer import I18nTyperCommand, I18nTyperGroup
-from .llm.providers.openai_codex import OPENAI_CODEX_DEFAULT_CALLBACK_PORT
-from .llm.providers.registry import (
+from aish.config import Config, ConfigModel
+from aish.i18n import t
+from aish.i18n.typer import I18nTyperCommand, I18nTyperGroup
+from aish.llm.providers.openai_codex import OPENAI_CODEX_DEFAULT_CALLBACK_PORT
+from aish.llm.providers.registry import (
     get_provider_by_id as get_provider_by_id,
     get_provider_for_model as get_provider_for_model,
     list_auth_capable_provider_ids as list_auth_capable_provider_ids,
     resolve_provider_metadata as resolve_provider_metadata,
 )
-from .state.logging import init_logging
-from .skills import SkillManager
+from aish.state.logging import init_logging
+from aish.skills import SkillManager
 from .uninstall_manager import UninstallManager
 from .update_manager import UpdateManager
-from .wizard.setup_wizard import (
+from aish.wizard.setup_wizard import (
     needs_interactive_setup as needs_interactive_setup,
     run_interactive_setup as run_interactive_setup,
     run_live_tool_support_check_debug,

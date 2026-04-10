@@ -7,7 +7,7 @@ import asyncio
 import os
 import re
 import sys
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from ...state import ContextManager, MemoryType
 
@@ -120,7 +120,7 @@ class AIHandler:
             loop.run_until_complete(shutdown_default_executor())
 
     @staticmethod
-    def _run_async_in_thread(coro, cancellation_token=None):
+    def _run_async_in_thread(coro, cancellation_token=None) -> Any:
         """Run an async coroutine in a separate thread with its own event loop.
 
         Uses polling-based cancellation to allow Ctrl+C interruption.
@@ -130,7 +130,7 @@ class AIHandler:
         result_box: list[Optional[str]] = [None]
         exc_box: list[BaseException | None] = [None]
 
-        def run_in_thread():
+        def run_in_thread() -> None:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
