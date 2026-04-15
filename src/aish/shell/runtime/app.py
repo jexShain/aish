@@ -79,6 +79,8 @@ else:
 class PTYAIShell:
     """AI shell with direct PTY connection."""
 
+    _TTFT_DISPLAY_THRESHOLD = 0.1  # minimum seconds to show timing summary
+
     def __init__(
         self,
         config: ConfigModel,
@@ -163,6 +165,7 @@ class PTYAIShell:
         self.llm_event_router: LLMEventRouter = LLMEventRouter(
             handlers={
                 LLMEventType.OP_START: self.handle_operation_start,
+                LLMEventType.OP_END: self.handle_op_end,
                 LLMEventType.GENERATION_START: self.handle_generation_start,
                 LLMEventType.GENERATION_END: self.handle_generation_end,
                 LLMEventType.REASONING_START: self.handle_reasoning_start,
@@ -181,6 +184,11 @@ class PTYAIShell:
         self.animation_thread: Optional[threading.Thread] = None
         self.animation_lock: threading.Lock = threading.Lock()
         self.animation_counter: int = 0
+        # Response timing state
+        self._thinking_start_time: float = 0.0  # monotonic time when thinking starts
+        self._timing_active: bool = False           # whether a timing-tracked operation is in progress
+        self._ttft: float = 0.0                 # time to first token in seconds
+        self._ttft_recorded: bool = False       # whether first token has been seen
         self._animation_base_text: str = "思考中"
         self._animation_pattern: str = "braille"
         self._animation_update_text: Optional[str] = None
@@ -315,6 +323,12 @@ class PTYAIShell:
         init_thread.start()
         return session
 
+    def _reset_timing_state(self) -> None:
+        self._timing_active = False
+        self._thinking_start_time = 0.0
+        self._ttft = 0.0
+        self._ttft_recorded = False
+
     def _update_current_session_state(self, state_patch: dict[str, object]) -> None:
         if self.session_record is None:
             return
@@ -342,6 +356,21 @@ class PTYAIShell:
                     pass
 
     def handle_operation_start(self, event) -> None:
+        self._timing_active = True
+        self._thinking_start_time = time.monotonic()
+        self._ttft_recorded = False
+        self._ttft = 0.0
+        return None
+
+    def handle_op_end(self, event) -> None:
+        # Display timing summary at operation end
+        if self._timing_active and self._ttft >= self._TTFT_DISPLAY_THRESHOLD:
+            self.console.print()
+            self.console.print(
+                f"思考: {self._ttft:.1f}s",
+                style="dim",
+            )
+        self._reset_timing_state()
         return None
 
     def handle_generation_start(self, event) -> None:
@@ -380,14 +409,16 @@ class PTYAIShell:
         with self.animation_lock:
             spinner_char = self._get_current_spinner_char("dots")
             self.animation_counter += 1
+            thinking_start = self._thinking_start_time
 
         max_width = max(10, self.console.size.width - 4)
         trimmed_lines = [line[-max_width:] if len(line) > max_width else line for line in lines]
         thinking_label = "思考中"
+        elapsed = time.monotonic() - thinking_start if thinking_start > 0 else 0
         if trimmed_lines:
-            display_text = "\n".join([f"{spinner_char} {thinking_label}", *trimmed_lines])
+            display_text = "\n".join([f"{spinner_char} {thinking_label} ... {elapsed:.1f}s", *trimmed_lines])
         else:
-            display_text = f"{spinner_char} {thinking_label}..."
+            display_text = f"{spinner_char} {thinking_label} ... {elapsed:.1f}s"
 
         self.current_live.update(Text(display_text, style="grey50"), refresh=True)
 
@@ -448,8 +479,14 @@ class PTYAIShell:
                     spinner_char = self._get_current_spinner_char(pattern)
                     self.animation_counter += 1
 
+                    # Read _thinking_start_time under lock for thread safety
+                    thinking_start = self._thinking_start_time
+
                 if update_text:
                     display_text = f"{spinner_char} {update_text}"
+                elif thinking_start > 0:
+                    elapsed = time.monotonic() - thinking_start
+                    display_text = f"{spinner_char} {base_text} ... {elapsed:.1f}s"
                 else:
                     display_text = f"{spinner_char} {base_text}..."
 
@@ -555,6 +592,10 @@ class PTYAIShell:
             self.current_live.stop()
             self.current_live = None
 
+        if not self._ttft_recorded and self._thinking_start_time > 0:
+            self._ttft = time.monotonic() - self._thinking_start_time
+            self._ttft_recorded = True
+
         content = event.data.get("delta") or event.data.get("accumulated") or ""
         content = str(content)
         if not content:
@@ -649,6 +690,7 @@ class PTYAIShell:
         from ..interruption import ShellState
 
         self._stop_animation()
+        self._reset_timing_state()
         self._reset_reasoning_state()
         self._last_streaming_accumulated = ""
         self._finalize_content_preview()
