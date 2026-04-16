@@ -7,6 +7,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-04-16
+
+### Added
+
+- Added a dedicated `Release Final Check` workflow so maintainers can confirm merged `main` release metadata before pushing a stable tag.
+
+### Changed
+
+- Changed release candidate validation so release PRs now run installed-binary runtime smoke checks and artifact-based live smoke against the built bundle before merge.
+- Changed the plan mode keyboard toggle from `F2` to `Shift+Tab` and `Ctrl+X P`, reducing conflicts with terminal key handling.
+
+### Fixed
+
+- Fixed normal streamed conversations so the live reasoning display is no longer interrupted by partial content rendering while the model is still responding.
+
 ## [0.2.1] - 2026-04-15
 
 ### Added
