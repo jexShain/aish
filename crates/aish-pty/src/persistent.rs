@@ -214,6 +214,10 @@ impl PersistentPty {
         self.command_state
             .register_command(command, CommandSource::User, None);
 
+        // Drain any stale PTY output left from the previous command's
+        // prompt rendering (PS1 / readline init sequences, etc.).
+        self.drain_master_silent();
+
         // Write command to bash.
         let mut payload = command.to_string();
         payload.push('\n');
@@ -235,6 +239,11 @@ impl PersistentPty {
         let mut result_exit_code: i32 = -1;
         let mut output_buf: Vec<u8> = Vec::new();
         let mut done = false;
+        // The PTY may still emit a leading line (ANSI escape sequences +
+        // newline) from readline or stale prompt rendering.  Skip the
+        // first newline-containing chunk to avoid a blank line before the
+        // actual command output.
+        let mut skip_leading_newline = true;
 
         while !done {
             // Build fd sets.
@@ -321,15 +330,28 @@ impl PersistentPty {
                     )
                 } {
                     n if n > 0 => {
-                        let data = &tmp[..n as usize];
-                        output_buf.extend_from_slice(data);
-                        let _ = unsafe {
-                            libc::write(
-                                libc::STDOUT_FILENO,
-                                data.as_ptr() as *const libc::c_void,
-                                data.len(),
-                            )
-                        };
+                        let mut data = &tmp[..n as usize];
+                        if skip_leading_newline {
+                            // Find the first newline (after any ANSI escape
+                            // sequences) and skip everything up to it.
+                            if let Some(pos) = data.iter().position(|&b| b == b'\n') {
+                                data = &data[pos + 1..];
+                                skip_leading_newline = false;
+                            } else {
+                                // Entire chunk is preamble — skip it.
+                                data = &[];
+                            }
+                        }
+                        if !data.is_empty() {
+                            output_buf.extend_from_slice(data);
+                            let _ = unsafe {
+                                libc::write(
+                                    libc::STDOUT_FILENO,
+                                    data.as_ptr() as *const libc::c_void,
+                                    data.len(),
+                                )
+                            };
+                        }
                     }
                     0 => {
                         // EOF on master_fd means the bash slave closed —
@@ -463,6 +485,25 @@ impl PersistentPty {
         let seq = self.next_backend_seq;
         self.next_backend_seq -= 1;
         seq
+    }
+
+    /// Drain any remaining data from master_fd and discard it.
+    /// Used to clear stale prompt rendering output before sending a
+    /// new command, so it does not leak into the forwarding loop.
+    fn drain_master_silent(&self) {
+        let mut tmp = [0u8; 8192];
+        loop {
+            match unsafe {
+                libc::read(
+                    self.master_fd,
+                    tmp.as_mut_ptr() as *mut libc::c_void,
+                    tmp.len(),
+                )
+            } {
+                n if n > 0 => { /* discard */ }
+                _ => break,
+            }
+        }
     }
 
     /// Drain any remaining data from master_fd to stdout.

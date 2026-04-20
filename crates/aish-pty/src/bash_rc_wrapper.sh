@@ -1,8 +1,11 @@
 # aish bash rc wrapper
 # This file is used as rcfile for interactive bash
 
-# Enable readline for interactive use
-set -o emacs
+# Disable readline — the frontend (aish) handles all display and editing.
+# Without readline, bash uses the simple line reader which does not emit
+# extra newlines on Enter, preventing spurious blank lines in PTY output.
+set +o emacs
+set +o vi
 
 # Source user's bashrc if exists
 if [ -f ~/.bashrc ]; then

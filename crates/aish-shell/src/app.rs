@@ -1330,20 +1330,20 @@ impl AishShell {
             InterruptionState::Normal | InterruptionState::Inputting => {
                 self.interruption = InterruptionState::ClearPending;
                 self.last_ctrl_c = Some(now);
-                println!("\n\x1b[33m(Ctrl+C again within 1s to exit)\x1b[0m");
+                println!("\x1b[33m(Ctrl+C again within 1s to exit)\x1b[0m");
                 false
             }
             InterruptionState::ClearPending => {
                 if let Some(last) = self.last_ctrl_c {
                     if now.duration_since(last).as_secs() < 1 {
                         self.interruption = InterruptionState::ExitPending;
-                        println!("\n\x1b[33mExiting...\x1b[0m");
+                        println!("\x1b[33mExiting...\x1b[0m");
                         return true;
                     }
                 }
                 self.interruption = InterruptionState::ClearPending;
                 self.last_ctrl_c = Some(now);
-                println!("\n\x1b[33m(Ctrl+C again within 1s to exit)\x1b[0m");
+                println!("\x1b[33m(Ctrl+C again within 1s to exit)\x1b[0m");
                 false
             }
             InterruptionState::ExitPending => true,
