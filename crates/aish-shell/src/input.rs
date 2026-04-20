@@ -23,7 +23,7 @@ pub fn classify_input(input: &str) -> InputIntent {
 
     let cmd = trimmed.split_whitespace().next().unwrap_or("");
     match cmd {
-        "cd" | "pwd" | "export" | "unset" | "pushd" | "popd" | "dirs" | "history" | "clear"
+        "cd" | "pwd" | "export" | "unset" | "pushd" | "popd" | "dirs" | "clear"
         | "exit" | "quit" | "su" | "sudo" => InputIntent::BuiltinCommand,
         _ => {
             // Check if the first word looks like a .aish script
@@ -56,7 +56,7 @@ pub fn classify_command(input: &str) -> CommandCategory {
         "cd" | "pushd" | "popd" | "dirs" | "pwd" | "export" | "unset" => {
             CommandCategory::BuiltinStateModify
         }
-        "help" | "history" | "clear" | "version" => CommandCategory::BuiltinInfo,
+        "help" | "clear" | "version" => CommandCategory::BuiltinInfo,
         "su" | "sudo" => CommandCategory::PtyRequired,
         "exit" | "quit" | "logout" => CommandCategory::Rejected,
         _ => CommandCategory::External,
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_classify_command_info() {
         assert_eq!(classify_command("help"), CommandCategory::BuiltinInfo);
-        assert_eq!(classify_command("history"), CommandCategory::BuiltinInfo);
+        assert_eq!(classify_command("history"), CommandCategory::External);
         assert_eq!(classify_command("clear"), CommandCategory::BuiltinInfo);
         assert_eq!(classify_command("version"), CommandCategory::BuiltinInfo);
     }

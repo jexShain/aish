@@ -54,7 +54,7 @@ impl BuiltinResult {
 
 /// Commands that modify shell state (cd, pushd, popd, export, unset, dirs).
 pub const STATE_MODIFYING_COMMANDS: &[&str] = &[
-    "cd", "pushd", "popd", "export", "unset", "dirs", "pwd", "history",
+    "cd", "pushd", "popd", "export", "unset", "dirs", "pwd",
 ];
 
 /// Commands that require a PTY for interactive input.
@@ -89,7 +89,6 @@ impl ShellState {
             "pushd" => self.handle_pushd(args),
             "popd" => self.handle_popd(),
             "dirs" => self.handle_dirs(args),
-            "history" => self.handle_history(args),
             "help" => self.handle_help(),
             "clear" => self.handle_clear(),
             "exit" | "quit" => self.handle_exit(),
@@ -466,28 +465,6 @@ impl ShellState {
             parts.push(shorten_path(d, &home));
         }
         BuiltinResult::handled(parts.join(" "))
-    }
-
-    // -- history -------------------------------------------------------------
-
-    fn handle_history(&mut self, args: &[&str]) -> BuiltinResult {
-        let limit: usize = if !args.is_empty() {
-            args[0].parse().unwrap_or(self.history.len())
-        } else {
-            self.history.len()
-        };
-
-        let start = if self.history.len() > limit {
-            self.history.len() - limit
-        } else {
-            0
-        };
-
-        let mut lines = Vec::new();
-        for (i, entry) in self.history[start..].iter().enumerate() {
-            lines.push(format!("{:>5}  {}", start + i + 1, entry));
-        }
-        BuiltinResult::handled(lines.join("\n"))
     }
 
     // -- help ----------------------------------------------------------------

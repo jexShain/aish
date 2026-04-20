@@ -44,7 +44,8 @@ fn test_classify_command_state_modify() {
 fn test_classify_command_info() {
     // Test 2: Informational builtins are correctly classified
     assert_eq!(classify_command("help"), CommandCategory::BuiltinInfo);
-    assert_eq!(classify_command("history"), CommandCategory::BuiltinInfo);
+    // history is now routed to PTY (bash) for full cross-session history
+    assert_eq!(classify_command("history"), CommandCategory::External);
     assert_eq!(classify_command("clear"), CommandCategory::BuiltinInfo);
     assert_eq!(classify_command("version"), CommandCategory::BuiltinInfo);
 }
@@ -166,7 +167,8 @@ fn test_classify_input_builtin_command() {
         classify_input("export FOO=bar"),
         InputIntent::BuiltinCommand
     );
-    assert_eq!(classify_input("history"), InputIntent::BuiltinCommand);
+    // history is now routed to PTY (bash) for full cross-session history
+    assert_eq!(classify_input("history"), InputIntent::Command);
     assert_eq!(classify_input("clear"), InputIntent::BuiltinCommand);
     assert_eq!(classify_input("exit"), InputIntent::BuiltinCommand);
 }
@@ -240,7 +242,7 @@ fn test_command_category_completeness() {
         ("export X=1", CommandCategory::BuiltinStateModify),
         ("unset X", CommandCategory::BuiltinStateModify),
         ("help", CommandCategory::BuiltinInfo),
-        ("history", CommandCategory::BuiltinInfo),
+        ("history", CommandCategory::External),
         ("clear", CommandCategory::BuiltinInfo),
         ("version", CommandCategory::BuiltinInfo),
         ("su -", CommandCategory::PtyRequired),
