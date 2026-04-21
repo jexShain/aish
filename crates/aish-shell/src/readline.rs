@@ -1,6 +1,6 @@
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::highlight::Highlighter;
@@ -23,17 +23,8 @@ const BUILTINS: &[&str] = &[
 /// Special commands starting with /.
 const SPECIALS: &[&str] = &["/model", "/setup"];
 
-/// Common POSIX shell commands that should appear in completion even if not in PATH.
-const COMMON_SHELL_COMMANDS: &[&str] = &[
-    "alias", "bg", "bind", "builtin", "command", "compgen", "complete", "declare", "disown",
-    "echo", "enable", "eval", "exec", "false", "fc", "fg", "getopts", "hash", "help", "jobs",
-    "kill", "let", "local", "printf", "read", "readonly", "return", "set", "shift", "shopt",
-    "source", "test", "times", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias",
-    "wait",
-];
-
-/// Commands that only accept directory paths as arguments.
-const DIRECTORY_ONLY_COMMANDS: &[&str] = &["cd", "pushd", "popd"];
+/// Timeout for PTY completion queries.
+const COMPLETION_TIMEOUT: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // Mode toggle key binding handler
@@ -59,23 +50,50 @@ impl ConditionalEventHandler for ModeToggleHandler {
     }
 }
 
-/// Shell command completer combining builtins, specials, PATH executables,
-/// and file paths.  Also provides history-based autosuggestions via Hinter.
+/// Shell command completer that delegates to the persistent PTY bash process
+/// for full bash-completion support (git add, systemctl status, etc.).
 struct ShellHelper {
     file_completer: FilenameCompleter,
-    /// Cached set of executable names discovered from PATH.
-    path_executables: HashSet<String>,
-    /// Shared autosuggest engine (Arc<Mutex> so it can be mutated from
-    /// ShellReadline without needing helper_mut).
+    /// Shared reference to the persistent PTY session.
+    pty: Arc<Mutex<aish_pty::PersistentPty>>,
+    /// Shared autosuggest engine.
     autosuggest: Arc<Mutex<AutoSuggest>>,
 }
 
 impl ShellHelper {
-    fn new(autosuggest: Arc<Mutex<AutoSuggest>>) -> Self {
+    fn new(pty: Arc<Mutex<aish_pty::PersistentPty>>, autosuggest: Arc<Mutex<AutoSuggest>>) -> Self {
         Self {
             file_completer: FilenameCompleter::new(),
-            path_executables: discover_path_executables(),
+            pty,
             autosuggest,
+        }
+    }
+
+    /// Query the PTY bash for completions using `__aish_query_completions`.
+    /// Returns a list of completion candidates on success, or an empty vec on
+    /// any error (timeout, PTY not running, etc.).
+    fn query_pty_completions(&self, line: &str, pos: usize) -> Vec<String> {
+        let mut pty = match self.pty.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Vec::new(),
+        };
+
+        // Skip if PTY is not running.
+        if !pty.is_running() {
+            return Vec::new();
+        }
+
+        // Build the completion query command.
+        let escaped_line = aish_pty::shell_quote_escape(line);
+        let cmd = format!("__aish_query_completions {} {}", escaped_line, pos);
+
+        match pty.execute_command(&cmd, COMPLETION_TIMEOUT) {
+            Ok((output, _exit_code)) => output
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| l.to_string())
+                .collect(),
+            Err(_) => Vec::new(),
         }
     }
 }
@@ -117,22 +135,12 @@ impl Completer for ShellHelper {
             return Ok((0, Vec::new()));
         }
 
-        // At the start of the line: complete commands
+        // At the start of the line: mix builtins/specials with PTY results
         if !before.contains(' ') {
             let mut candidates: Vec<Pair> = Vec::new();
 
-            // Builtin commands
+            // Builtin commands (handled by Rust shell, not PTY)
             for cmd in BUILTINS {
-                if cmd.starts_with(word) {
-                    candidates.push(Pair {
-                        display: cmd.to_string(),
-                        replacement: cmd.to_string(),
-                    });
-                }
-            }
-
-            // Common shell commands
-            for cmd in COMMON_SHELL_COMMANDS {
                 if cmd.starts_with(word) {
                     candidates.push(Pair {
                         display: cmd.to_string(),
@@ -159,15 +167,19 @@ impl Completer for ShellHelper {
                 });
             }
 
-            // PATH executables
+            // Query PTY for all other command completions
             if !word.is_empty() {
-                for exe in &self.path_executables {
-                    if exe.starts_with(word) {
-                        candidates.push(Pair {
-                            display: exe.clone(),
-                            replacement: format!("{} ", exe),
-                        });
+                let pty_results = self.query_pty_completions(line, pos);
+                let builtin_set: Vec<&str> = BUILTINS.to_vec();
+                for candidate in &pty_results {
+                    // Skip duplicates already covered by BUILTINS/SPECIALS
+                    if builtin_set.contains(&candidate.as_str()) {
+                        continue;
                     }
+                    candidates.push(Pair {
+                        display: candidate.clone(),
+                        replacement: format!("{} ", candidate),
+                    });
                 }
             }
 
@@ -187,64 +199,30 @@ impl Completer for ShellHelper {
             return Ok((word_start, candidates));
         }
 
-        // After a command: context-aware path completion
-        let tokens: Vec<&str> = before.split_whitespace().collect();
-        if let Some(&command) = tokens.first() {
-            // Skip flag arguments
-            if word.starts_with('-') {
-                return Ok((0, Vec::new()));
-            }
-            // Directory-only commands: complete just directories
-            if DIRECTORY_ONLY_COMMANDS.contains(&command) {
-                return self.file_completer.complete(line, pos, ctx);
-            }
+        // After a command: delegate entirely to PTY for context-aware completion
+        let pty_results = self.query_pty_completions(line, pos);
+        if !pty_results.is_empty() {
+            let candidates: Vec<Pair> = pty_results
+                .into_iter()
+                .map(|c| {
+                    // Append space for non-directory completions
+                    let replacement = if c.ends_with('/') {
+                        c.clone()
+                    } else {
+                        format!("{} ", c)
+                    };
+                    Pair {
+                        display: c,
+                        replacement,
+                    }
+                })
+                .collect();
+            return Ok((word_start, candidates));
         }
 
-        // Default: file completion
+        // Fallback: file completion
         self.file_completer.complete(line, pos, ctx)
     }
-}
-
-/// Discover all executable file names in PATH directories.
-fn discover_path_executables() -> HashSet<String> {
-    let mut executables = HashSet::new();
-    let path_var = std::env::var("PATH").unwrap_or_default();
-
-    for dir in path_var.split(':') {
-        let dir = dir.trim();
-        if dir.is_empty() {
-            continue;
-        }
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy().to_string();
-                if is_executable(&entry) {
-                    executables.insert(name_str);
-                }
-            }
-        }
-    }
-
-    executables
-}
-
-/// Check if a directory entry is an executable file (or symlink to one).
-#[cfg(unix)]
-fn is_executable(entry: &std::fs::DirEntry) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    entry
-        .metadata()
-        .map(|m| {
-            let mode = m.permissions().mode();
-            m.is_file() && (mode & 0o111 != 0)
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(entry: &std::fs::DirEntry) -> bool {
-    entry.metadata().map(|m| m.is_file()).unwrap_or(false)
 }
 
 /// Wrapper around rustyline Editor with shell-friendly configuration.
@@ -256,7 +234,7 @@ pub struct ShellReadline {
 }
 
 impl ShellReadline {
-    pub fn new() -> rustyline::Result<Self> {
+    pub fn new(pty: Arc<Mutex<aish_pty::PersistentPty>>) -> rustyline::Result<Self> {
         let autosuggest = Arc::new(Mutex::new(AutoSuggest::new(1000)));
 
         let builder = Config::builder()
@@ -266,7 +244,7 @@ impl ShellReadline {
         let config = builder.history_ignore_dups(true)?.build();
 
         let mut editor = Editor::with_config(config)?;
-        editor.set_helper(Some(ShellHelper::new(autosuggest.clone())));
+        editor.set_helper(Some(ShellHelper::new(pty, autosuggest.clone())));
 
         // Bind Shift+Tab (BackTab) and F2 for mode toggle
         editor.bind_sequence(
@@ -365,33 +343,19 @@ impl ShellReadline {
 }
 
 #[cfg(test)]
-mod path_tests {
+mod tests {
     use super::*;
 
     #[test]
-    fn test_discover_path_executables_returns_set() {
-        let exes = discover_path_executables();
-        assert!(!exes.is_empty());
-        assert!(exes.contains("ls") || exes.contains("cat"));
+    fn test_builtins_contains_cd() {
+        assert!(BUILTINS.contains(&"cd"));
+        assert!(BUILTINS.contains(&"exit"));
     }
 
     #[test]
-    fn test_common_commands_all_lowercase() {
-        for cmd in COMMON_SHELL_COMMANDS {
-            assert_eq!(
-                *cmd,
-                cmd.to_lowercase(),
-                "COMMON_SHELL_COMMANDS must be lowercase: {}",
-                cmd
-            );
-        }
-    }
-
-    #[test]
-    fn test_directory_commands_recognized() {
-        let dir_cmds: &[&str] = &["cd", "pushd", "popd"];
-        for cmd in dir_cmds {
-            assert!(DIRECTORY_ONLY_COMMANDS.contains(cmd));
+    fn test_specials_format() {
+        for cmd in SPECIALS {
+            assert!(cmd.starts_with('/'), "special must start with /: {}", cmd);
         }
     }
 }

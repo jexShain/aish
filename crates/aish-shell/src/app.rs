@@ -1,12 +1,12 @@
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use aish_config::ConfigModel;
 use aish_core::{LlmEvent, LlmEventType, MemoryCategory};
 use aish_i18n::{t, t_with_args};
-use aish_llm::{LlmCallbackResult, LlmSession};
+use aish_llm::{CancellationToken, LlmCallbackResult, LlmSession};
 use aish_memory::MemoryManager;
 use aish_security::{SecurityManager, SecurityPolicy};
 use aish_session::SessionStore;
@@ -22,6 +22,39 @@ use crate::prompt;
 use crate::readline::ShellReadline;
 use crate::renderer::ShellRenderer;
 use crate::types::ShellState;
+
+// ---------------------------------------------------------------------------
+// SIGINT handler for AI operation cancellation
+// ---------------------------------------------------------------------------
+
+/// Raw pointer to the current CancellationToken, set before an AI call and
+/// cleared afterwards. Only accessed from `ai_sigint_handler`.
+static CANCEL_TOKEN_PTR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+/// POSIX signal handler for SIGINT during AI operations.
+/// Sets the CancellationToken's atomic flag (async-signal-safe).
+extern "C" fn ai_sigint_handler(_: std::ffi::c_int) {
+    let ptr = CANCEL_TOKEN_PTR.load(Ordering::SeqCst) as *const CancellationToken;
+    if !ptr.is_null() {
+        unsafe { &*ptr }.cancel_atomic();
+    }
+}
+
+/// Poll a CancellationToken until it is cancelled. Used inside `tokio::select!`
+/// to race against the AI operation — when the token fires the AI future is
+/// dropped, which aborts the in-flight HTTP stream.
+///
+/// # Safety
+///
+/// The caller must guarantee that `token` points to a live `CancellationToken`
+/// that outlives this async task. This holds because the token lives inside
+/// `AiHandler` which is owned by `AishShell`, and `poll_cancelled` is only
+/// spawned as part of a `tokio::select!` block within `AishShell::run()`.
+async fn poll_cancelled(token: *const CancellationToken) {
+    while !unsafe { &*token }.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
 
 /// Braille spinner frames used in the reasoning overlay.
 const DOTS_FRAMES: &[&str] = &["⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈"];
@@ -78,7 +111,9 @@ pub struct AishShell {
     pub version: String,
     pub operation_in_progress: bool,
     /// Persistent PTY session for executing all external commands.
-    pty: aish_pty::PersistentPty,
+    /// Wrapped in `Arc<Mutex<>>` so the readline completion handler can
+    /// query the PTY bash for tab-completions.
+    pty: Arc<Mutex<aish_pty::PersistentPty>>,
     /// UUID for the current session, used to associate history entries.
     session_uuid: String,
     /// Whether streaming has started printing content (to avoid double-printing).
@@ -89,9 +124,21 @@ pub struct AishShell {
     interruption: InterruptionState,
     /// Timestamp of last Ctrl+C press (for double-press detection)
     last_ctrl_c: Option<std::time::Instant>,
+    /// Shared animation spinner, stored so it can be stopped on cancellation.
+    animation: Arc<SharedAnimation>,
 }
 
 impl AishShell {
+    /// Lock the PTY mutex, recovering from poison if a previous holder
+    /// panicked. A poisoned PTY is still usable — the lock just means
+    /// a prior operation failed, not that the PTY state is corrupt.
+    fn lock_pty(&self) -> std::sync::MutexGuard<'_, aish_pty::PersistentPty> {
+        match self.pty.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Create a new shell instance from the given configuration.
     pub fn new(config: ConfigModel) -> aish_core::Result<Self> {
         // Set terminal defaults and load bash environment
@@ -625,6 +672,7 @@ impl AishShell {
         let pty = aish_pty::PersistentPty::start(&state.cwd, rows, cols).map_err(|e| {
             aish_core::AishError::Pty(format!("failed to start persistent PTY: {e}"))
         })?;
+        let pty = Arc::new(Mutex::new(pty));
 
         // Placeholder instances for struct fields.  The real subsystems live
         // inside AiHandler which needs mutable access during each turn.
@@ -647,7 +695,37 @@ impl AishShell {
             phase: ShellPhase::Booting,
             interruption: InterruptionState::default(),
             last_ctrl_c: None,
+            animation,
         })
+    }
+
+    /// Install a POSIX SIGINT handler that atomically sets the LLM
+    /// session's cancellation flag. Returns the previous `SigAction`
+    /// so it can be restored via `restore_ai_sigint_handler`.
+    fn install_ai_sigint_handler(&self) -> Option<nix::sys::signal::SigAction> {
+        use nix::sys::signal::{self, SigAction, SigHandler, SigSet, Signal};
+
+        // Clear any leftover cancellation state from a previous operation.
+        self.ai_handler.cancellation_token().reset();
+
+        let token_ptr = self.ai_handler.cancellation_token() as *const CancellationToken;
+        CANCEL_TOKEN_PTR.store(token_ptr as *mut (), Ordering::SeqCst);
+
+        let action = SigAction::new(
+            SigHandler::Handler(ai_sigint_handler),
+            signal::SaFlags::empty(),
+            SigSet::empty(),
+        );
+        unsafe { signal::sigaction(Signal::SIGINT, &action) }.ok()
+    }
+
+    /// Restore the SIGINT handler saved by `install_ai_sigint_handler`.
+    fn restore_ai_sigint_handler(old: Option<nix::sys::signal::SigAction>) {
+        CANCEL_TOKEN_PTR.store(std::ptr::null_mut(), Ordering::SeqCst);
+        if let Some(old) = old {
+            use nix::sys::signal::{self, Signal};
+            let _ = unsafe { signal::sigaction(Signal::SIGINT, &old) };
+        }
     }
 
     /// Run the main REPL loop.
@@ -668,7 +746,7 @@ impl AishShell {
         });
 
         // Initialize readline with history, tab completion, and line editing
-        let mut rl = ShellReadline::new().map_err(|e| {
+        let mut rl = ShellReadline::new(self.pty.clone()).map_err(|e| {
             aish_core::AishError::Config(format!("Failed to initialize readline: {}", e))
         })?;
 
@@ -779,6 +857,9 @@ impl AishShell {
                     // trigger error correction instead of a normal AI query.
                     if question.is_empty() && self.state.can_correct_error {
                         if let Some(ref cmd) = self.state.last_command.clone() {
+                            let old_sigint = self.install_ai_sigint_handler();
+                            let token_ptr =
+                                self.ai_handler.cancellation_token() as *const CancellationToken;
                             let result = runtime.block_on(async {
                                 tokio::select! {
                                     r = self.ai_handler.handle_error_correction(
@@ -786,12 +867,12 @@ impl AishShell {
                                         self.state.last_exit_code,
                                         &self.state.last_output,
                                     ) => r,
-                                    _ = tokio::signal::ctrl_c() => {
-                                        println!("\n\x1b[33mInterrupted\x1b[0m");
+                                    _ = poll_cancelled(token_ptr) => {
                                         Err(aish_core::AishError::Cancelled)
                                     }
                                 }
                             });
+                            Self::restore_ai_sigint_handler(old_sigint);
                             let did_stream = self.streamed_content.load(Ordering::SeqCst);
 
                             match result {
@@ -814,6 +895,10 @@ impl AishShell {
                                         t("shell.error_correction.no_valid_command")
                                     );
                                 }
+                                Err(aish_core::AishError::Cancelled) => {
+                                    self.animation.stop();
+                                    println!("\x1b[33mInterrupted\x1b[0m");
+                                }
                                 Err(e) => {
                                     let msg = t("shell.error.llm_error_message")
                                         .replace("{error}", &e.to_string());
@@ -824,17 +909,18 @@ impl AishShell {
                         }
                     }
 
+                    let old_sigint = self.install_ai_sigint_handler();
+                    let token_ptr =
+                        self.ai_handler.cancellation_token() as *const CancellationToken;
                     let result = runtime.block_on(async {
                         tokio::select! {
                             r = self.ai_handler.handle_question(&question) => r,
-                            _ = tokio::signal::ctrl_c() => {
-                                // Signal the LLM session to cancel the in-flight request.
-                                self.ai_handler.cancel();
-                                println!("\n\x1b[33mInterrupted\x1b[0m");
+                            _ = poll_cancelled(token_ptr) => {
                                 Err(aish_core::AishError::Cancelled)
                             }
                         }
                     });
+                    Self::restore_ai_sigint_handler(old_sigint);
 
                     let did_stream = self.streamed_content.load(Ordering::SeqCst);
 
@@ -942,6 +1028,10 @@ impl AishShell {
                             }
 
                             self.record_history(input, 0);
+                        }
+                        Err(aish_core::AishError::Cancelled) => {
+                            self.animation.stop();
+                            println!("\x1b[33mInterrupted\x1b[0m");
                         }
                         Err(e) => {
                             let msg = t("shell.error.llm_error_message")
@@ -1242,18 +1332,21 @@ impl AishShell {
     fn execute_external_command(&mut self, command: &str) -> i32 {
         // Sync terminal size before each command
         if let Ok((cols, rows)) = crossterm::terminal::size() {
-            self.pty.resize(rows, cols);
+            self.lock_pty().resize(rows, cols);
         }
 
         // Ensure the PTY is alive before sending a command.
-        // If the bash process died (e.g., after `cd` triggered a subshell
-        // exit, or a race with the control pipe), restart it first so the
-        // command runs in the correct working directory.
-        if !self.pty.is_running() {
+        if !self.lock_pty().is_running() {
             self.restart_pty();
         }
 
-        let (exit_code, cwd, output) = match self.pty.send_command_interactive(command) {
+        // Send command via PTY (release the lock inside the block so the
+        // MutexGuard is dropped before any potential restart_pty() call).
+        let result = {
+            let mut pty = self.lock_pty();
+            pty.send_command_interactive(command)
+        };
+        let (exit_code, cwd, output) = match result {
             Ok(result) => result,
             Err(e) => {
                 eprintln!("PTY error: {}", e);
@@ -1276,7 +1369,7 @@ impl AishShell {
         }
 
         // Check if PTY is still running, restart if not
-        if !self.pty.is_running() {
+        if !self.lock_pty().is_running() {
             self.restart_pty();
         }
 
@@ -1287,11 +1380,13 @@ impl AishShell {
     /// persistent PTY bash process so that bash's CWD and env stay in sync
     /// with the Rust shell's tracking. Output is discarded.
     fn sync_command_to_pty(&mut self, command: &str) {
-        if !self.pty.is_running() {
+        if !self.lock_pty().is_running() {
             return;
         }
         let _ = self
             .pty
+            .lock()
+            .unwrap()
             .execute_command(command, std::time::Duration::from_secs(5));
     }
 
@@ -1300,7 +1395,7 @@ impl AishShell {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         match aish_pty::PersistentPty::start(&self.state.cwd, rows, cols) {
             Ok(new_pty) => {
-                self.pty = new_pty;
+                *self.lock_pty() = new_pty;
                 println!("\x1b[33mbash session restarted\x1b[0m");
             }
             Err(e) => {
@@ -1488,11 +1583,12 @@ impl AishShell {
 
     /// Execute accumulated bash commands from a script segment.
     fn flush_bash_segment(&mut self, segment: &str, base_rc: i32) -> i32 {
-        let (exit_code, cwd, output) = self.pty.send_command_interactive(segment).unwrap_or((
-            -1,
-            self.state.cwd.clone(),
-            String::new(),
-        ));
+        let (exit_code, cwd, output) = self
+            .pty
+            .lock()
+            .unwrap()
+            .send_command_interactive(segment)
+            .unwrap_or((-1, self.state.cwd.clone(), String::new()));
 
         if !output.is_empty() {
             // Basic ANSI stripping: remove escape sequences for display

@@ -248,6 +248,14 @@ impl CancellationToken {
         }
     }
 
+    /// Set the cancelled flag using only an atomic store.
+    /// Async-signal-safe: safe to call from a POSIX signal handler.
+    /// Note: registered callbacks are NOT invoked.
+    pub fn cancel_atomic(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn reset(&self) {
         self.cancelled
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -367,6 +375,30 @@ mod tests {
             PreflightResult::Block {
                 message: String::new()
             }
+        );
+    }
+
+    #[test]
+    fn test_cancel_atomic_sets_is_cancelled() {
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        token.cancel_atomic();
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancel_atomic_does_not_invoke_callbacks() {
+        let token = CancellationToken::new();
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = called.clone();
+        token.add_callback(Box::new(move || {
+            called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        token.cancel_atomic();
+        assert!(token.is_cancelled());
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "cancel_atomic should not invoke registered callbacks"
         );
     }
 }
