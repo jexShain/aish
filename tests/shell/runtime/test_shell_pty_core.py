@@ -305,6 +305,47 @@ def test_setup_pty_reuses_manager_startup_handshake(monkeypatch, tmp_path):
     sleep_mock.assert_not_called()
 
 
+def test_setup_pty_preserves_startup_session_ready_without_prompt(monkeypatch, tmp_path):
+    frontend_cwd = str(tmp_path / "frontend")
+    backend_cwd = str(tmp_path / "backend")
+    sleep_mock = Mock()
+
+    class _StartedPTYManager:
+        def __init__(self, *, rows: int, cols: int, cwd: str, use_output_thread: bool):
+            assert rows == 24
+            assert cols == 80
+            assert cwd == frontend_cwd
+            assert use_output_thread is False
+            self.startup_session_ready = True
+            self.startup_ready = False
+            self.startup_cwd = backend_cwd
+
+        def start(self) -> None:
+            return None
+
+    def _terminal_size(*_args, **_kwargs):
+        return os.terminal_size((80, 24))
+
+    monkeypatch.setattr("aish.shell.runtime.app.PTYManager", _StartedPTYManager)
+    monkeypatch.setattr("aish.shell.runtime.app.shutil.get_terminal_size", _terminal_size)
+    monkeypatch.setattr("aish.shell.runtime.app.time.sleep", sleep_mock)
+    monkeypatch.setattr("aish.shell.runtime.app.get_current_env_info", lambda: "env-info")
+    monkeypatch.setattr("aish.shell.runtime.app.os.chdir", lambda _cwd: None)
+
+    shell = object.__new__(PTYAIShell)
+    shell._current_cwd = frontend_cwd
+    shell._backend_session_ready = False
+    shell._shell_phase = "booting"
+
+    PTYAIShell._setup_pty(shell)
+
+    assert shell._pty_manager is not None
+    assert shell._current_cwd == backend_cwd
+    assert shell._backend_session_ready is True
+    assert shell._shell_phase == "booting"
+    sleep_mock.assert_called_once_with(0.2)
+
+
 def test_output_processor_filters_split_user_command_echo_across_chunks():
     processor = OutputProcessor(_FakePTYManager())
     processor.prepare_user_command_echo("pwd", 5)
@@ -1367,6 +1408,103 @@ def test_ttft_timing_records_on_first_content_delta():
 
     assert shell._ttft > 0
     assert shell._ttft_recorded is True
+
+
+def test_non_final_content_delta_does_not_mark_content_streamed():
+    shell = object.__new__(PTYAIShell)
+    shell.console = Mock()
+    shell._stop_animation = Mock()
+    shell._reset_reasoning_state = Mock()
+    shell.current_live = None
+    shell._at_line_start = True
+    shell._last_streaming_accumulated = ""
+    shell._content_preview_active = False
+    shell._content_streamed_to_terminal = False
+    shell._thinking_start_time = 0.0
+    shell._ttft = 0.0
+    shell._ttft_recorded = False
+
+    PTYAIShell.handle_content_delta(
+        shell,
+        Mock(data={"delta": "Working on it", "is_final": False}),
+    )
+
+    assert shell._content_streamed_to_terminal is False
+    shell.console.print.assert_called_once()
+
+
+def test_final_content_delta_marks_content_streamed():
+    shell = object.__new__(PTYAIShell)
+    shell.console = Mock()
+    shell._stop_animation = Mock()
+    shell._reset_reasoning_state = Mock()
+    shell.current_live = None
+    shell._at_line_start = True
+    shell._last_streaming_accumulated = ""
+    shell._content_preview_active = False
+    shell._content_streamed_to_terminal = False
+    shell._thinking_start_time = 0.0
+    shell._ttft = 0.0
+    shell._ttft_recorded = False
+
+    PTYAIShell.handle_content_delta(
+        shell,
+        Mock(data={"delta": "Final answer", "is_final": True}),
+    )
+
+    assert shell._content_streamed_to_terminal is True
+    shell.console.print.assert_called_once()
+
+
+def test_non_final_content_delta_does_not_record_ttft():
+    shell = object.__new__(PTYAIShell)
+    shell.console = Mock()
+    shell._stop_animation = Mock()
+    shell._reset_reasoning_state = Mock()
+    shell.current_live = None
+    shell._at_line_start = True
+    shell._last_streaming_accumulated = ""
+    shell._content_preview_active = False
+    shell._content_streamed_to_terminal = False
+    shell._thinking_start_time = 1.0
+    shell._ttft = 0.0
+    shell._ttft_recorded = False
+
+    PTYAIShell.handle_content_delta(
+        shell,
+        Mock(data={"delta": "Preview before tool", "is_final": False}),
+    )
+
+    assert shell._ttft == 0.0
+    assert shell._ttft_recorded is False
+
+
+def test_op_end_does_not_render_ttft_for_non_final_preview_only():
+    shell = object.__new__(PTYAIShell)
+    shell.console = Mock()
+    shell._stop_animation = Mock()
+    shell._reset_reasoning_state = Mock()
+    shell.current_live = None
+    shell._at_line_start = True
+    shell._last_streaming_accumulated = ""
+    shell._content_preview_active = False
+    shell._content_streamed_to_terminal = False
+    shell._timing_active = True
+    shell._thinking_start_time = 1.0
+    shell._ttft = 0.0
+    shell._ttft_recorded = False
+
+    PTYAIShell.handle_content_delta(
+        shell,
+        Mock(data={"delta": "Preview before tool", "is_final": False}),
+    )
+    PTYAIShell.handle_op_end(shell, Mock())
+
+    timing_calls = [
+        call for call in shell.console.print.call_args_list
+        if "思考:" in str(call)
+    ]
+    assert timing_calls == []
 
 
 def test_ttft_timing_preserves_state_across_generations(monkeypatch):
