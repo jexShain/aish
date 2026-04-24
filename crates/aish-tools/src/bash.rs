@@ -1,8 +1,9 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use aish_i18n;
-use aish_llm::{Tool, ToolResult};
+use aish_llm::{CancellationToken, Tool, ToolResult};
 use aish_pty::{BashOffloadSettings, BashOutputOffload, CancelToken, PtyExecutor};
 
 /// Large keep_bytes for the silent PTY executor to capture full command output.
@@ -12,16 +13,45 @@ const CAPTURE_KEEP_BYTES: usize = 10 * 1024 * 1024; // 10MB
 /// Default timeout for command execution in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
-/// Check if a command likely needs interactive stdin (e.g. sudo password prompt).
-/// False positives (e.g. `grep sudo file`) are harmless — interactive mode just
-/// means output also goes to the terminal, it's still captured for the LLM.
+/// Commands that need a real terminal for interactive use.
+const INTERACTIVE_COMMANDS: &[&str] = &[
+    "vim", "vi", "nano", "emacs", "ssh", "telnet", "mosh", "htop", "top", "btop", "iotop", "less",
+    "more", "most", "man", "screen", "tmux", "mc", "ranger",
+];
+
+/// Commands that establish a remote session where Ctrl-C should be forwarded
+/// as a character rather than converted to SIGINT.
+const SESSION_COMMANDS: &[&str] = &["ssh", "telnet", "mosh", "nc", "netcat", "ftp", "sftp"];
+
+/// Check if a command likely needs interactive stdin (e.g. sudo password prompt,
+/// ssh password, or a full-screen TUI program).
+/// False positives are acceptable because output is still captured for the LLM.
 fn needs_interactive(command: &str) -> bool {
     let lower = command.to_lowercase();
-    lower.contains("sudo") || lower.contains(" su ") || lower.starts_with("su ")
+
+    // sudo / su always need interactive stdin for password prompts.
+    if lower.contains("sudo") || lower.contains(" su ") || lower.starts_with("su ") {
+        return true;
+    }
+
+    // Check first word against known interactive commands.
+    let first = command.split_whitespace().next().unwrap_or("");
+    let basename = first.rsplit('/').next().unwrap_or(first);
+
+    if INTERACTIVE_COMMANDS.contains(&basename) || SESSION_COMMANDS.contains(&basename) {
+        return true;
+    }
+
+    false
 }
 
 /// Tool for executing bash commands via PTY.
-pub struct BashTool {}
+pub struct BashTool {
+    /// Shared cancellation token from the AI handler.
+    /// When the user presses Ctrl+C during AI processing, this token is set,
+    /// and a bridge thread propagates the cancellation to the tool's CancelToken.
+    cancellation_token: Option<Arc<CancellationToken>>,
+}
 
 /// Cached translated description.
 static DESCRIPTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -38,7 +68,15 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            cancellation_token: None,
+        }
+    }
+
+    /// Set the shared cancellation token from the AI handler.
+    /// This allows Ctrl+C during AI processing to cancel in-progress tool execution.
+    pub fn set_cancellation_token(&mut self, token: Arc<CancellationToken>) {
+        self.cancellation_token = Some(token);
     }
 }
 
@@ -96,9 +134,33 @@ impl Tool for BashTool {
             timeout_token.cancel();
         });
 
+        // Bridge: watch the AI handler's CancellationToken and propagate to our
+        // local CancelToken.  This ensures Ctrl+C during tool execution actually
+        // kills the PTY child process.
+        let done = Arc::new(AtomicBool::new(false));
+        if let Some(ref ct) = self.cancellation_token {
+            let ct = Arc::clone(ct);
+            let tool_cancel = Arc::clone(&cancel_token);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    if ct.is_cancelled() {
+                        tool_cancel.cancel();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+        }
+
         let env_vars: std::collections::HashMap<String, String> = std::env::vars().collect();
 
-        match executor.execute_blocking(command, env_vars, &cancel_token) {
+        let result = executor.execute_blocking(command, env_vars, &cancel_token);
+
+        // Signal the bridge thread to stop polling.
+        done.store(true, Ordering::SeqCst);
+
+        match result {
             Ok(result) => {
                 // Use BashOutputOffload for threshold-based offload, matching Python's
                 // render_bash_output(). This handles:
@@ -172,6 +234,25 @@ mod tests {
     fn test_needs_interactive_no() {
         assert!(!needs_interactive("ls -la"));
         assert!(!needs_interactive("echo hello"));
+        assert!(!needs_interactive("cat /etc/hosts"));
+        assert!(!needs_interactive("grep pattern file.txt"));
+    }
+
+    #[test]
+    fn test_needs_interactive_ssh() {
+        assert!(needs_interactive("ssh user@host"));
+        assert!(needs_interactive("ssh -l root 10.10.17.112"));
+        assert!(needs_interactive("/usr/bin/ssh user@host"));
+        assert!(needs_interactive("telnet example.com 23"));
+        assert!(needs_interactive("mosh user@host"));
+    }
+
+    #[test]
+    fn test_needs_interactive_tui() {
+        assert!(needs_interactive("vim file.txt"));
+        assert!(needs_interactive("htop"));
+        assert!(needs_interactive("top"));
+        assert!(needs_interactive("less /var/log/syslog"));
     }
 
     #[test]

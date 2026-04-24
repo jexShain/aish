@@ -218,6 +218,11 @@ impl AiHandler {
         self.llm_session.cancellation_token()
     }
 
+    /// Get a shared reference to the cancellation token for use in tools.
+    pub fn cancellation_token_arc(&self) -> std::sync::Arc<aish_llm::CancellationToken> {
+        self.llm_session.cancellation_token_arc()
+    }
+
     /// Add a shell command result to the LLM context so the AI can reference
     /// previous command output in follow-up questions.
     pub fn add_shell_context(&mut self, entry: &str) {

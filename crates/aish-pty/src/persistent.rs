@@ -7,7 +7,7 @@ use std::time::Duration;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::pty::openpty;
 use nix::sys::signal::{kill, Signal};
-use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
+use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, OutputFlags, SetArg};
 use nix::unistd::{close, dup2, execvp, fork, pipe, ForkResult, Pid};
 
 use aish_core::AishError;
@@ -117,16 +117,18 @@ impl PersistentPty {
             exec_mode: Arc::new(AtomicBool::new(false)),
         };
 
-        // Wait for session_ready event.
-        pty.wait_for_session_ready(Duration::from_secs(5))?;
+        // Wait for session_ready event.  Also returns whether the
+        // initial PromptReady was seen in the same control-pipe read
+        // (common case: both arrive together).
+        let saw_prompt = pty.wait_for_session_ready(Duration::from_secs(5))?;
 
-        // Drain any stale events (e.g., prompt_ready from bash's initial
-        // prompt rendering) left in the control pipe after session_ready.
-        // Without this, the first user command would match the stale
-        // prompt_ready and exit the forwarding loop immediately, producing
-        // no output.
+        // Consume the initial PromptReady if it wasn't already seen
+        // during session_ready.  Use a short timeout — bash emits it
+        // very quickly after SessionReady.
+        if !saw_prompt {
+            pty.wait_for_initial_prompt_ready(Duration::from_millis(500));
+        }
         pty.drain_master_to_stdout();
-        pty.drain_control_pipe();
 
         // Now safe to clean up rcfile -- bash has loaded it.
         let _ = std::fs::remove_file(&rcfile_path);
@@ -216,12 +218,18 @@ impl PersistentPty {
         command: &str,
     ) -> aish_core::Result<(i32, String, String)> {
         let is_session = is_session_command(command);
+
+        // Drain stale data from both the PTY master fd and the control
+        // pipe BEFORE registering the new command.  A stale PromptReady
+        // left in the control pipe (e.g. from bash's initial prompt or
+        // from a previous command whose event arrived late) would be
+        // matched with the new command's submission, producing a wrong
+        // exit code (the classic off-by-one shift).
+        self.drain_master_silent();
+        self.drain_control_pipe_raw();
+
         self.command_state
             .register_command(command, CommandSource::User, None);
-
-        // Drain any stale PTY output left from the previous command's
-        // prompt rendering (PS1 / readline init sequences, etc.).
-        self.drain_master_silent();
 
         // Write command to bash.  Prepend Ctrl-U (NAK) to clear any
         // stale input in the PTY line discipline canonical buffer so
@@ -239,6 +247,13 @@ impl PersistentPty {
         if let Some(ref saved) = saved_termios {
             let mut raw = saved.clone();
             cfmakeraw(&mut raw);
+            // Re-enable output processing so that \n in PTY output is
+            // converted to \r\n by the terminal driver.  Without this,
+            // interactive sessions (ssh, telnet) display prompts
+            // concatenated on the same line because the terminal emulator
+            // only moves the cursor down for bare \n without returning to
+            // column 0.
+            raw.output_flags |= OutputFlags::OPOST | OutputFlags::ONLCR;
             let _ = tcsetattr(stdin_borrowed, SetArg::TCSANOW, &raw);
         }
 
@@ -541,6 +556,28 @@ impl PersistentPty {
         }
     }
 
+    /// Drain stale data from the control pipe and discard it without
+    /// processing events through the command state machine.  Called
+    /// before registering a new command to prevent a stale PromptReady
+    /// (e.g. from bash's initial prompt or a late-arriving event) from
+    /// being matched with the wrong command submission.
+    fn drain_control_pipe_raw(&mut self) {
+        self.control_buffer.clear();
+        let mut tmp = [0u8; 4096];
+        loop {
+            match unsafe {
+                libc::read(
+                    self.control_fd,
+                    tmp.as_mut_ptr() as *mut libc::c_void,
+                    tmp.len(),
+                )
+            } {
+                n if n > 0 => { /* discard */ }
+                _ => break,
+            }
+        }
+    }
+
     /// Drain any remaining data from master_fd to stdout.
     /// Called after the forwarding loop exits to prevent stale output
     /// from appearing at the start of the next command.
@@ -593,13 +630,13 @@ impl PersistentPty {
         }
     }
 
-    /// Drain all remaining events from the control pipe.
-    /// Called after session_ready to consume any stale prompt_ready events
-    /// emitted during bash initialization, preventing them from being
-    /// misinterpreted as completion of the first user command.
-    fn drain_control_pipe(&mut self) {
-        let mut tmp = [0u8; 4096];
-        loop {
+    /// Wait for the first PromptReady event from bash (the initial prompt
+    /// displayed after startup).  Best-effort — a timeout is not fatal
+    /// because `send_command_interactive` also drains stale events.
+    fn wait_for_initial_prompt_ready(&mut self, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let mut tmp = [0u8; 4096];
             match unsafe {
                 libc::read(
                     self.control_fd,
@@ -609,15 +646,39 @@ impl PersistentPty {
             } {
                 n if n > 0 => {
                     let events = decode_control_chunk(&mut self.control_buffer, &tmp[..n as usize]);
-                    // Process events (e.g., update command_state) but
-                    // don't act on them -- they're stale.
                     for event in &events {
-                        let _ = self.command_state.handle_event(event);
+                        if matches!(event, BackendControlEvent::PromptReady { .. }) {
+                            debug!("consumed initial prompt_ready from bash");
+                            return;
+                        }
                     }
                 }
-                _ => break, // EAGAIN / nothing more to read
+                0 => {
+                    // Control pipe closed.
+                    return;
+                }
+                _ => {}
             }
+            // Drain master_fd to the output callback so initial bash output
+            // (MOTD, etc.) is not lost.
+            let mut mtmp = [0u8; 8192];
+            match unsafe {
+                libc::read(
+                    self.master_fd,
+                    mtmp.as_mut_ptr() as *mut libc::c_void,
+                    mtmp.len(),
+                )
+            } {
+                n if n > 0 => {
+                    if let Some(ref cb) = self.output_callback {
+                        cb(&mtmp[..n as usize]);
+                    }
+                }
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
+        debug!("timed out waiting for initial prompt_ready (non-fatal)");
     }
 
     fn write_master(&self, data: &[u8]) -> aish_core::Result<()> {
@@ -639,7 +700,8 @@ impl PersistentPty {
         Ok(())
     }
 
-    fn wait_for_session_ready(&mut self, timeout: Duration) -> aish_core::Result<()> {
+    /// Returns Ok(true) if PromptReady was also seen in the same batch.
+    fn wait_for_session_ready(&mut self, timeout: Duration) -> aish_core::Result<bool> {
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
             // Drain any initial bash output from master_fd.
@@ -676,11 +738,18 @@ impl PersistentPty {
                 n if n > 0 => {
                     let events =
                         decode_control_chunk(&mut self.control_buffer, &ctrl_tmp[..n as usize]);
+                    let mut found_session = false;
+                    let mut found_prompt = false;
                     for event in &events {
-                        if matches!(event, BackendControlEvent::SessionReady { .. }) {
-                            debug!("received session_ready from bash");
-                            return Ok(());
+                        match event {
+                            BackendControlEvent::SessionReady { .. } => found_session = true,
+                            BackendControlEvent::PromptReady { .. } => found_prompt = true,
+                            _ => {}
                         }
+                    }
+                    if found_session {
+                        debug!("received session_ready from bash");
+                        return Ok(found_prompt);
                     }
                 }
                 0 => {

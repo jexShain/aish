@@ -168,6 +168,19 @@ __aish_on_debug() {
             ;;
     esac
 
+    # Re-enable echo for interactive session commands (ssh, telnet, etc.)
+    # so that the remote PTY inherits normal terminal settings.  The
+    # local PTY has -echo set by this wrapper, and SSH propagates these
+    # settings to the remote server, which can confuse the remote shell's
+    # readline.
+    local __aish_cmd_name="${BASH_COMMAND%% *}"
+    __aish_cmd_name="${__aish_cmd_name##*/}"
+    case "$__aish_cmd_name" in
+        ssh|telnet|mosh|nc|netcat|ftp|sftp)
+            stty echo 2>/dev/null || true
+            ;;
+    esac
+
     __AISH_AT_PROMPT=0
     __aish_emit_command_started "$BASH_COMMAND"
     return 0
@@ -183,6 +196,9 @@ __aish_prompt_command() {
     fi
     # Keep PS1 empty — prompt rendering is handled by the Python frontend.
     PS1=''
+    # Re-disable echo in case a session command (ssh, telnet) re-enabled
+    # it via the DEBUG trap.  The frontend handles all display itself.
+    stty -echo -echonl 2>/dev/null || true
     __AISH_AT_PROMPT=1
     __aish_emit_prompt_ready "$exit_code"
 }

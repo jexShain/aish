@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -100,7 +101,11 @@ impl ShellHelper {
 
 impl Helper for ShellHelper {}
 
-impl Highlighter for ShellHelper {}
+impl Highlighter for ShellHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(format!("\x1b[38;5;242m{}\x1b[0m", hint))
+    }
+}
 
 impl Hinter for ShellHelper {
     type Hint = String;
@@ -252,7 +257,7 @@ pub struct ShellReadline {
 
 impl ShellReadline {
     pub fn new(pty: Arc<Mutex<aish_pty::PersistentPty>>) -> rustyline::Result<Self> {
-        let autosuggest = Arc::new(Mutex::new(AutoSuggest::new(1000)));
+        let autosuggest = Arc::new(Mutex::new(AutoSuggest::new(5000)));
 
         let builder = Config::builder()
             .completion_type(CompletionType::List)
@@ -349,8 +354,15 @@ impl ShellReadline {
     }
 
     /// Load history from a file (best-effort).
+    /// Also populates the autosuggest engine so hints appear immediately.
     pub fn load_history(&mut self, path: &std::path::Path) {
-        let _ = self.editor.load_history(path);
+        if self.editor.load_history(path).is_ok() {
+            let history = self.editor.history();
+            let mut guard = self.autosuggest.lock().unwrap();
+            for entry in history.iter() {
+                guard.add(entry);
+            }
+        }
     }
 
     /// Save history to a file (best-effort).
