@@ -12,7 +12,7 @@ use crate::types::*;
 pub struct LlmSession {
     client: LlmClient,
     tools: HashMap<String, Box<dyn Tool>>,
-    cancellation_token: CancellationToken,
+    cancellation_token: Arc<CancellationToken>,
     event_callback: Option<Arc<dyn Fn(LlmEvent) -> Option<LlmCallbackResult> + Send + Sync>>,
     confirmation_callback: Option<Arc<dyn Fn(&str, &str) -> bool + Send + Sync>>,
     temperature: Option<f32>,
@@ -37,7 +37,7 @@ impl LlmSession {
         Self {
             client: LlmClient::new(api_base, api_key, model),
             tools: HashMap::new(),
-            cancellation_token: CancellationToken::new(),
+            cancellation_token: Arc::new(CancellationToken::new()),
             event_callback: None,
             confirmation_callback: None,
             temperature,
@@ -68,6 +68,12 @@ impl LlmSession {
 
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
+    }
+
+    /// Return a shared reference to the cancellation token, allowing tools
+    /// and other components to monitor cancellation without borrowing self.
+    pub fn cancellation_token_arc(&self) -> Arc<CancellationToken> {
+        Arc::clone(&self.cancellation_token)
     }
 
     /// Set the maximum context token budget for message trimming.
@@ -809,7 +815,7 @@ impl LlmSession {
                 self.client.model_name(),
             ),
             tools: HashMap::new(),
-            cancellation_token: CancellationToken::new(),
+            cancellation_token: Arc::new(CancellationToken::new()),
             event_callback: self.event_callback.clone(),
             confirmation_callback: self.confirmation_callback.clone(),
             temperature: self.temperature,

@@ -1,4 +1,6 @@
-use aish_llm::{Tool, ToolResult};
+use std::sync::Arc;
+
+use aish_llm::{CancellationToken, Tool, ToolResult};
 use aish_security::SecurityDecision;
 
 /// Type of the security check callback.
@@ -74,6 +76,11 @@ impl SecureBashTool {
             inner: crate::bash::BashTool::new(),
             security_check: Some(Box::new(security_check)),
         }
+    }
+
+    /// Set the shared cancellation token from the AI handler.
+    pub fn set_cancellation_token(&mut self, token: Arc<CancellationToken>) {
+        self.inner.set_cancellation_token(token);
     }
 }
 

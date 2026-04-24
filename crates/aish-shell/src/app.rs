@@ -184,9 +184,9 @@ impl AishShell {
             move |cmd: &str| mgr.check_command(cmd)
         };
         let mut tool_registry = ToolRegistry::new();
-        tool_registry.register(Box::new(aish_tools::SecureBashTool::with_security_check(
-            security_check,
-        )));
+        let mut bash_tool = aish_tools::SecureBashTool::with_security_check(security_check);
+        bash_tool.set_cancellation_token(llm_session.cancellation_token_arc());
+        tool_registry.register(Box::new(bash_tool));
         tool_registry.register(Box::new(aish_tools::fs::ReadFileTool::new()));
         tool_registry.register(Box::new(aish_tools::fs::WriteFileTool::new()));
         tool_registry.register(Box::new(aish_tools::fs::EditFileTool::new()));
