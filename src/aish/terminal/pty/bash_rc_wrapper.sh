@@ -4,6 +4,9 @@
 # Enable readline for interactive use
 set -o emacs
 
+# Enable job control so Ctrl+Z suspends foreground jobs
+set -m
+
 # Source user's bashrc if exists
 if [ -f ~/.bashrc ]; then
     source ~/.bashrc

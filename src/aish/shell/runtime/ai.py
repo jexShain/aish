@@ -6,7 +6,9 @@ import anyio
 import asyncio
 import os
 import re
+import select
 import sys
+import threading
 from typing import TYPE_CHECKING, Any, Optional
 
 from ...plan import PlanPhase
@@ -315,8 +317,9 @@ class AIHandler:
     def _execute_ai_operation(self, coro, shell, history_entry=None):
         """Execute an AI operation with state management and interrupt handling.
 
-        Handles input buffer save, state transitions, temporary SIGINT
-        handler, async execution with cancellation, and cleanup.
+        Handles input buffer save, state transitions, stdin forwarding
+        (so Ctrl+Z reaches bash for job control), Ctrl+C cancellation,
+        and cleanup.
         """
         from ..interruption import ShellState
 
@@ -340,17 +343,54 @@ class AIHandler:
             except Exception:
                 pass
 
-        # Install temporary SIGINT handler since main thread is blocked
-        # in cooked mode during AI call. Without this, Ctrl+C generates
-        # SIGINT which kills the shell entirely.
-        import signal as _signal
+        # Set non-canonical mode on the main thread so we can read individual
+        # bytes (Ctrl+Z = 0x1a, Ctrl+C = 0x03) without the terminal driver
+        # intercepting them.  Keep OPOST for correct AI streaming output.
+        import termios
 
-        def _sigint_handler(signum, frame):
-            _ = (signum, frame)
-            shell._on_interrupt_requested()
+        pre_monitor_settings = None
+        try:
+            pre_monitor_settings = termios.tcgetattr(sys.stdin.fileno())
+            new_settings = [list(s) if isinstance(s, list) else s
+                           for s in pre_monitor_settings]
+            new_settings[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
+            new_settings[6][termios.VMIN] = 1
+            new_settings[6][termios.VTIME] = 0
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, new_settings)
+        except Exception:
+            pass
 
-        _prev_sigint = _signal.getsignal(_signal.SIGINT)
-        _signal.signal(_signal.SIGINT, _sigint_handler)
+        # Start a background thread that reads stdin and forwards bytes to
+        # the PTY.  Ctrl+Z is forwarded so bash handles job control natively
+        # (suspend foreground job).  Ctrl+C triggers cancellation.
+        cancel_requested = threading.Event()
+
+        def _stdin_loop():
+            while not cancel_requested.is_set():
+                try:
+                    ready, _, _ = select.select(
+                        [sys.stdin.fileno()], [], [], 0.1
+                    )
+                    if not ready:
+                        continue
+                    data = os.read(sys.stdin.fileno(), 1)
+                    if not data:  # EOF — stdin closed
+                        break
+                    if data == b"\x03":  # Ctrl+C — cancel AI operation
+                        cancel_requested.set()
+                        self.llm_session.cancellation_token.cancel()
+                        shell._on_interrupt_requested()
+                        break
+                    # Forward everything else (including Ctrl+Z = 0x1a)
+                    # to the PTY so bash handles it natively.
+                    if shell._pty_manager:
+                        shell._pty_manager.send(data)
+                except (OSError, ValueError):
+                    break
+
+        monitor_thread = threading.Thread(target=_stdin_loop, daemon=True)
+        monitor_thread.start()
+
         response = None
         was_cancelled = False
         cancel_exceptions = self._get_cancel_exceptions()
@@ -362,7 +402,23 @@ class AIHandler:
             was_cancelled = True
             shell.handle_processing_cancelled()
         finally:
-            _signal.signal(_signal.SIGINT, _prev_sigint)
+            cancel_requested.set()
+            monitor_thread.join(timeout=1.0)
+            # Flush stale input (escape sequences, cursor reports) so they
+            # don't confuse the next prompt_toolkit render.
+            try:
+                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            except Exception:
+                pass
+            # Restore terminal settings on the main thread.
+            if pre_monitor_settings is not None:
+                try:
+                    termios.tcsetattr(
+                        sys.stdin.fileno(), termios.TCSADRAIN,
+                        pre_monitor_settings,
+                    )
+                except Exception:
+                    pass
             shell.interruption_manager.set_state(ShellState.NORMAL)
             shell.operation_in_progress = False
 
