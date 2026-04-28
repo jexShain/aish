@@ -351,9 +351,9 @@ class AIHandler:
         pre_monitor_settings = None
         try:
             pre_monitor_settings = termios.tcgetattr(sys.stdin.fileno())
-            new_settings = [list(s) if isinstance(s, list) else s
-                           for s in pre_monitor_settings]
+            new_settings = list(pre_monitor_settings)
             new_settings[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
+            new_settings[6] = list(pre_monitor_settings[6])
             new_settings[6][termios.VMIN] = 1
             new_settings[6][termios.VTIME] = 0
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, new_settings)
@@ -369,7 +369,7 @@ class AIHandler:
             while not cancel_requested.is_set():
                 try:
                     ready, _, _ = select.select(
-                        [sys.stdin.fileno()], [], [], 0.1
+                        [sys.stdin.fileno()], [], [], 0.5
                     )
                     if not ready:
                         continue
@@ -379,7 +379,6 @@ class AIHandler:
                     if data == b"\x03":  # Ctrl+C — cancel AI operation
                         cancel_requested.set()
                         self.llm_session.cancellation_token.cancel()
-                        shell._on_interrupt_requested()
                         break
                     # Forward everything else (including Ctrl+Z = 0x1a)
                     # to the PTY so bash handles it natively.
@@ -404,6 +403,11 @@ class AIHandler:
         finally:
             cancel_requested.set()
             monitor_thread.join(timeout=1.0)
+            if monitor_thread.is_alive():
+                import logging
+                logging.getLogger(__name__).warning(
+                    "stdin monitor thread did not exit in time"
+                )
             # Flush stale input (escape sequences, cursor reports) so they
             # don't confuse the next prompt_toolkit render.
             try:
@@ -418,7 +422,10 @@ class AIHandler:
                         pre_monitor_settings,
                     )
                 except Exception:
-                    pass
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "failed to restore terminal settings"
+                    )
             shell.interruption_manager.set_state(ShellState.NORMAL)
             shell.operation_in_progress = False
 

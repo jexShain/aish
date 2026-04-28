@@ -4,9 +4,6 @@
 # Enable readline for interactive use
 set -o emacs
 
-# Enable job control so Ctrl+Z suspends foreground jobs
-set -m
-
 # Source user's bashrc if exists
 if [ -f ~/.bashrc ]; then
     source ~/.bashrc
@@ -16,6 +13,10 @@ fi
 if [ -f /etc/bash.bashrc ]; then
     source /etc/bash.bashrc
 fi
+
+# Enable job control so Ctrl+Z suspends foreground jobs.
+# Placed after sourcing bashrc to avoid being overridden.
+set -m
 
 case ":${HISTCONTROL:-}:" in
     *:ignorespace:*|*:ignoreboth:*)
