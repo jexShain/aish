@@ -1213,9 +1213,13 @@ impl AishShell {
                             println!("\x1b[33m{}\x1b[0m", t("shell.interrupted"));
                         }
                         Err(e) => {
-                            let msg = t("shell.error.llm_error_message")
-                                .replace("{error}", &e.to_string());
-                            eprintln!("\x1b[31m{}\x1b[0m", msg);
+                            // Errors are already displayed via the LlmEventType::Error
+                            // event callback — avoid printing twice.
+                            if !matches!(e, aish_core::AishError::Llm(_)) {
+                                let msg = t("shell.error.llm_error_message")
+                                    .replace("{error}", &e.to_string());
+                                eprintln!("\x1b[31m{}\x1b[0m", msg);
+                            }
                             self.record_history(input, 1);
                         }
                     }
