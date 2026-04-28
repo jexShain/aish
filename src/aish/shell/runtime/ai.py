@@ -360,9 +360,9 @@ class AIHandler:
         except Exception:
             pass
 
-        # Start a background thread that reads stdin and forwards bytes to
-        # the PTY.  Ctrl+Z is forwarded so bash handles job control natively
-        # (suspend foreground job).  Ctrl+C triggers cancellation.
+        # Start a background thread that reads stdin to intercept Ctrl+C.
+        # Other keystrokes are discarded — during AI streaming bash is idle
+        # at a prompt and forwarding them would pollute its readline buffer.
         cancel_requested = threading.Event()
 
         def _stdin_loop():
@@ -380,10 +380,7 @@ class AIHandler:
                         cancel_requested.set()
                         self.llm_session.cancellation_token.cancel()
                         break
-                    # Forward everything else (including Ctrl+Z = 0x1a)
-                    # to the PTY so bash handles it natively.
-                    if shell._pty_manager:
-                        shell._pty_manager.send(data)
+                    # Discard all other keystrokes during AI streaming.
                 except (OSError, ValueError):
                     break
 
