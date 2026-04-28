@@ -317,9 +317,8 @@ class AIHandler:
     def _execute_ai_operation(self, coro, shell, history_entry=None):
         """Execute an AI operation with state management and interrupt handling.
 
-        Handles input buffer save, state transitions, stdin forwarding
-        (so Ctrl+Z reaches bash for job control), Ctrl+C cancellation,
-        and cleanup.
+        Handles input buffer save, state transitions, stdin monitoring
+        (Ctrl+C triggers cancellation), and cleanup.
         """
         from ..interruption import ShellState
 
