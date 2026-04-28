@@ -1059,9 +1059,14 @@ impl AishShell {
                                 }
                                 Err(e) => {
                                     self.animation.stop();
-                                    let msg = t("shell.error.llm_error_message")
-                                        .replace("{error}", &e.to_string());
-                                    eprintln!("\x1b[31m{}\x1b[0m", msg);
+                                    // Errors are already displayed via the LlmEventType::Error
+                                    // event callback — avoid printing twice. Only handle
+                                    // non-LLM errors that bypass the event system.
+                                    if !matches!(e, aish_core::AishError::Llm(_)) {
+                                        let msg = t("shell.error.llm_error_message")
+                                            .replace("{error}", &e.to_string());
+                                        eprintln!("\x1b[31m{}\x1b[0m", msg);
+                                    }
                                 }
                             }
                             continue;
