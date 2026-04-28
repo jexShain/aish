@@ -184,8 +184,12 @@ impl AishShell {
             move |cmd: &str| mgr.check_command(cmd)
         };
         let mut tool_registry = ToolRegistry::new();
+        // Shared PTY slot — will be populated after PersistentPty starts.
+        let pty_slot: aish_tools::bash::PtySlot =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         let mut bash_tool = aish_tools::SecureBashTool::with_security_check(security_check);
         bash_tool.set_cancellation_token(llm_session.cancellation_token_arc());
+        bash_tool.set_pty_slot(pty_slot.clone());
         tool_registry.register(Box::new(bash_tool));
         tool_registry.register(Box::new(aish_tools::fs::ReadFileTool::new()));
         tool_registry.register(Box::new(aish_tools::fs::WriteFileTool::new()));
@@ -776,6 +780,12 @@ impl AishShell {
             aish_core::AishError::Pty(t_with_args("shell.general_error", &args))
         })?;
         let pty = Arc::new(Mutex::new(pty));
+
+        // Inject PersistentPty into the bash tool slot.
+        {
+            let mut slot = pty_slot.lock().unwrap();
+            *slot = Some(pty.clone());
+        }
 
         // Placeholder instances for struct fields.  The real subsystems live
         // inside AiHandler which needs mutable access during each turn.
@@ -1577,7 +1587,7 @@ impl AishShell {
             .pty
             .lock()
             .unwrap()
-            .execute_command(command, std::time::Duration::from_secs(5));
+            .execute_command(command, std::time::Duration::from_secs(5), None);
     }
 
     /// Restart the PTY session (e.g., after bash exits or crashes).

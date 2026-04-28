@@ -3,6 +3,8 @@ use std::sync::Arc;
 use aish_llm::{CancellationToken, Tool, ToolResult};
 use aish_security::SecurityDecision;
 
+use super::bash::PtySlot;
+
 /// Type of the security check callback.
 type SecurityCheckFn = Box<dyn Fn(&str) -> SecurityDecision + Send + Sync>;
 
@@ -81,6 +83,11 @@ impl SecureBashTool {
     /// Set the shared cancellation token from the AI handler.
     pub fn set_cancellation_token(&mut self, token: Arc<CancellationToken>) {
         self.inner.set_cancellation_token(token);
+    }
+
+    /// Set the shared PersistentPty slot for Ctrl+Z/bg/fg support.
+    pub fn set_pty_slot(&mut self, slot: PtySlot) {
+        self.inner.set_pty_slot(slot);
     }
 }
 

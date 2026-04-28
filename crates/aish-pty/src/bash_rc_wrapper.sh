@@ -7,6 +7,9 @@
 set +o emacs
 set +o vi
 
+# Enable job control so Ctrl+Z suspends foreground jobs
+set -m
+
 # Source user's bashrc if exists
 if [ -f ~/.bashrc ]; then
     source ~/.bashrc

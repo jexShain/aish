@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::pty::openpty;
@@ -15,38 +14,7 @@ use aish_core::{AishError, CommandResult, CommandStatus};
 use tracing::{debug, warn};
 
 use crate::offload::PtyOutputOffload;
-use crate::types::StreamName;
-
-// ---------------------------------------------------------------------------
-// CancelToken
-// ---------------------------------------------------------------------------
-
-/// Simple cancellation token backed by an atomic bool.
-pub struct CancelToken {
-    cancelled: AtomicBool,
-}
-
-impl Default for CancelToken {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CancelToken {
-    pub fn new() -> Self {
-        Self {
-            cancelled: AtomicBool::new(false),
-        }
-    }
-
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
-    }
-}
+use crate::types::{CancelToken, StreamName};
 
 /// Send a signal to the process *group* led by `pid`.
 fn kill_pg(pid: Pid, sig: Signal) -> nix::Result<()> {

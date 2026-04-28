@@ -1,3 +1,32 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Simple cancellation token backed by an atomic bool.
+pub struct CancelToken {
+    cancelled: AtomicBool,
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
 /// Identifies which output stream we are dealing with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamName {

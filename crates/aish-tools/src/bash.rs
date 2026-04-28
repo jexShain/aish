@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aish_i18n;
@@ -45,12 +45,18 @@ fn needs_interactive(command: &str) -> bool {
     false
 }
 
+/// Shared slot for injecting a PersistentPty reference after tool creation.
+/// None = fall back to PtyExecutor (one-shot PTY).
+pub type PtySlot = Arc<Mutex<Option<Arc<Mutex<aish_pty::PersistentPty>>>>>;
+
 /// Tool for executing bash commands via PTY.
 pub struct BashTool {
     /// Shared cancellation token from the AI handler.
     /// When the user presses Ctrl+C during AI processing, this token is set,
     /// and a bridge thread propagates the cancellation to the tool's CancelToken.
     cancellation_token: Option<Arc<CancellationToken>>,
+    /// Shared slot for PersistentPty — set after PTY creation.
+    pty_slot: PtySlot,
 }
 
 /// Cached translated description.
@@ -70,6 +76,7 @@ impl BashTool {
     pub fn new() -> Self {
         Self {
             cancellation_token: None,
+            pty_slot: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -77,6 +84,165 @@ impl BashTool {
     /// This allows Ctrl+C during AI processing to cancel in-progress tool execution.
     pub fn set_cancellation_token(&mut self, token: Arc<CancellationToken>) {
         self.cancellation_token = Some(token);
+    }
+
+    /// Set the shared PersistentPty slot for Ctrl+Z/bg/fg support.
+    pub fn set_pty_slot(&mut self, slot: PtySlot) {
+        self.pty_slot = slot;
+    }
+
+    /// Execute via PersistentPty — supports Ctrl+Z/bg/fg job control.
+    fn execute_via_persistent_pty(
+        &self,
+        command: &str,
+        timeout_secs: u64,
+        pty_arc: Arc<Mutex<aish_pty::PersistentPty>>,
+    ) -> ToolResult {
+        let cancel_token = Arc::new(CancelToken::new());
+
+        // Timeout thread.
+        let timeout_token = Arc::clone(&cancel_token);
+        let timeout_duration = Duration::from_secs(timeout_secs);
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout_duration);
+            timeout_token.cancel();
+        });
+
+        // Bridge: AI handler cancellation -> tool cancel token.
+        let done = Arc::new(AtomicBool::new(false));
+        if let Some(ref ct) = self.cancellation_token {
+            let ct = Arc::clone(ct);
+            let tool_cancel = Arc::clone(&cancel_token);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    if ct.is_cancelled() {
+                        tool_cancel.cancel();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+        }
+
+        let mut pty = pty_arc.lock().unwrap();
+        let result = pty.execute_command(
+            command,
+            Duration::from_secs(timeout_secs),
+            Some(&cancel_token),
+        );
+        done.store(true, Ordering::SeqCst);
+
+        match result {
+            Ok((output, exit_code)) => {
+                let session_uuid = uuid::Uuid::new_v4().to_string();
+                let cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let settings = BashOffloadSettings::default();
+                let offloader = BashOutputOffload::new(&session_uuid, &cwd, settings);
+                let offload_result =
+                    offloader.render(&output, &"", command, exit_code);
+
+                let output_text = crate::registry::format_tagged_result(
+                    &offload_result.stdout_text,
+                    &offload_result.stderr_text,
+                    exit_code,
+                    offload_result.offload_payload.as_ref(),
+                );
+
+                ToolResult {
+                    ok: true,
+                    output: output_text,
+                    meta: offload_result
+                        .offload_payload
+                        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null)),
+                }
+            }
+            Err(e) => {
+                let mut args_map = std::collections::HashMap::new();
+                args_map.insert("error".to_string(), e.to_string());
+                ToolResult::error(aish_i18n::t_with_args(
+                    "tools.bash.execute_failed",
+                    &args_map,
+                ))
+            }
+        }
+    }
+
+    /// Execute via one-shot PtyExecutor — original behavior.
+    fn execute_via_pty_executor(&self, command: &str, timeout_secs: u64) -> ToolResult {
+        let executor = if needs_interactive(command) {
+            PtyExecutor::new(CAPTURE_KEEP_BYTES)
+        } else {
+            PtyExecutor::new_silent(CAPTURE_KEEP_BYTES)
+        };
+        let cancel_token = Arc::new(CancelToken::new());
+
+        let timeout_token = Arc::clone(&cancel_token);
+        let timeout_duration = Duration::from_secs(timeout_secs);
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout_duration);
+            timeout_token.cancel();
+        });
+
+        let done = Arc::new(AtomicBool::new(false));
+        if let Some(ref ct) = self.cancellation_token {
+            let ct = Arc::clone(ct);
+            let tool_cancel = Arc::clone(&cancel_token);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    if ct.is_cancelled() {
+                        tool_cancel.cancel();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+        }
+
+        let env_vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let result = executor.execute_blocking(command, env_vars, &cancel_token);
+        done.store(true, Ordering::SeqCst);
+
+        match result {
+            Ok(result) => {
+                let session_uuid = uuid::Uuid::new_v4().to_string();
+                let cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let settings = BashOffloadSettings::default();
+                let offloader = BashOutputOffload::new(&session_uuid, &cwd, settings);
+                let offload_result =
+                    offloader.render(&result.stdout, &result.stderr, command, result.exit_code);
+
+                let output = crate::registry::format_tagged_result(
+                    &offload_result.stdout_text,
+                    &offload_result.stderr_text,
+                    result.exit_code,
+                    offload_result.offload_payload.as_ref(),
+                );
+
+                ToolResult {
+                    ok: true,
+                    output,
+                    meta: offload_result
+                        .offload_payload
+                        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null)),
+                }
+            }
+            Err(e) => {
+                let mut args_map = std::collections::HashMap::new();
+                args_map.insert("error".to_string(), e.to_string());
+                ToolResult::error(aish_i18n::t_with_args(
+                    "tools.bash.execute_failed",
+                    &args_map,
+                ))
+            }
+        }
     }
 }
 
@@ -117,94 +283,17 @@ impl Tool for BashTool {
             .and_then(|t| t.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
-        // Use interactive executor (stdin forwarding + terminal display) for
-        // commands that may prompt for a password. Otherwise capture silently.
-        let executor = if needs_interactive(command) {
-            PtyExecutor::new(CAPTURE_KEEP_BYTES)
-        } else {
-            PtyExecutor::new_silent(CAPTURE_KEEP_BYTES)
+        // Try PersistentPty path first (supports Ctrl+Z/bg/fg).
+        let pty_arc = {
+            let guard = self.pty_slot.lock().unwrap();
+            guard.clone()
         };
-        let cancel_token = Arc::new(CancelToken::new());
-
-        // Spawn a thread that cancels after timeout.
-        let timeout_token = Arc::clone(&cancel_token);
-        let timeout_duration = Duration::from_secs(timeout_secs);
-        std::thread::spawn(move || {
-            std::thread::sleep(timeout_duration);
-            timeout_token.cancel();
-        });
-
-        // Bridge: watch the AI handler's CancellationToken and propagate to our
-        // local CancelToken.  This ensures Ctrl+C during tool execution actually
-        // kills the PTY child process.
-        let done = Arc::new(AtomicBool::new(false));
-        if let Some(ref ct) = self.cancellation_token {
-            let ct = Arc::clone(ct);
-            let tool_cancel = Arc::clone(&cancel_token);
-            let done = Arc::clone(&done);
-            std::thread::spawn(move || {
-                while !done.load(Ordering::SeqCst) {
-                    if ct.is_cancelled() {
-                        tool_cancel.cancel();
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            });
+        if let Some(pty_arc) = pty_arc {
+            return self.execute_via_persistent_pty(command, timeout_secs, pty_arc);
         }
 
-        let env_vars: std::collections::HashMap<String, String> = std::env::vars().collect();
-
-        let result = executor.execute_blocking(command, env_vars, &cancel_token);
-
-        // Signal the bridge thread to stop polling.
-        done.store(true, Ordering::SeqCst);
-
-        match result {
-            Ok(result) => {
-                // Use BashOutputOffload for threshold-based offload, matching Python's
-                // render_bash_output(). This handles:
-                // - Checking if output > threshold_bytes (1KB)
-                // - Writing full output to disk (stdout.txt, stderr.txt, result.json)
-                // - Returning HEAD preview (1KB) + offload payload with paths and hint
-                let session_uuid = uuid::Uuid::new_v4().to_string();
-                let cwd = std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-
-                let settings = BashOffloadSettings::default();
-                let offloader = BashOutputOffload::new(&session_uuid, &cwd, settings);
-                let offload_result =
-                    offloader.render(&result.stdout, &result.stderr, command, result.exit_code);
-
-                let output = crate::registry::format_tagged_result(
-                    &offload_result.stdout_text,
-                    &offload_result.stderr_text,
-                    result.exit_code,
-                    offload_result.offload_payload.as_ref(),
-                );
-
-                // Always report ok=true when PTY execution succeeds.
-                // Non-zero exit codes are normal command outcomes, not tool
-                // failures — the LLM sees <return_code> and decides what to do.
-                // Returning ok=false triggers a pointless retry of the same command.
-                ToolResult {
-                    ok: true,
-                    output,
-                    meta: offload_result
-                        .offload_payload
-                        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null)),
-                }
-            }
-            Err(e) => {
-                let mut args_map = std::collections::HashMap::new();
-                args_map.insert("error".to_string(), e.to_string());
-                ToolResult::error(aish_i18n::t_with_args(
-                    "tools.bash.execute_failed",
-                    &args_map,
-                ))
-            }
-        }
+        // Fallback: one-shot PtyExecutor.
+        self.execute_via_pty_executor(command, timeout_secs)
     }
 }
 

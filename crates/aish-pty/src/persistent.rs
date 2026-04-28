@@ -15,7 +15,7 @@ use tracing::debug;
 
 use crate::command_state::CommandState;
 use crate::control::{decode_control_chunk, BackendControlEvent};
-use crate::types::CommandSource;
+use crate::types::{CancelToken, CommandSource};
 
 /// Bash rc wrapper script embedded at compile time.
 const BASH_RC_WRAPPER: &str = include_str!("bash_rc_wrapper.sh");
@@ -165,10 +165,14 @@ impl PersistentPty {
 
     /// Execute a command and wait for completion with timeout.
     /// Returns cleaned output and exit code.
+    /// When `cancel_token` is provided, the caller can request
+    /// cancellation; on cancel the method sends SIGINT and returns
+    /// exit code -1.
     pub fn execute_command(
         &mut self,
         command: &str,
         timeout: Duration,
+        cancel_token: Option<&CancelToken>,
     ) -> aish_core::Result<(String, i32)> {
         let seq = self.allocate_backend_seq();
 
@@ -178,17 +182,175 @@ impl PersistentPty {
 
         self.send_command(command, Some(seq))?;
 
-        // Poll for prompt_ready event.
-        let result = self.wait_for_prompt_ready(seq, timeout);
+        // Save and set terminal to non-canonical mode so we can read
+        // individual bytes (Ctrl+Z = 0x1a, Ctrl+C = 0x03) without the
+        // terminal driver intercepting them.
+        let stdin_fd = libc::STDIN_FILENO;
+        let stdin_borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(stdin_fd) };
+        let saved_termios = tcgetattr(stdin_borrowed).ok();
+        if let Some(ref saved) = saved_termios {
+            let mut raw = saved.clone();
+            use nix::sys::termios::{ControlFlags, InputFlags, LocalFlags};
+            raw.local_flags &= !(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG);
+            raw.input_flags &= !InputFlags::ISTRIP;
+            raw.control_flags &= !ControlFlags::CSIZE;
+            raw.control_flags |= ControlFlags::CS8;
+            raw.control_chars[libc::VMIN] = 1;
+            raw.control_chars[libc::VTIME] = 0;
+            let _ = tcsetattr(stdin_borrowed, SetArg::TCSANOW, &raw);
+        }
 
-        // Drain any remaining master_fd output into exec buffer before
-        // exiting exec mode, so stale data doesn't leak to the next command.
+        let deadline = std::time::Instant::now() + timeout;
+        let mut result_exit_code: i32 = -1;
+        let mut cancelled = false;
+
+        // Select-based I/O loop.
+        'select_loop: while std::time::Instant::now() < deadline {
+            // Check external cancellation.
+            if let Some(ref ct) = cancel_token {
+                if ct.is_cancelled() {
+                    let _ = self.write_master(b"\x03");
+                    cancelled = true;
+                    break;
+                }
+            }
+
+            let mut read_fds: libc::fd_set = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::FD_ZERO(&mut read_fds);
+                libc::FD_SET(stdin_fd, &mut read_fds);
+                libc::FD_SET(self.master_fd, &mut read_fds);
+                libc::FD_SET(self.control_fd, &mut read_fds);
+            }
+            let max_fd = self.master_fd.max(self.control_fd).max(stdin_fd) + 1;
+
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut tv = libc::timeval {
+                tv_sec: remaining.as_secs().min(1) as libc::c_long,
+                tv_usec: (remaining.subsec_micros() % 1_000_000) as libc::c_long,
+            };
+
+            let sel = unsafe {
+                libc::select(
+                    max_fd,
+                    &mut read_fds,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut tv,
+                )
+            };
+
+            if sel < 0 {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno == libc::EINTR {
+                    continue;
+                }
+                break;
+            }
+
+            if sel == 0 {
+                continue;
+            }
+
+            // Read stdin -> forward to master.
+            if unsafe { libc::FD_ISSET(stdin_fd, &read_fds) } {
+                let mut tmp = [0u8; 64];
+                match unsafe {
+                    libc::read(stdin_fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len())
+                } {
+                    n if n > 0 => {
+                        let data = &tmp[..n as usize];
+                        if data.contains(&0x03) {
+                            // Ctrl+C: cancel and send SIGINT to bash.
+                            let _ = kill_pg(self.child_pid, Signal::SIGINT);
+                            if let Some(ref ct) = cancel_token {
+                                ct.cancel();
+                            }
+                            cancelled = true;
+                        } else {
+                            // Forward everything else (including Ctrl+Z = 0x1a)
+                            // to the PTY so bash handles it natively.
+                            let _ = self.write_master(data);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Read master -> exec buffer.
+            if unsafe { libc::FD_ISSET(self.master_fd, &read_fds) } {
+                let mut tmp = [0u8; 8192];
+                match unsafe {
+                    libc::read(
+                        self.master_fd,
+                        tmp.as_mut_ptr() as *mut libc::c_void,
+                        tmp.len(),
+                    )
+                } {
+                    n if n > 0 => {
+                        if self.exec_mode.load(Ordering::SeqCst) {
+                            self.exec_buffer
+                                .lock()
+                                .unwrap()
+                                .extend_from_slice(&tmp[..n as usize]);
+                        }
+                    }
+                    0 => {
+                        self.running.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Read control pipe for events.
+            if unsafe { libc::FD_ISSET(self.control_fd, &read_fds) } {
+                let mut tmp = [0u8; 4096];
+                match unsafe {
+                    libc::read(
+                        self.control_fd,
+                        tmp.as_mut_ptr() as *mut libc::c_void,
+                        tmp.len(),
+                    )
+                } {
+                    n if n > 0 => {
+                        let events =
+                            decode_control_chunk(&mut self.control_buffer, &tmp[..n as usize]);
+                        for event in &events {
+                            if let BackendControlEvent::ShellExiting { .. } = event {
+                                self.running.store(false, Ordering::SeqCst);
+                            }
+                            if let Some(r) = self.command_state.handle_event(event) {
+                                if r.command_seq == Some(seq) {
+                                    result_exit_code = r.exit_code;
+                                    break 'select_loop;
+                                }
+                            }
+                        }
+                    }
+                    0 => {
+                        self.running.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Drain remaining output.
         self.drain_master_to_exec_buffer();
-
-        // Exit exec mode.
         self.exec_mode.store(false, Ordering::SeqCst);
 
-        // Grab buffered output.
+        // Flush stale input so escape sequences don't confuse the next prompt.
+        unsafe {
+            libc::tcflush(stdin_fd, libc::TCIFLUSH);
+        }
+
+        // Restore terminal settings.
+        if let Some(ref saved) = saved_termios {
+            let _ = tcsetattr(stdin_borrowed, SetArg::TCSADRAIN, saved);
+        }
+
         let raw_output = self
             .exec_buffer
             .lock()
@@ -197,17 +359,12 @@ impl PersistentPty {
             .collect::<Vec<u8>>();
         let raw_str = String::from_utf8_lossy(&raw_output).to_string();
 
-        match result {
-            Some(pty_result) => {
-                let cleaned = clean_pty_output(&raw_str, command);
-                Ok((cleaned, pty_result.exit_code))
-            }
-            None => {
-                // Timeout -- send Ctrl-C.
-                let _ = self.write_master(b"\x03");
-                let cleaned = clean_pty_output(&raw_str, command);
-                Ok((cleaned, -1))
-            }
+        if cancelled {
+            let cleaned = clean_pty_output(&raw_str, command);
+            Ok((cleaned, -1))
+        } else {
+            let cleaned = clean_pty_output(&raw_str, command);
+            Ok((cleaned, result_exit_code))
         }
     }
 
@@ -769,73 +926,6 @@ impl PersistentPty {
         ))
     }
 
-    fn wait_for_prompt_ready(
-        &mut self,
-        expected_seq: i32,
-        timeout: Duration,
-    ) -> Option<crate::types::PtyCommandResult> {
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            // Drain master output into exec buffer.
-            let mut tmp = [0u8; 8192];
-            match unsafe {
-                libc::read(
-                    self.master_fd,
-                    tmp.as_mut_ptr() as *mut libc::c_void,
-                    tmp.len(),
-                )
-            } {
-                n if n > 0 => {
-                    let data: Vec<u8> = tmp[..n as usize].to_vec();
-                    if self.exec_mode.load(Ordering::SeqCst) {
-                        self.exec_buffer.lock().unwrap().extend_from_slice(&data);
-                    } else if let Some(ref cb) = self.output_callback {
-                        cb(&data);
-                    }
-                }
-                0 => {
-                    // EOF on master_fd -- bash exited.
-                    self.running.store(false, Ordering::SeqCst);
-                    return None;
-                }
-                _ => {}
-            }
-
-            // Read control pipe.
-            let mut ctrl_tmp = [0u8; 4096];
-            match unsafe {
-                libc::read(
-                    self.control_fd,
-                    ctrl_tmp.as_mut_ptr() as *mut libc::c_void,
-                    ctrl_tmp.len(),
-                )
-            } {
-                n if n > 0 => {
-                    let events =
-                        decode_control_chunk(&mut self.control_buffer, &ctrl_tmp[..n as usize]);
-                    for event in &events {
-                        if let BackendControlEvent::ShellExiting { .. } = event {
-                            self.running.store(false, Ordering::SeqCst);
-                        }
-                        if let Some(result) = self.command_state.handle_event(event) {
-                            if result.command_seq == Some(expected_seq) {
-                                return Some(result);
-                            }
-                        }
-                    }
-                }
-                0 => {
-                    // Control pipe closed -- bash exited.
-                    self.running.store(false, Ordering::SeqCst);
-                    return None;
-                }
-                _ => {}
-            }
-
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        None
-    }
 }
 
 impl Drop for PersistentPty {
@@ -1086,7 +1176,7 @@ mod tests {
         let mut pty = PersistentPty::start(&cwd, 24, 80).expect("start should succeed");
 
         let (output, exit_code) = pty
-            .execute_command("echo hello_world_123", Duration::from_secs(5))
+            .execute_command("echo hello_world_123", Duration::from_secs(5), None)
             .expect("execute should succeed");
         assert_eq!(exit_code, 0);
         assert!(output.contains("hello_world_123"), "output was: {}", output);
@@ -1102,13 +1192,13 @@ mod tests {
         let mut pty = PersistentPty::start(&cwd, 24, 80).expect("start should succeed");
 
         let (out1, code1) = pty
-            .execute_command("echo first", Duration::from_secs(5))
+            .execute_command("echo first", Duration::from_secs(5), None)
             .expect("cmd1");
         assert_eq!(code1, 0);
         assert!(out1.contains("first"));
 
         let (out2, code2) = pty
-            .execute_command("echo second", Duration::from_secs(5))
+            .execute_command("echo second", Duration::from_secs(5), None)
             .expect("cmd2");
         assert_eq!(code2, 0);
         assert!(out2.contains("second"));
