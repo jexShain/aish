@@ -274,7 +274,7 @@ impl LlmSession {
                 metadata: None,
             });
 
-            let response = self
+            let response = match self
                 .client
                 .chat_completion(
                     &messages,
@@ -283,7 +283,25 @@ impl LlmSession {
                     self.temperature,
                     self.max_tokens,
                 )
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    self.emit_event(LlmEvent {
+                        event_type: LlmEventType::Error,
+                        data: serde_json::json!({"error": e.to_string()}),
+                        timestamp: now_timestamp(),
+                        metadata: None,
+                    });
+                    self.emit_event(LlmEvent {
+                        event_type: LlmEventType::OpEnd,
+                        data: serde_json::json!({"reason": "api_error"}),
+                        timestamp: now_timestamp(),
+                        metadata: None,
+                    });
+                    return Err(e);
+                }
+            };
 
             match response {
                 LlmResponse::Json(json) => {

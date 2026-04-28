@@ -1058,6 +1058,7 @@ impl AishShell {
                                     println!("\x1b[33mInterrupted\x1b[0m");
                                 }
                                 Err(e) => {
+                                    self.animation.stop();
                                     let msg = t("shell.error.llm_error_message")
                                         .replace("{error}", &e.to_string());
                                     eprintln!("\x1b[31m{}\x1b[0m", msg);
