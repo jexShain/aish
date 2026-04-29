@@ -14,6 +14,10 @@ if [ -f /etc/bash.bashrc ]; then
     source /etc/bash.bashrc
 fi
 
+# Enable job control so Ctrl+Z suspends foreground jobs.
+# Placed after sourcing bashrc to avoid being overridden.
+set -m
+
 case ":${HISTCONTROL:-}:" in
     *:ignorespace:*|*:ignoreboth:*)
         ;;
