@@ -166,6 +166,7 @@ shell:
     visit: "Visiter : {url}"
     log_unavailable: "(fichier journal introuvable)"
     logs_included: "inclus (30 dernières lignes, expurgés)"
+    logs_truncated: "Remarque : les journaux ont été tronqués en raison de la limite de longueur d'URL"
 
   security:
     panel_title:

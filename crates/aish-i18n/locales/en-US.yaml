@@ -346,6 +346,7 @@ shell:
     visit: "Visit: {url}"
     log_unavailable: "(log file not found)"
     logs_included: "included (last 30 lines, redacted)"
+    logs_truncated: "Note: logs were truncated to fit URL length limits"
 
   # Model switching
   model_usage: "Usage: /model [model-name]"

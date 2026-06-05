@@ -166,6 +166,7 @@ shell:
     visit: "Visitar: {url}"
     log_unavailable: "(archivo de registro no encontrado)"
     logs_included: "incluidos (últimas 30 líneas, redactados)"
+    logs_truncated: "Nota: los registros se truncaron para cumplir con el límite de longitud de URL"
 
   security:
     panel_title:

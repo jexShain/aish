@@ -166,6 +166,7 @@ shell:
     visit: "アクセス: {url}"
     log_unavailable: "（ログファイルが見つかりません）"
     logs_included: "含まれる（最後の30行、秘匿済み）"
+    logs_truncated: "注：URL長さ制限のためログが切り詰められました"
 
   security:
     panel_title:

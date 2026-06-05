@@ -133,41 +133,43 @@ fn redact_sensitive_lines_owned(lines: &mut [String]) {
 /// Maximum URL length to stay within browser/GitHub limits.
 const MAX_URL_LEN: usize = 7168;
 
+/// Result of URL generation, indicating whether logs were truncated.
+struct IssueUrlResult {
+    url: String,
+    logs_truncated: bool,
+}
+
 /// Build a GitHub issue URL with template, title, labels, and pre-filled body.
-/// Automatically strips logs if the URL exceeds `MAX_URL_LEN`.
+/// Truncates logs from the tail to fit within `MAX_URL_LEN` when necessary.
 fn generate_issue_url(
     feedback_type: FeedbackType,
     info: &SystemInfo,
     include_logs: bool,
-) -> String {
-    let mut params = Vec::new();
-
-    params.push("template=feedback_auto.md".to_string());
-    params.push(format!(
-        "title={}{}",
+) -> IssueUrlResult {
+    let params_prefix = format!(
+        "https://github.com/AI-Shell-Team/aish/issues/new?template=feedback_auto.md&title={}{}",
         feedback_type.title_prefix(),
         percent_encode_str("<describe your issue>")
-    ));
-
-    let label = feedback_type.label();
-    if !label.is_empty() {
-        params.push(format!("labels={}", label));
-    }
-
-    // Try with logs first, strip if URL too long
-    let body = build_body(info, include_logs);
-    params.push(format!("body={}", percent_encode_str(&body)));
-
-    let url = format!(
-        "https://github.com/AI-Shell-Team/aish/issues/new?{}",
-        params.join("&")
     );
+    let label = feedback_type.label();
+    let params_suffix = if label.is_empty() {
+        String::new()
+    } else {
+        format!("&labels={}", label)
+    };
 
-    if url.len() > MAX_URL_LEN && include_logs {
-        return generate_issue_url(feedback_type, info, false);
+    // Calculate how many bytes are available for the body parameter
+    let overhead = params_prefix.len() + params_suffix.len() + "&body=".len();
+    let max_body_encoded = MAX_URL_LEN.saturating_sub(overhead);
+
+    let (body, truncated) = build_body_fitting(info, include_logs, max_body_encoded);
+
+    let url = format!("{}{}&body={}", params_prefix, params_suffix, body);
+
+    IssueUrlResult {
+        url,
+        logs_truncated: truncated,
     }
-
-    url
 }
 
 /// Compose the Markdown body for the GitHub issue with environment info and optional logs.
@@ -193,6 +195,76 @@ fn build_body(info: &SystemInfo, include_logs: bool) -> String {
     }
 
     body
+}
+
+/// Build the issue body, truncating logs line-by-line from the top to fit
+/// within `max_encoded_len` bytes after percent-encoding.
+/// Returns `(encoded_body, was_truncated)`.
+fn build_body_fitting(
+    info: &SystemInfo,
+    include_logs: bool,
+    max_encoded_len: usize,
+) -> (String, bool) {
+    let body_without_logs = build_body(info, false);
+    let encoded_without = percent_encode_str(&body_without_logs);
+
+    if !include_logs || info.logs.is_none() {
+        return (encoded_without, false);
+    }
+
+    let logs = info.logs.as_ref().unwrap();
+    let log_lines: Vec<&str> = logs.lines().collect();
+
+    // Binary search for the maximum number of tail log lines that fit
+    let mut lo = 0usize;
+    let mut hi = log_lines.len();
+    let mut best = 0;
+
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let start = log_lines.len().saturating_sub(mid);
+        let truncated_logs: String = if mid == 0 {
+            String::new()
+        } else {
+            log_lines[start..].join("\n")
+        };
+        let header = if mid < log_lines.len() {
+            format!("... (truncated, showing last {} of {} lines)\n", mid, log_lines.len())
+        } else {
+            String::new()
+        };
+        let full = format!(
+            "{}\n## Logs\n```shell\n{}{}\n```\n",
+            body_without_logs, header, truncated_logs
+        );
+        if percent_encode_str(&full).len() <= max_encoded_len {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    let truncated = best < log_lines.len();
+    let start = log_lines.len().saturating_sub(best);
+    let kept_logs: String = if best == 0 {
+        String::new()
+    } else {
+        log_lines[start..].join("\n")
+    };
+    let header = if truncated {
+        format!(
+            "... (truncated, showing last {} of {} lines)\n",
+            best, log_lines.len()
+        )
+    } else {
+        String::new()
+    };
+    let full = format!(
+        "{}\n## Logs\n```shell\n{}{}\n```\n",
+        body_without_logs, header, kept_logs
+    );
+    (percent_encode_str(&full), truncated)
 }
 
 /// Percent-encode a string for use in a URL query parameter.
@@ -232,14 +304,17 @@ pub fn run_feedback(model: &str, api_base: &str) {
         ConfirmAction::Cancel => return,
     };
 
-    let url = generate_issue_url(feedback_type, &info, include_logs);
+    let result = generate_issue_url(feedback_type, &info, include_logs);
+    if result.logs_truncated {
+        eprintln!("{}", t("shell.feedback.logs_truncated"));
+    }
     println!("{}", t("shell.feedback.opening"));
-    if let Err(e) = open::that(&url) {
+    if let Err(e) = open::that(&result.url) {
         let mut args = std::collections::HashMap::new();
         args.insert("error".to_string(), e.to_string());
         eprintln!("{}", t_with_args("shell.feedback.failed", &args));
         let mut visit_args = std::collections::HashMap::new();
-        visit_args.insert("url".to_string(), url);
+        visit_args.insert("url".to_string(), result.url);
         println!("{}", t_with_args("shell.feedback.visit", &visit_args));
     }
 }
@@ -366,23 +441,24 @@ mod tests {
             logs: None,
         };
 
-        let url = generate_issue_url(FeedbackType::Bug, &info, false);
-        assert!(url.starts_with("https://github.com/AI-Shell-Team/aish/issues/new?"));
-        assert!(url.contains("template=feedback_auto.md"));
-        assert!(url.contains("labels=bug"));
-        assert!(url.contains("title="));
-        assert!(url.contains("body="));
-        assert!(url.contains("AISH+version%3A+0.3.3"));
+        let result = generate_issue_url(FeedbackType::Bug, &info, false);
+        assert!(result.url.starts_with("https://github.com/AI-Shell-Team/aish/issues/new?"));
+        assert!(result.url.contains("template=feedback_auto.md"));
+        assert!(result.url.contains("labels=bug"));
+        assert!(result.url.contains("title="));
+        assert!(result.url.contains("body="));
+        assert!(result.url.contains("AISH+version%3A+0.3.3"));
+        assert!(!result.logs_truncated);
 
-        let url = generate_issue_url(FeedbackType::Feature, &info, false);
-        assert!(url.contains("labels=enhancement"));
+        let result = generate_issue_url(FeedbackType::Feature, &info, false);
+        assert!(result.url.contains("labels=enhancement"));
 
-        let url = generate_issue_url(FeedbackType::Question, &info, false);
-        assert!(!url.contains("labels="));
+        let result = generate_issue_url(FeedbackType::Question, &info, false);
+        assert!(!result.url.contains("labels="));
     }
 
     #[test]
-    fn test_url_length_limit_strips_logs() {
+    fn test_url_length_limit_truncates_logs() {
         let big_logs = "x".repeat(10000);
         let info = SystemInfo {
             version: "0.3.3".to_string(),
@@ -392,9 +468,11 @@ mod tests {
             logs: Some(big_logs),
         };
 
-        let url = generate_issue_url(FeedbackType::Bug, &info, true);
-        assert!(url.len() <= MAX_URL_LEN);
-        assert!(!url.contains(&"x".repeat(100)));
+        let result = generate_issue_url(FeedbackType::Bug, &info, true);
+        assert!(result.url.len() <= MAX_URL_LEN);
+        assert!(result.logs_truncated);
+        // Should still contain some log content (truncated)
+        assert!(result.url.contains("truncated"));
     }
 
     #[test]

@@ -166,6 +166,7 @@ shell:
     visit: "Besuchen: {url}"
     log_unavailable: "(Protokolldatei nicht gefunden)"
     logs_included: "enthalten (letzte 30 Zeilen, bereinigt)"
+    logs_truncated: "Hinweis: Logs wurden aufgrund der URL-Längenbegrenzung gekürzt"
 
   security:
     panel_title:

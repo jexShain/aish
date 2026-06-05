@@ -346,6 +346,7 @@ shell:
     visit: "访问: {url}"
     log_unavailable: "（未找到日志文件）"
     logs_included: "已包含（最近 30 行，已脱敏）"
+    logs_truncated: "注意：日志因 URL 长度限制已被截断"
 
   # 模型切换
   model_usage: "用法: /model [模型名称]"
