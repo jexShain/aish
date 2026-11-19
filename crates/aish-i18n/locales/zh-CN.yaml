@@ -1582,6 +1582,9 @@ tools:
       blocked: "已拦截：命令不是只读操作（{reason}）"
       unparseable: "已拦截：无法将该命令判定为只读"
 
+  todo:
+    description: "维护共享待办清单：init 建立多阶段任务清单，按逐字内容 start/完成/移除/放弃任务，append 追加条目，或 view 查看当前清单。各阶段在 shell 中渲染为复选框清单。"
+
   fs:
     read_file:
       missing_path: "缺少 'path' 参数"

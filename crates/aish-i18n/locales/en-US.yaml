@@ -1580,9 +1580,9 @@ tools:
     description: "Stop a running background task: sends SIGTERM to its process group, then SIGKILL after a 3s grace period."
     missing_task_id: "Missing 'task_id' parameter"
     stopped: "Task {task_id} stopped (exit code {exit_code})."
-    read_only:
-      blocked: "Blocked: command is not read-only ({reason})"
-      unparseable: "Blocked: command could not be analyzed as read-only"
+
+  todo:
+    description: "Maintain the shared todo list: init a multi-phase task list, start/complete/remove/abandon tasks by verbatim content, append items, or view the current checklist. Phases render as a checkbox checklist in the shell."
 
   fs:
     read_file:

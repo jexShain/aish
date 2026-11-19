@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -1562,6 +1562,7 @@ impl AishShell {
         tool_registry.register(Box::new(aish_tools::TaskOutputTool::new()));
         tool_registry.register(Box::new(aish_tools::TaskListTool::new()));
         tool_registry.register(Box::new(aish_tools::TaskStopTool::new()));
+        tool_registry.register(Box::new(aish_tools::TodoTool::new()));
         // AgentTool is registered after skill loading so the parent session already
         // has SkillTool when general-purpose / troubleshoot inherit the tool pool.
 
@@ -1904,6 +1905,12 @@ impl AishShell {
         let sub_agent_active_count_ref = sub_agent_active_count.clone();
         let sub_agent_animation = Arc::new(SubAgentThinkingAnimation::new());
         let sub_agent_animation_ref = sub_agent_animation.clone();
+        // Per-op tool execution counters for the spinner summary label:
+        // done = tools completed in this op, total = tools started (0 = unknown).
+        let tool_done_count = Arc::new(AtomicU64::new(0));
+        let tool_done_count_ref = tool_done_count.clone();
+        let tool_total = Arc::new(AtomicU64::new(0));
+        let tool_total_ref = tool_total.clone();
         let ai_op_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ai_op_generation_cb = ai_op_generation.clone();
         // Stable per-spawn ordinals (#1, #2, …) so interleaved sub-agent
@@ -2044,6 +2051,8 @@ impl AishShell {
                         reasoning_active_ref.store(false, Ordering::SeqCst);
                         compaction_active_ref.store(false, Ordering::SeqCst);
                         compaction_notice_shown_ref.store(false, Ordering::SeqCst);
+                        tool_done_count_ref.store(0, Ordering::SeqCst);
+                        tool_total_ref.store(0, Ordering::SeqCst);
                         op_gen.store(
                             ai_op_generation_cb_ref.load(Ordering::SeqCst),
                             Ordering::SeqCst,
@@ -2373,7 +2382,20 @@ impl AishShell {
                                 && !is_interactive_tool
                                 && !bash_needs_tty
                             {
-                                guarded_start(&animation_ref, &theme::tool_status_label(name));
+                                tool_total_ref.fetch_add(1, Ordering::SeqCst);
+                                let done = tool_done_count_ref.load(Ordering::SeqCst);
+                                let total = tool_total_ref.load(Ordering::SeqCst);
+                                let label = if total > 0 {
+                                    format!(
+                                        "[{}/{}] {}",
+                                        done,
+                                        total,
+                                        theme::tool_status_label(name)
+                                    )
+                                } else {
+                                    theme::tool_status_label(name)
+                                };
+                                guarded_start(&animation_ref, &label);
                             }
                         }
                     }
@@ -2389,6 +2411,7 @@ impl AishShell {
                         }
                         // Stop progress spinner started at ToolExecutionStart.
                         animation_ref.stop();
+                        tool_done_count_ref.fetch_add(1, Ordering::SeqCst);
                         // Also stop the sub-agent thinking animation so its
                         // background thread does not keep overwriting the
                         // terminal line with \r\x1b[K while we print the
@@ -2486,6 +2509,45 @@ impl AishShell {
                                             .add(command, full_output);
                                     }
                                 }
+                            }
+                        }
+                        let end_tool = event
+                            .data
+                            .get("tool_name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("");
+                        // Render todo checklist for the todo tool. The checklist
+                        // is rendered from the in-process todo state via
+                        // aish_tools::todo::render_checklist() rather than
+                        // event.data's output_preview, because session.rs only
+                        // populates output_preview for the bash tool.
+                        if end_tool == "todo" && tool_ok {
+                            let checklist = aish_tools::todo::render_checklist();
+                            if !checklist.is_empty() {
+                                let rail = theme::dim(theme::TOOL_BOX_MID);
+                                let collapsed = collapse_display_lines(&checklist, 8);
+                                let total_lines = checklist.lines().count();
+                                let mut checklist_ansi = collapsed
+                                    .lines()
+                                    .map(|l| format!("{}   {}", rail, theme::dim(l)))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                if total_lines > 8 {
+                                    let hidden = total_lines - 8;
+                                    checklist_ansi.push_str(&format!(
+                                        "\n{}   {}{} lines hidden",
+                                        rail,
+                                        theme::dim("... "),
+                                        hidden
+                                    ));
+                                }
+                                checklist_ansi.push('\n');
+                                crate::recorder::shared_record_output(
+                                    &shared_recorder_cb,
+                                    &checklist_ansi,
+                                );
+                                print!("{}", checklist_ansi);
+                                let _ = io::stdout().flush();
                             }
                         }
                         // Render colored diff for write_file/edit_file tools.
