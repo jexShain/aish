@@ -15,6 +15,7 @@ members = [
     "crates/aish-skills",
     "crates/aish-memory",
     "crates/aish-ui",
+    "crates/aish-tui",
     "crates/aish-tools",
     "crates/aish-scripts",
     "crates/aish-shell",

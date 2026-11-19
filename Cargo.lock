@@ -366,6 +366,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aish-tui"
+version = "1.1.0"
+dependencies = [
+ "crossterm 0.28.1",
+ "parking_lot",
+ "thiserror 2.0.21",
+ "tracing",
+ "unicode-width",
+]
+
+[[package]]
 name = "aish-ui"
 version = "1.1.0"
 dependencies = [

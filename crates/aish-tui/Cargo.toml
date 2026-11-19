@@ -1,0 +1,18 @@
+[package]
+name = "aish-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Dual-channel (history + viewport) terminal renderer for aish"
+
+[dependencies]
+crossterm.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+unicode-width.workspace = true
+
+[[bin]]
+name = "tui-demo"
+path = "src/bin/tui-demo.rs"
