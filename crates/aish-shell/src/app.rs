@@ -2448,12 +2448,17 @@ impl AishShell {
                                     .and_then(|a| a.get("command"))
                                     .and_then(|c| c.as_str())
                                     .is_some_and(aish_tools::bash::command_needs_interactive);
+                            // Progress counters count every tool call, not just
+                            // the ones that start a spinner: the done counter
+                            // increments unconditionally at ToolExecutionEnd,
+                            // so incrementing total under a narrower condition
+                            // let done exceed total (`[5/2]`).
+                            tool_total_ref.fetch_add(1, Ordering::SeqCst);
                             if crate::llm_event_ui::sub_agent_context(&event).is_none()
                                 && !react_agent_llm_event(&event)
                                 && !is_interactive_tool
                                 && !bash_needs_tty
                             {
-                                tool_total_ref.fetch_add(1, Ordering::SeqCst);
                                 let done = tool_done_count_ref.load(Ordering::SeqCst);
                                 let total = tool_total_ref.load(Ordering::SeqCst);
                                 let label = if total > 0 {
