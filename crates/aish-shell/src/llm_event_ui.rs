@@ -1,7 +1,7 @@
 //! Helpers for rendering sub-agent LLM events in the shell TUI (AC-11).
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use aish_core::LlmEvent;
 
@@ -255,6 +255,73 @@ pub fn print_sub_agent_generation_start(event: &LlmEvent) {
 /// Prefix for [`crate::animation::SubAgentThinkingAnimation`].
 pub fn sub_agent_thinking_animation_prefix(event: &LlmEvent) -> Option<String> {
     sub_agent_context(event).map(|ctx| sub_agent_thinking_prefix(&ctx))
+}
+
+/// Spawn ids whose most recent streamed fragment left the cursor mid-row.
+///
+/// Shared between the event callback (which writes the fragments) and the
+/// generation end (which terminates the row), so the two cannot disagree about
+/// whether a newline is due.
+pub type SubAgentContentRows = Arc<std::sync::Mutex<HashSet<String>>>;
+
+/// Fresh empty row tracker.
+pub fn new_sub_agent_content_rows() -> SubAgentContentRows {
+    Arc::new(std::sync::Mutex::new(HashSet::new()))
+}
+
+/// Streamed text of a `ContentDelta`, from whichever key the provider used.
+fn content_delta_text(event: &LlmEvent) -> Option<&str> {
+    ["text", "delta"]
+        .iter()
+        .find_map(|key| event.data.get(*key).and_then(|value| value.as_str()))
+        .filter(|text| !text.is_empty())
+}
+
+/// Write one sub-agent content delta, indented under its agent branch.
+///
+/// Sub-agent text streams in arbitrary chunks, so the branch indent is written
+/// **once per row**, not once per chunk: a chunk boundary must never repeat it
+/// or split a row. Chunks arrive in order on the LLM callback thread, which is
+/// what makes the mid-row bookkeeping safe without a per-spawn lock.
+///
+/// Returns `false` when the event carries no text (nothing is written).
+pub fn write_sub_agent_content_delta(event: &LlmEvent, mid_row: &SubAgentContentRows) -> bool {
+    let Some(ctx) = sub_agent_context(event) else {
+        return false;
+    };
+    let Some(text) = content_delta_text(event) else {
+        return false;
+    };
+    let mut mid_row = mid_row.lock().unwrap_or_else(|e| e.into_inner());
+    if !mid_row.contains(&ctx.spawn_id) {
+        let indent = sub_agent_child_indent(ctx.depth);
+        aish_tui::global_sink().raw(&indent);
+    }
+    aish_tui::global_sink().raw(text);
+    if text.ends_with('\n') {
+        mid_row.remove(&ctx.spawn_id);
+    } else {
+        mid_row.insert(ctx.spawn_id);
+    }
+    true
+}
+
+/// Terminate a sub-agent's streamed row when its generation ends.
+///
+/// A generation that stopped mid-row would otherwise glue the next status or
+/// tool row onto its last fragment. Generations that already ended on a newline
+/// write nothing, which keeps the row count identical to the pre-streaming
+/// behavior.
+pub fn finish_sub_agent_content(event: &LlmEvent, mid_row: &SubAgentContentRows) -> bool {
+    let Some(ctx) = sub_agent_context(event) else {
+        return false;
+    };
+    let mut mid_row = mid_row.lock().unwrap_or_else(|e| e.into_inner());
+    if !mid_row.remove(&ctx.spawn_id) {
+        return false;
+    }
+    aish_tui::global_sink().line("");
+    true
 }
 
 #[cfg(test)]

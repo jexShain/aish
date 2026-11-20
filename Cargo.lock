@@ -42,6 +42,7 @@ dependencies = [
  "aish-session",
  "aish-shell",
  "aish-skills",
+ "aish-supervisor",
  "aish-tools",
  "aish-tui",
  "aish-ui",

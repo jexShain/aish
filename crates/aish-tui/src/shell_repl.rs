@@ -23,13 +23,18 @@ use std::sync::Arc;
 
 use crate::completion::{CompletionSource, WordListSource};
 use crate::output::{OutputSink, QueueSink};
-use crate::repl::{demo_words, Repl, ReplAction, ReplConfig, TerminalGuard};
+use crate::repl::{
+    demo_words, HudSource, PanelHandle, Repl, ReplAction, ReplConfig, TerminalGuard,
+};
 
 /// Run the interactive shell REPL, calling `on_submit` for every accepted line.
 ///
 /// `on_submit` returns the [`ReplAction`] the REPL should take: `Exit` leaves
 /// the loop, `Continue` waits for the next line, `AppendHistory` commits extra
 /// rows to the history channel.
+///
+/// `hud` and `panel` are the supervision integrations: `None` for either means
+/// the REPL paints and reads exactly what it did before the feature existed.
 ///
 /// # Errors
 ///
@@ -39,6 +44,8 @@ use crate::repl::{demo_words, Repl, ReplAction, ReplConfig, TerminalGuard};
 pub fn run_shell_repl<F>(
     prompt: &str,
     history_path: Option<PathBuf>,
+    hud: Option<HudSource>,
+    panel: Option<Arc<PanelHandle>>,
     on_submit: F,
 ) -> io::Result<()>
 where
@@ -59,6 +66,8 @@ where
         history_path,
         auto_suggest: true,
         sink: Some(Arc::clone(&sink) as Arc<dyn OutputSink>),
+        hud,
+        panel,
     };
     let sources: Vec<Box<dyn CompletionSource>> = vec![Box::new(WordListSource::new(demo_words()))];
     let mut repl = Repl::new(
@@ -131,6 +140,8 @@ mod tests {
                 history_path: None,
                 auto_suggest: false,
                 sink: None,
+                hud: None,
+                panel: None,
             },
             Vec::new(),
             crate::TerminalCaps {
@@ -163,6 +174,8 @@ mod tests {
                 history_path: None,
                 auto_suggest: false,
                 sink: None,
+                hud: None,
+                panel: None,
             },
             Vec::new(),
             crate::TerminalCaps {

@@ -687,13 +687,80 @@ fn run_ui_v2(shell: &mut aish_shell::AishShell) -> bool {
         }
     };
     let history_path = aish_tui::repl::default_history_path();
-    match aish_tui::run_shell_repl(UI_V2_PROMPT, history_path, |line| {
-        if shell.process_line(line, &runtime) {
-            aish_tui::ReplAction::Exit
-        } else {
-            aish_tui::ReplAction::Continue
-        }
-    }) {
+
+    // Supervision state for the HUD row and the Ctrl+S panel. One supervisor
+    // feeds both, so the row and the panel can never disagree about what is
+    // running.
+    let supervisor = std::sync::Arc::new(std::sync::Mutex::new(aish_supervisor::Supervisor::new()));
+
+    // Observe every LLM event *in addition* to the shell's own rendering: the
+    // existing callback is wrapped, never replaced, so the v2 front end and the
+    // legacy loop render from exactly the same event stream.
+    if let Some(inner) = shell.ai_handler.event_callback_arc() {
+        let observed = std::sync::Arc::clone(&supervisor);
+        shell
+            .ai_handler
+            .set_event_callback(std::sync::Arc::new(move |event| {
+                observed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .observe(&event);
+                inner(event)
+            }));
+    }
+
+    let hud_source: aish_tui::repl::HudSource = {
+        let supervisor = std::sync::Arc::clone(&supervisor);
+        std::sync::Arc::new(move || {
+            Some(
+                supervisor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .snapshot(),
+            )
+        })
+    };
+    let panel = std::sync::Arc::new(aish_tui::repl::PanelHandle {
+        snapshot: {
+            let supervisor = std::sync::Arc::clone(&supervisor);
+            std::sync::Arc::new(move || {
+                supervisor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .snapshot()
+            })
+        },
+        on_action: std::sync::Arc::new(|action| match action {
+            aish_tui::PanelAction::StopTask(task_id) => {
+                if let Err(err) = aish_supervisor::tasks::stop(&task_id) {
+                    eprintln!("aish: cannot stop task {task_id}: {err}");
+                }
+            }
+            // Cancelling a sub-agent run and attaching a PTY session are owned
+            // by the shell session; the panel only reports the request.
+            aish_tui::PanelAction::CancelAgent(spawn_id) => {
+                eprintln!("aish: cancelling sub-agent {spawn_id} is not wired up yet");
+            }
+            aish_tui::PanelAction::AttachSession(session_id) => {
+                eprintln!("aish: attaching to session {session_id} is not wired up yet");
+            }
+            aish_tui::PanelAction::Close | aish_tui::PanelAction::None => {}
+        }),
+    });
+
+    match aish_tui::run_shell_repl(
+        UI_V2_PROMPT,
+        history_path,
+        Some(hud_source),
+        Some(panel),
+        |line| {
+            if shell.process_line(line, &runtime) {
+                aish_tui::ReplAction::Exit
+            } else {
+                aish_tui::ReplAction::Continue
+            }
+        },
+    ) {
         Ok(()) => true,
         Err(err) => {
             eprintln!("aish: AISH_UI=v2 REPL failed ({err}); using the legacy shell");

@@ -26,23 +26,43 @@
 //! `Cursor<Vec<u8>>` keystroke bytes and asserts on the exact escape sequences
 //! that reached the sink. Nothing here reads `std::io::stdin` directly except
 //! [`run_standalone`], which is the only entry point that also owns raw mode.
+//!
+//! # Supervision
+//!
+//! Two optional integrations sit on top of the line editor and are both
+//! opt-in:
+//!
+//! * [`ReplConfig::hud`] — one status row appended below the editor and the
+//!   completion menu, re-supplied (and re-ticked) every frame;
+//! * [`ReplConfig::panel`] — a full-screen supervision panel opened with
+//!   Ctrl+S (or by returning [`ReplAction::OpenPanel`] from a submit
+//!   callback), which replaces the editor until it is dismissed.
+//!
+//! With neither configured, nothing in this module changes what reaches the
+//! terminal: no extra row, no extra chord, no extra paint.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use aish_supervisor::SupervisorSnapshot;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
 use crate::caps::detect_caps;
 use crate::completion::{
     common_prefix, token_range, Candidate, CompletionSource, WordListSource, MAX_CANDIDATES,
 };
-use crate::component::render_lines_to_viewport;
+use crate::component::{render_lines_to_viewport, InputHandled, Interactive};
 use crate::editor::Editor;
 use crate::frame::{Frame, HistoryBatch};
 use crate::highlight::{DIM, RESET};
+use crate::hud::HudState;
 use crate::input::{InputEvent, InputParser, Key};
 use crate::output::{OutputSink, QueueSink};
+use crate::panel::{PanelAction, SupervisorPanel};
 use crate::render::{prepare_line, visible_width};
 use crate::renderer::{Renderer, TerminalCaps};
 
@@ -52,6 +72,29 @@ pub const MENU_ROWS: usize = 8;
 /// Maximum output rows one command may commit (a `yes` run must not fill the
 /// scrollback with a million rows in one batch).
 const MAX_OUTPUT_ROWS: usize = 200;
+
+/// Snapshot provider for the HUD row (called once per frame).
+pub type HudSource = Arc<dyn Fn() -> Option<SupervisorSnapshot> + Send + Sync>;
+
+/// Shared handle the shell side uses to open (and act on) the supervision
+/// panel.
+///
+/// The REPL never performs the action itself: [`PanelHandle::on_action`]
+/// receives whatever the user picked and the product decides what it means
+/// (`StopTask` needs the task registry, `AttachSession` the PTY daemon).
+pub struct PanelHandle {
+    /// Snapshot provider, called every frame the panel is open.
+    pub snapshot: Arc<dyn Fn() -> SupervisorSnapshot + Send + Sync>,
+    /// Called with the action the user picked; the shell performs it.
+    pub on_action: Arc<dyn Fn(PanelAction) + Send + Sync>,
+}
+
+impl fmt::Debug for PanelHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Both fields are transports, not configuration worth reading back.
+        f.debug_struct("PanelHandle").finish_non_exhaustive()
+    }
+}
 
 /// How the REPL is configured.
 #[derive(Clone)]
@@ -69,6 +112,16 @@ pub struct ReplConfig {
     /// [`QueueSink`] is drained; any other sink writes on its own, so the REPL
     /// leaves it alone.
     pub sink: Option<Arc<dyn OutputSink>>,
+    /// Snapshot provider for the status row, called once per frame.
+    ///
+    /// `None` (the default) and a provider returning `None` both hide the row,
+    /// so the REPL paints exactly what it painted before the HUD existed.
+    pub hud: Option<HudSource>,
+    /// Supervision panel, opened by Ctrl+S and dismissed by Esc or `q`.
+    ///
+    /// `None` (the default) makes Ctrl+S a no-op — the chord is not consumed
+    /// and reaches the editor as it always did.
+    pub panel: Option<Arc<PanelHandle>>,
 }
 
 impl ReplConfig {
@@ -80,6 +133,8 @@ impl ReplConfig {
             history_path: None,
             auto_suggest: true,
             sink: None,
+            hud: None,
+            panel: None,
         }
     }
 }
@@ -99,6 +154,8 @@ impl fmt::Debug for ReplConfig {
             .field("history_path", &self.history_path)
             .field("auto_suggest", &self.auto_suggest)
             .field("sink", &self.sink.as_ref().map(|_| "<sink>"))
+            .field("hud", &self.hud.as_ref().map(|_| "<hud>"))
+            .field("panel", &self.panel)
             .finish()
     }
 }
@@ -117,6 +174,10 @@ pub enum ReplAction {
     /// Clear the live screen: the separator row is committed, the renderer
     /// forgets its memo and repaints everything.
     Clear,
+    /// Open the supervision panel (Ctrl+S).
+    ///
+    /// Ignored unless [`ReplConfig::panel`] is configured.
+    OpenPanel,
 }
 
 /// Interactive line reader over the dual-channel renderer.
@@ -140,6 +201,14 @@ pub struct Repl<W: Write, R: Read> {
     menu: Vec<Candidate>,
     /// First Ctrl+C cleared the buffer; the next one exits.
     ctrl_c_armed: bool,
+    /// Status row state; only painted while the configured provider returns a
+    /// snapshot.
+    hud: HudState,
+    /// Supervision panel, created on first open (it keeps the selected tab and
+    /// row across opens).
+    panel: SupervisorPanel,
+    /// Whether the panel currently owns the screen.
+    panel_open: bool,
 }
 
 impl<W: Write, R: Read> Repl<W, R> {
@@ -179,6 +248,9 @@ impl<W: Write, R: Read> Repl<W, R> {
             auto_resize: false,
             menu: Vec::new(),
             ctrl_c_armed: false,
+            hud: HudState::new(),
+            panel: SupervisorPanel::new(),
+            panel_open: false,
         }
     }
 
@@ -240,25 +312,55 @@ impl<W: Write, R: Read> Repl<W, R> {
     where
         F: FnMut(&str) -> ReplAction,
     {
-        self.draw()?;
         let mut chunk = [0u8; 4096];
+        // Events decoded from the last read that neither the panel nor the
+        // editor has seen yet. Opening the panel must not drop the rest of the
+        // chunk: the keys that follow Ctrl+S (Tab, the Enter that picks a task)
+        // belong to the panel, and whatever follows the dismissal belongs to
+        // the editor again.
+        let mut pending: VecDeque<InputEvent> = VecDeque::new();
         loop {
-            let read = match self.reader.read(&mut chunk) {
-                Ok(0) => {
-                    // EOF: settle a trailing ambiguous sequence (a bare Escape)
-                    // before leaving so no half-parsed key is dropped silently.
-                    for event in &self.parser.flush() {
-                        self.dispatch(event, &mut on_submit)?;
+            if self.panel_open {
+                self.draw_panel()?;
+            } else {
+                self.draw()?;
+            }
+
+            if pending.is_empty() {
+                let read = match self.reader.read(&mut chunk) {
+                    Ok(0) => {
+                        // EOF: settle a trailing ambiguous sequence (a bare
+                        // Escape) before leaving so no half-parsed key is
+                        // dropped silently.
+                        pending.extend(self.parser.flush());
+                        if pending.is_empty() {
+                            break;
+                        }
+                        continue;
                     }
-                    break;
-                }
-                Ok(n) => n,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(err),
-            };
+                    Ok(n) => n,
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(err),
+                };
+                pending.extend(self.parser.feed(&chunk[..read]));
+            }
 
             let mut exit = false;
-            for event in self.parser.feed(&chunk[..read]) {
+            while let Some(event) = pending.pop_front() {
+                if self.panel_open {
+                    if self.dispatch_panel(&event) {
+                        self.panel_open = false;
+                    }
+                    // The panel is the only view while it is open, so every
+                    // keystroke repaints it (a tab switch must show its rows
+                    // immediately); dismissing it repaints the editor instead.
+                    if self.panel_open {
+                        self.draw_panel()?;
+                    } else {
+                        self.draw()?;
+                    }
+                    continue;
+                }
                 // Per-event, not per-chunk: one read may carry several keys and
                 // Right must see the ghost the preceding keys produced.
                 if self.dispatch(&event, &mut on_submit)? {
@@ -270,7 +372,6 @@ impl<W: Write, R: Read> Repl<W, R> {
             if exit {
                 break;
             }
-            self.draw()?;
         }
         self.finish()
     }
@@ -285,8 +386,80 @@ impl<W: Write, R: Read> Repl<W, R> {
         let width = self.renderer.caps().width;
         let mut rows = self.editor.render(width);
         rows.extend(self.menu_rows());
+        // The status row is the viewport's last row: below the editor (so the
+        // input line keeps its position) and above nothing, because history is
+        // committed ahead of the whole viewport.
+        if let Some(row) = self.hud_row(width) {
+            rows.push(row);
+        }
         let viewport = render_lines_to_viewport(rows, width);
         let history = self.take_history(width);
+        self.renderer.draw(Frame { history, viewport })
+    }
+
+    /// The HUD row for this frame, or `None` when there is nothing to show.
+    ///
+    /// The provider is called exactly once per frame (it may query process
+    /// state). The row is painted only while the supervisor is busy, while a
+    /// left segment is set, or while context usage is non-zero: an idle shell
+    /// with nothing configured must not grow a permanent `0%` bar.
+    fn hud_row(&mut self, width: u16) -> Option<String> {
+        let snapshot = (self.config.hud.as_ref()?)()?;
+        self.hud.set_snapshot(&snapshot);
+        if snapshot.is_busy() {
+            self.hud.tick();
+        }
+        let visible = snapshot.is_busy() || !self.hud.left.is_empty() || self.hud.ctx_percent > 0;
+        visible.then(|| self.hud.render(width))
+    }
+
+    /// Feed one event to the open panel; `true` when it asked to close.
+    ///
+    /// The panel is modal: it sees every event while it is open and the editor
+    /// sees none of them. `Submit` hands the picked action to the product
+    /// *before* reporting the close, so the product observes the action exactly
+    /// once per Enter. A dismissal is not an action: `Close` is dropped.
+    fn dispatch_panel(&mut self, event: &InputEvent) -> bool {
+        // Defensive: without a handle there is no panel to be open.
+        let Some(handle) = self.config.panel.clone() else {
+            return true;
+        };
+        // A whole burst of keys can arrive in one read, so the panel's lists are
+        // refreshed per event: the Tab and the Enter that follows it must see
+        // the rows the user is looking at, not the ones from the previous frame.
+        self.panel.set_snapshot(&(handle.snapshot)());
+        let Some(key) = panel_key(event) else {
+            return false;
+        };
+        match self.panel.handle_input(Event::Key(key)) {
+            InputHandled::Submit => {
+                if let Some(action) = self.panel.take_action() {
+                    (handle.on_action)(action);
+                }
+                true
+            }
+            InputHandled::Cancel => {
+                let _ = self.panel.take_action();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Paint the panel as the whole viewport (history still commits above it).
+    fn draw_panel(&mut self) -> io::Result<()> {
+        self.sync_geometry();
+        self.drain_sink();
+        // The panel is the only view while it is open, so it re-reads the
+        // supervisor every frame: a task that finishes while the panel is up
+        // must update its row without waiting for a keystroke.
+        if let Some(handle) = self.config.panel.as_ref() {
+            self.panel.set_snapshot(&(handle.snapshot)());
+        }
+        let caps = self.renderer.caps();
+        let rows = self.panel.render(caps.width, caps.height);
+        let viewport = render_lines_to_viewport(rows, caps.width);
+        let history = self.take_history(caps.width);
         self.renderer.draw(Frame { history, viewport })
     }
 
@@ -368,6 +541,14 @@ impl<W: Write, R: Read> Repl<W, R> {
                 self.complete();
                 return Ok(false);
             }
+            InputEvent::Key(Key::Ctrl('S')) if self.config.panel.is_some() => {
+                // Only a configured panel claims the chord: without one it is
+                // not consumed here and reaches the editor as it always did.
+                self.ctrl_c_armed = false;
+                self.menu.clear();
+                self.panel_open = true;
+                return Ok(false);
+            }
             _ => {}
         }
 
@@ -406,6 +587,13 @@ impl<W: Write, R: Read> Repl<W, R> {
                     }
                     self.commit_plain(row);
                 }
+                Ok(false)
+            }
+            ReplAction::OpenPanel => {
+                // A product-requested panel open (an external front end may
+                // reserve a different chord). Ignored without a configured
+                // panel, exactly like the chord itself.
+                self.panel_open = self.config.panel.is_some();
                 Ok(false)
             }
         }
@@ -551,6 +739,39 @@ impl<W: Write, R: Read> Repl<W, R> {
     }
 }
 
+/// Translate a parsed [`InputEvent`] into the crossterm event the panel expects.
+///
+/// The panel is an [`Interactive`] component written against crossterm's
+/// `Event`, while the REPL parses its own byte stream; this is the one adapter
+/// between the two. Pastes and unrecognised bytes have no crossterm equivalent
+/// and are dropped — the panel is a modal screen, so there is nothing for them
+/// to mean.
+fn panel_key(event: &InputEvent) -> Option<KeyEvent> {
+    let code = match event {
+        InputEvent::Char(ch) => KeyCode::Char(*ch),
+        InputEvent::Key(key) => match key {
+            Key::Enter | Key::ShiftEnter | Key::AltEnter => KeyCode::Enter,
+            Key::Esc => KeyCode::Esc,
+            Key::Backspace => KeyCode::Backspace,
+            Key::Tab => KeyCode::Tab,
+            Key::BackTab => KeyCode::BackTab,
+            Key::Delete => KeyCode::Delete,
+            Key::Insert => KeyCode::Insert,
+            Key::Home => KeyCode::Home,
+            Key::End => KeyCode::End,
+            Key::Up | Key::CtrlUp => KeyCode::Up,
+            Key::Down | Key::CtrlDown => KeyCode::Down,
+            Key::Left | Key::CtrlLeft => KeyCode::Left,
+            Key::Right | Key::CtrlRight => KeyCode::Right,
+            Key::PageUp => KeyCode::PageUp,
+            Key::PageDown => KeyCode::PageDown,
+            Key::Ctrl(ch) | Key::Alt(ch) => KeyCode::Char(*ch),
+        },
+        InputEvent::Paste(_) | InputEvent::Unknown(_) => return None,
+    };
+    Some(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
 /// Read one history entry per line; a missing file is an empty history.
 fn load_history(path: &Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -633,6 +854,8 @@ pub fn run_standalone(prompt: &str, history_path: Option<PathBuf>) -> io::Result
         history_path,
         auto_suggest: true,
         sink: None,
+        hud: None,
+        panel: None,
     };
     let sources: Vec<Box<dyn CompletionSource>> = vec![Box::new(WordListSource::new(demo_words()))];
     let mut repl = Repl::new(
@@ -777,6 +1000,7 @@ fn demo_submit(line: &str) -> ReplAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aish_supervisor::{SupervisorSnapshot, TaskRow, TaskState};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
@@ -805,6 +1029,8 @@ mod tests {
                 history_path: None,
                 auto_suggest: false,
                 sink: None,
+                hud: None,
+                panel: None,
             },
             sources,
             CAPS,
@@ -971,6 +1197,8 @@ mod tests {
                 history_path: None,
                 auto_suggest: true,
                 sink: None,
+                hud: None,
+                panel: None,
             },
             words(&["git-add", "git-log"]),
             CAPS,
@@ -996,6 +1224,8 @@ mod tests {
                 history_path: Some(path.clone()),
                 auto_suggest: false,
                 sink: None,
+                hud: None,
+                panel: None,
             },
             Vec::new(),
             CAPS,
@@ -1042,6 +1272,8 @@ mod tests {
                 history_path: None,
                 auto_suggest: false,
                 sink: Some(Arc::clone(sink) as Arc<dyn OutputSink>),
+                hud: None,
+                panel: None,
             },
             Vec::new(),
             CAPS,
@@ -1080,5 +1312,220 @@ mod tests {
         let mut repl = repl(b"", Vec::new());
         run(&mut repl, |_| ReplAction::Continue);
         assert_eq!(repl.renderer().history_rows(), 0);
+    }
+
+    // ── HUD / panel integration ────────────────────────────────────────────
+
+    fn task_row(id: &str, state: TaskState) -> TaskRow {
+        TaskRow {
+            task_id: id.to_string(),
+            command: "sleep 8".to_string(),
+            state,
+            exit_code: None,
+            started_at_ms: 0,
+            finished_at_ms: None,
+            output_path: String::new(),
+        }
+    }
+
+    fn snapshot(tasks: Vec<TaskRow>) -> SupervisorSnapshot {
+        SupervisorSnapshot {
+            tasks,
+            ..SupervisorSnapshot::default()
+        }
+    }
+
+    /// REPL whose HUD row is supplied by `hud` and whose panel is `panel`.
+    fn repl_with_supervision(
+        input: &[u8],
+        hud: Option<HudSource>,
+        panel: Option<Arc<PanelHandle>>,
+    ) -> Repl<Vec<u8>, Cursor<Vec<u8>>> {
+        Repl::with_caps(
+            Vec::new(),
+            Cursor::new(input.to_vec()),
+            ReplConfig {
+                prompt: "> ".to_string(),
+                history_path: None,
+                auto_suggest: false,
+                sink: None,
+                hud,
+                panel,
+            },
+            Vec::new(),
+            CAPS,
+        )
+    }
+
+    /// The editor prompt as painted: `>` plus the reverse-video cursor cell.
+    const EDITOR_PROMPT: &str = ">\u{1b}[7m";
+
+    /// HUD source returning a fixed snapshot.
+    fn fixed_hud(snap: SupervisorSnapshot) -> HudSource {
+        Arc::new(move || Some(snap.clone()))
+    }
+
+    /// Panel handle whose actions are recorded, over a fixed snapshot.
+    fn recording_panel(
+        snap: SupervisorSnapshot,
+    ) -> (Arc<PanelHandle>, Arc<Mutex<Vec<PanelAction>>>) {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&actions);
+        let handle = Arc::new(PanelHandle {
+            snapshot: Arc::new(move || snap.clone()),
+            on_action: Arc::new(move |action| recorded.lock().unwrap().push(action)),
+        });
+        (handle, actions)
+    }
+
+    #[test]
+    fn hud_row_appears_when_busy() {
+        let mut repl = repl_with_supervision(
+            b"",
+            Some(fixed_hud(snapshot(vec![task_row(
+                "t1",
+                TaskState::Running,
+            )]))),
+            None,
+        );
+        run(&mut repl, |_| ReplAction::Continue);
+        let bytes = output(repl);
+        // The summary is the supervisor's own wording, echoed verbatim.
+        assert!(bytes.contains("1 task"), "HUD row missing: {bytes:?}");
+        // Busy paints advance the spinner, so the row carries a braille cell.
+        assert!(
+            bytes
+                .chars()
+                .any(|ch| crate::hud::SPINNER_FRAMES.contains(&ch)),
+            "spinner never ticked: {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn hud_hidden_when_idle() {
+        let busy = repl_with_supervision(
+            b"",
+            Some(fixed_hud(snapshot(vec![task_row(
+                "t1",
+                TaskState::Running,
+            )]))),
+            None,
+        );
+        let mut busy = busy;
+        run(&mut busy, |_| ReplAction::Continue);
+        let busy_bytes = output(busy);
+
+        let mut idle = repl_with_supervision(b"", Some(fixed_hud(snapshot(Vec::new()))), None);
+        run(&mut idle, |_| ReplAction::Continue);
+        let idle_bytes = output(idle);
+
+        assert!(busy_bytes.contains("1 task"));
+        // Nothing running: no summary, no spinner, no context bar.
+        assert!(!idle_bytes.contains("task"), "idle HUD row: {idle_bytes:?}");
+        assert!(
+            !idle_bytes
+                .chars()
+                .any(|ch| crate::hud::SPINNER_FRAMES.contains(&ch)),
+            "idle HUD spun: {idle_bytes:?}"
+        );
+    }
+
+    #[test]
+    fn no_hud_config_preserves_bytes() {
+        // A provider returning `None` must paint exactly what a REPL with no
+        // HUD at all paints: the row is opt-in, never a permanent fixture.
+        let mut unset = repl(b"", Vec::new());
+        run(&mut unset, |_| ReplAction::Continue);
+        let unset_bytes = output(unset);
+
+        let mut absent = repl_with_supervision(b"", Some(Arc::new(|| None)), None);
+        run(&mut absent, |_| ReplAction::Continue);
+        let absent_bytes = output(absent);
+
+        assert_eq!(absent_bytes, unset_bytes);
+    }
+
+    #[test]
+    fn ctrl_s_opens_panel() {
+        let (panel, _actions) = recording_panel(snapshot(vec![task_row("t1", TaskState::Running)]));
+        // Ctrl+S (0x13) opens on the agents tab, Tab switches to tasks, Esc
+        // (0x1b) dismisses.
+        let mut repl = repl_with_supervision(b"\x13\t\x1b", None, Some(panel));
+        run(&mut repl, |_| ReplAction::Continue);
+        let bytes = output(repl);
+
+        // All three tabs are drawn with the panel's own header format, and the
+        // running task has a row.
+        for tab in ["Agents(", "Tasks(", "Sessions("] {
+            assert!(bytes.contains(tab), "tab {tab} missing: {bytes:?}");
+        }
+        // The selected task has a row, painted with the panel's own marker.
+        let row = "▸ sleep 8";
+        assert!(bytes.contains(row), "task row missing: {bytes:?}");
+
+        // The panel is full screen: from the first panel paint to the last one
+        // the editor prompt (its `>` plus the reverse-video cursor cell) is
+        // never painted. The prompt before that window is the initial frame;
+        // the one after it is the dismissal restoring the editor.
+        let opened = bytes.find("Agents(").expect("panel never painted");
+        let closed = bytes.rfind(row).expect("panel row never painted");
+        assert!(
+            !bytes[opened..closed].contains(EDITOR_PROMPT),
+            "editor painted under the panel: {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn panel_esc_closes_without_action() {
+        let (panel, actions) = recording_panel(snapshot(vec![task_row("t1", TaskState::Running)]));
+        let mut repl = repl_with_supervision(b"\x13\t\x1b", None, Some(panel));
+        let submitted = run(&mut repl, |_| ReplAction::Continue);
+
+        assert!(submitted.is_empty(), "panel submitted: {submitted:?}");
+        assert!(actions.lock().unwrap().is_empty(), "Esc ran an action");
+        // Back to the editor: the prompt is painted again, after the panel.
+        let bytes = output(repl);
+        let panel = bytes.find("Agents(").expect("panel never painted");
+        let editor = bytes
+            .rfind(EDITOR_PROMPT)
+            .expect("editor prompt never repainted");
+        assert!(editor > panel, "editor did not come back: {bytes:?}");
+    }
+
+    #[test]
+    fn panel_submit_invokes_callback() {
+        let (panel, actions) = recording_panel(snapshot(vec![task_row("t1", TaskState::Running)]));
+        // Ctrl+S, Tab (agents → tasks), Enter (stop t1), Esc to close the
+        // editor afterwards.
+        let mut repl = repl_with_supervision(b"\x13\t\r\x1b", None, Some(panel));
+        run(&mut repl, |_| ReplAction::Continue);
+
+        assert_eq!(
+            *actions.lock().unwrap(),
+            vec![PanelAction::StopTask("t1".to_string())],
+            "the picked action never reached the product"
+        );
+    }
+
+    #[test]
+    fn panel_closed_by_action_returns_to_editor() {
+        let (panel, actions) = recording_panel(snapshot(vec![task_row("t1", TaskState::Running)]));
+        // Ctrl+S, Tab, Enter: the submit also closes the panel, so the trailing
+        // "x" is typed into the editor and never into a dismissable panel.
+        let mut repl = repl_with_supervision(b"\x13\t\rx", None, Some(panel));
+        run(&mut repl, |_| ReplAction::Continue);
+
+        assert_eq!(actions.lock().unwrap().len(), 1);
+        assert_eq!(repl.editor().buffer(), "x");
+    }
+
+    #[test]
+    fn ctrl_s_without_panel_config_is_not_consumed() {
+        // Ctrl+S alone is not an editor binding; with no panel configured the
+        // REPL must not swallow it *and* must not open anything. The trailing
+        // Enter proves the loop kept reading normally.
+        let mut repl = repl_with_supervision(b"ab\x13\r", None, None);
+        let submitted = run(&mut repl, |_| ReplAction::Continue);
+        assert_eq!(submitted, ["ab"], "Ctrl+S disturbed the editor");
     }
 }

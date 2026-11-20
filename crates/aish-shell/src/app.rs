@@ -1950,6 +1950,11 @@ impl AishShell {
         // tool rows pair deterministically with their start rows.
         let spawn_ordinals = crate::llm_event_ui::new_shared_spawn_ordinals();
         let spawn_ordinals_ref = spawn_ordinals.clone();
+        // Sub-agents whose streamed text is currently mid-row, so the branch
+        // indent is written once per row and the row is terminated at
+        // generation end.
+        let sub_agent_content_rows = crate::llm_event_ui::new_sub_agent_content_rows();
+        let sub_agent_content_rows_ref = sub_agent_content_rows.clone();
 
         // Shared history of collapsed bash outputs for Ctrl+O browsing.
         let expand_history = Arc::new(Mutex::new(crate::expand_history::ExpandHistory::new()));
@@ -2184,6 +2189,12 @@ impl AishShell {
                         if crate::llm_event_ui::sub_agent_llm_event(&event) =>
                     {
                         sub_agent_animation_ref.stop();
+                        // A generation that stopped mid-row must not glue the
+                        // next status row onto its last fragment.
+                        crate::llm_event_ui::finish_sub_agent_content(
+                            &event,
+                            &sub_agent_content_rows_ref,
+                        );
                     }
                     LlmEventType::GenerationEnd => {
                         animation_ref.stop();
@@ -2194,7 +2205,17 @@ impl AishShell {
                         }
                     }
                     LlmEventType::ContentDelta
-                        if crate::llm_event_ui::sub_agent_llm_event(&event) => {}
+                        if crate::llm_event_ui::sub_agent_llm_event(&event) =>
+                    {
+                        // Sub-agent text is the model's own progress reports:
+                        // it is indented under the agent branch and streamed
+                        // through the same sink as the parent answer, so a
+                        // queued sink keeps both coherent.
+                        crate::llm_event_ui::write_sub_agent_content_delta(
+                            &event,
+                            &sub_agent_content_rows_ref,
+                        );
+                    }
                     LlmEventType::ContentDelta => {
                         if let Some(delta) = event.data.get("delta").and_then(|d| d.as_str()) {
                             if !delta.is_empty() {

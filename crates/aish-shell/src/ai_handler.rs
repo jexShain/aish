@@ -316,6 +316,18 @@ impl AiHandler {
         self.llm_session.set_event_callback(cb);
     }
 
+    /// Clone the current event callback.
+    ///
+    /// A front end that wants to see every event without replacing the
+    /// shell's rendering (the v2 supervision HUD) wraps the existing callback
+    /// instead of duplicating it, so there is exactly one place that decides
+    /// what an event looks like on screen.
+    pub fn event_callback_arc(
+        &self,
+    ) -> Option<Arc<dyn Fn(LlmEvent) -> Option<LlmCallbackResult> + Send + Sync>> {
+        self.llm_session.event_callback_arc()
+    }
+
     /// Trigger cancellation of the current LLM operation.
     pub fn cancel(&self) {
         self.llm_session.cancellation_token().cancel();
