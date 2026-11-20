@@ -24,6 +24,8 @@ pub const TAB_WIDTH: usize = 8;
 
 /// Reset all graphic rendition attributes.
 const SGR_RESET: &str = "\x1b[0m";
+/// Closes an OSC 8 hyperlink (`ESC ] 8 ; ; ST`). SGR reset does not.
+const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
 
 /// One normalized row ready for the terminal.
 ///
@@ -132,8 +134,8 @@ fn escape_end(bytes: &[u8], start: usize) -> usize {
                 i
             }
         }
-        b']' | b'P' | b'_' | b'^' | b'X' => {
-            // OSC / DCS / APC / PM / SOS: string payload terminated by BEL or ST.
+        b']' => {
+            // OSC: string payload terminated by BEL or ST.
             let mut i = start + 2;
             while i < bytes.len() {
                 if bytes[i] == 0x07 {
@@ -146,13 +148,33 @@ fn escape_end(bytes: &[u8], start: usize) -> usize {
             }
             bytes.len()
         }
+        b'P' | b'_' | b'^' | b'X' => {
+            // DCS / APC / PM / SOS: ECMA-48 terminates these with ST only
+            // (BEL is data). Accepting BEL here would cut the sequence short
+            // and leak its payload into the visible row.
+            let mut i = start + 2;
+            while i < bytes.len() {
+                if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                    return i + 2;
+                }
+                i += 1;
+            }
+            bytes.len()
+        }
         _ => {
             // Two-byte escape (ESC 7, ESC =, ...) after optional intermediates.
+            // The final byte must be ASCII (0x30..=0x7e); a non-ASCII lead
+            // byte means malformed input, so consume the lone ESC instead of
+            // slicing into the middle of a UTF-8 character.
             let mut i = start + 1;
             while i < bytes.len() && (0x20..=0x2f).contains(&bytes[i]) {
                 i += 1;
             }
-            (i + 1).min(bytes.len())
+            if i < bytes.len() && (0x30..=0x7e).contains(&bytes[i]) {
+                i + 1
+            } else {
+                start + 1
+            }
         }
     }
 }
@@ -184,6 +206,8 @@ struct Scanner {
     column: usize,
     truncated: bool,
     saw_escape: bool,
+    /// An OSC 8 hyperlink is currently open (SGR reset does not close it).
+    hyperlink_open: bool,
 }
 
 impl Scanner {
@@ -194,6 +218,7 @@ impl Scanner {
             column: 0,
             truncated: false,
             saw_escape: false,
+            hyperlink_open: false,
         }
     }
 
@@ -232,6 +257,13 @@ impl Scanner {
     }
 
     fn push_escape(&mut self, esc: &str) {
+        // Track OSC 8 hyperlink state so a truncation inside a link can close
+        // it: SGR reset does not, and an unclosed link makes every following
+        // row clickable to the truncated URL.
+        if let Some(params) = esc.strip_prefix("\x1b]8;") {
+            let is_open = !params.split(';').take(2).all(|field| field.is_empty());
+            self.hyperlink_open = is_open;
+        }
         match self.segs.last_mut() {
             Some(Seg::Text(text)) => text.push_str(esc),
             _ => self.segs.push(Seg::Text(esc.to_string())),
@@ -305,9 +337,14 @@ impl Scanner {
             }
         }
         if self.truncated && self.saw_escape {
-            // The cut may have landed inside a colored run; make sure the
-            // attributes cannot bleed into the next row.
+            // The cut may have landed inside a colored run or an OSC 8
+            // hyperlink. SGR reset closes attributes; only a still-open link
+            // needs its terminator, or every following row would stay
+            // clickable to the truncated URL.
             out.push_str(SGR_RESET);
+            if self.hyperlink_open {
+                out.push_str(OSC8_CLOSE);
+            }
         }
         out
     }
@@ -384,6 +421,41 @@ mod tests {
         // Trimming keeps a trailing reset so attributes still close.
         let styled = prepare_line("\x1b[32mok  \x1b[0m", 20);
         assert_eq!(styled.text, "\x1b[32mok\x1b[0m");
+    }
+
+    #[test]
+    fn lone_escape_before_multibyte_char_does_not_panic() {
+        // A malformed two-byte escape whose "final byte" is a multi-byte lead
+        // must consume only the ESC (kept verbatim as a lone escape); slicing
+        // past it would split the character and panic.
+        assert_eq!(prepare_line("\x1b漢", 10).text, "\x1b漢");
+        assert_eq!(visible_width("\x1b漢"), 2);
+        assert_eq!(strip_escapes("\x1b漢"), "漢");
+    }
+
+    #[test]
+    fn dcs_payload_is_not_terminated_by_bel() {
+        // ECMA-48: only OSC accepts BEL; DCS/APC/PM/SOS end at ST. A BEL
+        // inside the payload is data, so everything through the (missing) ST
+        // stays invisible instead of leaking into the row.
+        assert_eq!(visible_width("\x1bP1;2qPAYLOAD\x07after"), 0);
+        assert_eq!(strip_escapes("\x1bP1;2qPAYLOAD\x07after"), "");
+        // And the ST form still ends the sequence, so the tail is visible.
+        assert_eq!(strip_escapes("\x1bP1;2qPAYLOAD\x1b\\after"), "after");
+    }
+
+    #[test]
+    fn truncation_closes_an_open_hyperlink() {
+        // Cutting inside an OSC 8 link must emit the link terminator: SGR
+        // reset does not close it, and an unclosed link makes every following
+        // row clickable to the truncated URL.
+        let line = prepare_line("\x1b]8;;https://example.com\x07click here", 6);
+        assert!(
+            line.text.contains(OSC8_CLOSE),
+            "missing ST: {:?}",
+            line.text
+        );
+        assert_eq!(strip_escapes(&line.text), "click");
     }
 
     #[test]

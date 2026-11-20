@@ -104,8 +104,9 @@ pub struct Renderer<W: Write> {
     acked_id: u64,
     /// Rows painted by the previous frame, in frame order.
     last_viewport: Vec<PreparedLine>,
-    /// 1-based row of `last_viewport[0]`, if a viewport was painted.
-    last_top: Option<u16>,
+    /// 1-based row of `last_viewport[0]`, if a viewport was painted. Values
+    /// above the screen height mean "scroll this many rows before writing".
+    last_top: Option<usize>,
     /// History rows committed through this renderer (diagnostics and tests).
     history_rows: usize,
 }
@@ -165,10 +166,17 @@ impl<W: Write> Renderer<W> {
     /// bracketed by cursor hiding and (when supported) synchronized output.
     pub fn draw(&mut self, frame: Frame) -> io::Result<()> {
         let height = self.caps.height.max(1) as usize;
-        let rows = frame.viewport.len().min(height);
-        let viewport = &frame.viewport[..rows];
+        // A viewport taller than the screen keeps its TAIL: the editor/prompt
+        // sits at the bottom, so dropping the head is the only choice that
+        // keeps the input line visible.
+        let viewport = &frame.viewport[frame.viewport.len().saturating_sub(height)..];
 
-        let mut buf = Vec::with_capacity(64 + rows * (self.caps.width as usize + 12));
+        // Snapshot the band state: a failed write must not desync the memo
+        // from the screen, or a retried frame would repaint history twice.
+        let prev_top = self.last_top;
+        let prev_viewport = self.last_viewport.clone();
+
+        let mut buf = Vec::with_capacity(64 + viewport.len() * (self.caps.width as usize + 12));
         self.paint_begin(&mut buf);
 
         // The watermark check comes first: an empty batch with a stale id must
@@ -184,9 +192,11 @@ impl<W: Write> Renderer<W> {
                 None
             }
             Some(batch) if batch.rows.is_empty() => {
-                // An empty batch advances the watermark without emitting bytes
-                // (so the product may release its buffer); the screen is
-                // unchanged, so the viewport needs no repaint either.
+                // An empty batch advances the watermark without emitting
+                // history bytes (so the product may release its buffer), but
+                // the viewport is re-supplied every frame and may have changed
+                // — it still has to be placed.
+                self.place_viewport(viewport, &mut buf);
                 Some((batch.id, 0))
             }
             Some(batch) => Some(self.commit_history(batch, viewport, &mut buf)),
@@ -198,8 +208,13 @@ impl<W: Write> Renderer<W> {
 
         self.paint_end(&mut buf);
 
-        self.out.write_all(&buf)?;
-        self.out.flush()?;
+        if let Err(err) = self.out.write_all(&buf).and_then(|()| self.out.flush()) {
+            // Roll the memo back so the next frame repaints from the same
+            // starting state; the ack watermark never advanced.
+            self.last_top = prev_top;
+            self.last_viewport = prev_viewport;
+            return Err(err);
+        }
 
         // The ack is only durable once the rows are on the wire.
         if let Some((id, count)) = committed {
@@ -232,10 +247,12 @@ impl<W: Write> Renderer<W> {
 
     /// First row (1-based) of a bottom-anchored band of `rows` rows. An empty
     /// band collapses onto the bottom row.
-    fn band_top(&self, rows: usize) -> u16 {
+    fn band_top(&self, rows: usize) -> usize {
         let height = self.caps.height.max(1);
-        let rows = (rows as u16).min(height);
-        (height - rows).saturating_add(1).min(height)
+        let rows = rows.min(height as usize);
+        (height as usize - rows)
+            .saturating_add(1)
+            .min(height as usize)
     }
 
     /// Commit history and paint the viewport directly below it, as one
@@ -250,7 +267,7 @@ impl<W: Write> Renderer<W> {
         viewport: &[PreparedLine],
         buf: &mut Vec<u8>,
     ) -> (u64, usize) {
-        let height = self.caps.height.max(1);
+        let height = self.caps.height.max(1) as usize;
         let width = self.caps.width;
         let count = batch.rows.len();
         let rows = viewport.len();
@@ -258,10 +275,11 @@ impl<W: Write> Renderer<W> {
         // Erase the live band before anything scrolls: rows pushed off the top
         // by the history write must be finished history or blanks, never a
         // stale in-progress frame. Erasure is per line (`EL`) from column 1, so
-        // no line is ever deleted and committed rows above are untouched.
+        // no line is ever deleted and committed rows above are untouched. The
+        // band always ends at or above the bottom row, so no scroll is needed.
         if let Some(top) = self.last_top {
-            for offset in 0..self.last_viewport.len().min(height as usize) {
-                goto(buf, top.saturating_add(offset as u16).min(height));
+            for offset in 0..self.last_viewport.len().min(height) {
+                goto(buf, (top + offset) as u16);
                 buf.extend_from_slice(ERASE_TO_EOL.as_bytes());
             }
         }
@@ -270,8 +288,13 @@ impl<W: Write> Renderer<W> {
         // frame it starts on the bottom row and scrolls rows in. `\r\n`, not
         // `\n`: in raw mode (the shell owns the tty) a bare LF moves down
         // without returning to column 1.
-        let start = self.last_top.unwrap_or(height).min(height);
-        goto(buf, start);
+        //
+        // `start` may exceed the screen height when the previous block ended
+        // flush with the bottom: that means "scroll first, then write", and
+        // everything already painted shifts up by the same amount — which is
+        // fine, because the live band was just erased.
+        let start = self.last_top.unwrap_or(height).max(1);
+        let scrolled = goto_scrolling(buf, start, height);
         for (index, row) in batch.rows.iter().enumerate() {
             if index > 0 {
                 buf.extend_from_slice(CRLF);
@@ -289,16 +312,20 @@ impl<W: Write> Renderer<W> {
         // Physical row of the viewport's first line after the terminal applied
         // any scroll: the block needed `count + rows` rows from `start`, and
         // everything past the bottom shifts the whole block up by the overflow.
-        let overflow = (start as usize + count + rows).saturating_sub(1 + height as usize);
-        let top_after = (start as usize + count).saturating_sub(overflow);
-        self.last_top = (rows > 0).then(|| top_after.min(height as usize).max(1) as u16);
+        let overflow = (start + count + rows).saturating_sub(1 + height);
+        let top_after = (start + count).saturating_sub(scrolled + overflow);
+        // With an empty viewport the anchor must still advance: dropping it
+        // would make the next frame bottom-anchor its band and paint over the
+        // rows committed here (invariant 4). `height + 1` is the legal "one
+        // scroll pending" anchor.
+        self.last_top = Some(top_after.max(1));
         self.last_viewport = viewport.to_vec();
         (batch.id, count)
     }
 
     /// Rewrite the live viewport at its anchor, diffing rows when possible.
     fn place_viewport(&mut self, viewport: &[PreparedLine], buf: &mut Vec<u8>) {
-        let height = self.caps.height.max(1);
+        let height = self.caps.height.max(1) as usize;
         let rows = viewport.len();
         let previous_rows = self.last_viewport.len();
         let previous_top = self.last_top;
@@ -307,8 +334,10 @@ impl<W: Write> Renderer<W> {
             // Nothing to place. The band left by the previous frame is cleared
             // to the end of the display; no whole line is ever deleted.
             if let Some(top) = previous_top {
-                goto(buf, top);
-                buf.extend_from_slice(ERASE_TO_EOD.as_bytes());
+                if top <= height {
+                    goto(buf, top as u16);
+                    buf.extend_from_slice(ERASE_TO_EOD.as_bytes());
+                }
             }
             self.last_viewport.clear();
             self.last_top = None;
@@ -325,23 +354,25 @@ impl<W: Write> Renderer<W> {
         // one downward flow: the write then scrolls, and rows leaving the top
         // are finished history (never live rows, which sit at or below the
         // anchor). The anchor shifts up by exactly that overflow.
-        if top.saturating_add(rows as u16 - 1) > height {
+        if top.saturating_add(rows - 1) > height {
             if let Some(old_top) = previous_top {
                 // The old band is live area and is about to be overwritten;
                 // clear it first so a short old band cannot leave stale cells
                 // below the new one.
-                goto(buf, old_top);
-                buf.extend_from_slice(ERASE_TO_EOD.as_bytes());
+                if old_top <= height {
+                    goto(buf, old_top as u16);
+                    buf.extend_from_slice(ERASE_TO_EOD.as_bytes());
+                }
             }
-            goto(buf, top);
+            let scrolled = goto_scrolling(buf, top, height);
             for (index, line) in viewport.iter().enumerate() {
                 if index > 0 {
                     buf.extend_from_slice(CRLF);
                 }
                 write_row(buf, line, self.caps.width);
             }
-            let overflow = (top as usize + rows - 1).saturating_sub(height as usize);
-            self.last_top = Some((top as usize).saturating_sub(overflow).max(1) as u16);
+            let overflow = (top + rows - 1).saturating_sub(height);
+            self.last_top = Some(top.saturating_sub(scrolled + overflow).max(1));
             self.last_viewport = viewport.to_vec();
             return;
         }
@@ -359,7 +390,7 @@ impl<W: Write> Renderer<W> {
                     continue;
                 }
                 changed_any = true;
-                goto(buf, top + index as u16);
+                goto(buf, (top + index) as u16);
                 write_row(buf, line, self.caps.width);
             }
             if !changed_any {
@@ -373,12 +404,12 @@ impl<W: Write> Renderer<W> {
         // band). Rewrite the whole band at its anchor and clear whatever the
         // previous band left below it — `ED`, never a line delete.
         for (index, line) in viewport.iter().enumerate() {
-            goto(buf, (top + index as u16).min(height));
+            goto(buf, (top + index).min(height) as u16);
             write_row(buf, line, self.caps.width);
         }
-        let below = top.saturating_add(rows as u16);
+        let below = top + rows;
         if below <= height {
-            goto(buf, below);
+            goto(buf, below as u16);
             buf.extend_from_slice(ERASE_TO_EOD.as_bytes());
         }
         self.last_viewport = viewport.to_vec();
@@ -391,6 +422,19 @@ fn goto(buf: &mut Vec<u8>, row: u16) {
     buf.extend_from_slice(b"\x1b[");
     buf.extend_from_slice(row.max(1).to_string().as_bytes());
     buf.extend_from_slice(b";1H");
+}
+
+/// Move to `row`, scrolling first when it lies past the bottom of the screen.
+///
+/// Returns the number of rows the whole screen scrolled, so the caller can
+/// shift its own recorded geometry by the same amount.
+fn goto_scrolling(buf: &mut Vec<u8>, row: usize, height: usize) -> usize {
+    let scroll = row.saturating_sub(height);
+    goto(buf, row.min(height).max(1) as u16);
+    for _ in 0..scroll {
+        buf.extend_from_slice(CRLF);
+    }
+    scroll
 }
 
 /// Emit one prepared row at the cursor, clearing the cells it does not cover.

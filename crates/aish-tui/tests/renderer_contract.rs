@@ -715,3 +715,137 @@ fn empty_history_batch_advances_watermark_only() {
         "empty batch must not repaint the viewport"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression: defects found by the omp review (2026-11-20)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empty_viewport_batch_keeps_the_anchor_so_history_survives() {
+    // Bug: committing with an empty viewport cleared `last_top`, so the next
+    // frame bottom-anchored its band and painted over the committed rows.
+    let (mut renderer, sink) = renderer();
+    let mut stream = String::new();
+    renderer
+        .draw(Frame {
+            history: Some(HistoryBatch::new(1, lines(&["keepA", "keepB"]))),
+            viewport: Vec::new(),
+        })
+        .unwrap();
+    stream.push_str(&sink.take());
+
+    renderer
+        .draw(Frame {
+            history: None,
+            viewport: lines(&["vp1", "vp2", "vp3"]),
+        })
+        .unwrap();
+    stream.push_str(&sink.take());
+
+    let mut screen = Screen::new(WIDTH as usize, HEIGHT as usize);
+    screen.feed(&stream);
+    let visible: Vec<String> = screen
+        .cells
+        .iter()
+        .map(|row| row.iter().collect::<String>().trim_end().to_string())
+        .collect();
+    let mut combined = screen.scrollback.clone();
+    combined.extend(visible);
+    assert!(
+        combined.iter().any(|line| line == "keepA") && combined.iter().any(|line| line == "keepB"),
+        "committed rows were overwritten by the live band: {combined:?}"
+    );
+}
+
+#[test]
+fn empty_batch_still_places_a_changed_viewport() {
+    // Bug: an empty history batch returned early without placing the
+    // viewport, losing that frame's viewport update entirely.
+    let (mut renderer, sink) = renderer();
+    renderer.draw(rows(&["a"])).unwrap();
+    sink.take();
+
+    renderer
+        .draw(Frame {
+            history: Some(HistoryBatch::new(1, Vec::new())),
+            viewport: lines(&["b"]),
+        })
+        .unwrap();
+
+    let addressed = addressed_rows(&sink.take());
+    assert_eq!(addressed, vec![HEIGHT], "viewport update was dropped");
+}
+
+#[test]
+fn failed_flush_rolls_back_the_viewport_memo() {
+    // Bug: last_viewport/last_top were updated before the write, so a failed
+    // flush left the memo claiming rows that never reached the screen; the
+    // retry then repainted history a second time.
+    struct FailingSink {
+        inner: Sink,
+        fail_next: Rc<RefCell<bool>>,
+    }
+    impl Write for FailingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if *self.fail_next.borrow() {
+                *self.fail_next.borrow_mut() = false;
+                return Err(io::Error::other("flush failed"));
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let inner = Sink::default();
+    let fail_next = Rc::new(RefCell::new(true));
+    let mut renderer = Renderer::new(
+        FailingSink {
+            inner: inner.clone(),
+            fail_next: fail_next.clone(),
+        },
+        caps(true),
+    );
+
+    let frame = Frame {
+        history: Some(HistoryBatch::new(1, lines(&["done"]))),
+        viewport: lines(&["vp"]),
+    };
+    assert!(renderer.draw(frame.clone()).is_err());
+    assert_eq!(renderer.acked_history_id(), 0, "ack advanced on failure");
+    renderer.draw(frame).unwrap();
+
+    let written = inner.snapshot();
+    assert_eq!(
+        written.matches("done").count(),
+        1,
+        "history row written twice: {written:?}"
+    );
+    assert_eq!(renderer.history_rows(), 1);
+}
+
+#[test]
+fn oversized_viewport_keeps_the_tail() {
+    // Bug: `[..min(height)]` kept the head, so the prompt row (last) was
+    // never painted on a viewport taller than the screen.
+    let (mut renderer, sink) = renderer();
+    let tall: Vec<&str> = vec!["r1", "r2", "r3", "r4", "r5", "r6", "PROMPT", "tail"];
+    renderer.draw(rows(&tall)).unwrap();
+    let written = sink.take();
+    let mut screen = Screen::new(WIDTH as usize, HEIGHT as usize);
+    screen.feed(&written);
+    let visible: Vec<String> = screen
+        .cells
+        .iter()
+        .map(|row| row.iter().collect::<String>().trim_end().to_string())
+        .collect();
+    assert!(
+        visible.iter().any(|line| line == "PROMPT"),
+        "prompt row dropped: {visible:?}"
+    );
+    assert!(
+        visible.iter().any(|line| line == "tail"),
+        "last row dropped: {visible:?}"
+    );
+}
