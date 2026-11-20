@@ -19,6 +19,7 @@ aish-session.workspace = true
 aish-tools.workspace = true
 aish-i18n.workspace = true
 aish-ui.workspace = true
+aish-tui.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde.workspace = true

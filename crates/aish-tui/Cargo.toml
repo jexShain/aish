@@ -16,3 +16,10 @@ unicode-width.workspace = true
 [[bin]]
 name = "tui-demo"
 path = "src/bin/tui-demo.rs"
+
+[[bin]]
+name = "aish-tui-repl"
+path = "src/bin/aish-tui-repl.rs"
+
+[dev-dependencies]
+tempfile.workspace = true

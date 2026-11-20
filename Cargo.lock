@@ -43,6 +43,7 @@ dependencies = [
  "aish-shell",
  "aish-skills",
  "aish-tools",
+ "aish-tui",
  "aish-ui",
  "chrono",
  "clap",
@@ -371,6 +372,7 @@ version = "1.1.0"
 dependencies = [
  "crossterm 0.28.1",
  "parking_lot",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
  "unicode-width",

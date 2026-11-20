@@ -265,6 +265,43 @@ impl Editor {
         true
     }
 
+    /// Discard the buffer without submitting it.
+    ///
+    /// History is untouched (the line was never accepted) and the cleared
+    /// buffer is undoable, so Ctrl+C then Ctrl+Z restores the draft.
+    pub fn clear(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        self.begin_edit();
+        self.buffer.clear();
+        self.cursor = 0;
+        self.ghost = None;
+    }
+
+    /// Replace the `chars` characters before the cursor with `replacement`.
+    ///
+    /// This is the completion edit: one undo snapshot for the whole swap, so
+    /// Ctrl+Z restores the token the user had typed instead of unwinding the
+    /// replacement one character at a time.
+    pub fn replace_before_cursor(&mut self, chars: usize, replacement: &str) -> bool {
+        let mut start = self.cursor;
+        for _ in 0..chars {
+            if start == 0 {
+                break;
+            }
+            start = self.prev_boundary(start);
+        }
+        if start == self.cursor && replacement.is_empty() {
+            return false;
+        }
+        self.begin_edit();
+        self.buffer.replace_range(start..self.cursor, replacement);
+        self.cursor = start + replacement.len();
+        self.ghost = None;
+        true
+    }
+
     /// Delete the character under the cursor.
     pub fn delete(&mut self) -> bool {
         if self.cursor >= self.buffer.len() {
@@ -1242,5 +1279,35 @@ mod tests {
         editor.handle_event(&InputEvent::Key(Key::End));
         editor.handle_event(&InputEvent::Key(Key::Ctrl('F')));
         assert_eq!(editor.buffer(), "alpha beta gamma!");
+    }
+
+    #[test]
+    fn clear_discards_the_buffer_and_undo_restores_it() {
+        let mut editor = Editor::new("> ");
+        editor.insert_str("half typed");
+        editor.push_history("kept");
+        editor.clear();
+        assert_eq!(editor.buffer(), "");
+        assert_eq!(editor.cursor(), 0);
+        // Clearing is not a submit: history and the undo stack survive.
+        assert_eq!(editor.history(), ["kept"]);
+        assert!(editor.undo());
+        assert_eq!(editor.buffer(), "half typed");
+    }
+
+    #[test]
+    fn replace_before_cursor_swaps_the_token_in_one_undo() {
+        let mut editor = Editor::new("> ");
+        editor.insert_str("git sta");
+        assert!(editor.replace_before_cursor(3, "status"));
+        assert_eq!(editor.buffer(), "git status");
+        assert_eq!(editor.cursor(), "git status".len());
+        // One undo returns the typed token, not the replacement minus a char.
+        assert!(editor.undo());
+        assert_eq!(editor.buffer(), "git sta");
+        // A multi-byte token is measured in chars, never bytes.
+        editor.insert_str(" 漢字");
+        assert!(editor.replace_before_cursor(2, "漢"));
+        assert_eq!(editor.buffer(), "git sta 漢");
     }
 }

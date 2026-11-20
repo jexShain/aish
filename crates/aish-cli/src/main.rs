@@ -14,6 +14,7 @@
 )]
 
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
@@ -603,8 +604,78 @@ enum RegistryAction {
     Remove { name: String },
 }
 
+/// Environment variable selecting the next-generation UI.
+const UI_SELECT_ENV: &str = "AISH_UI";
+
+/// Prompt of the v2 REPL launched by `AISH_UI=v2`.
+const UI_V2_PROMPT: &str = "◆ aish ➜ ";
+
+/// Whether this invocation should run the v2 REPL instead of the legacy shell.
+///
+/// Only a plain interactive launch qualifies: the hidden entry points (sandbox
+/// and PTY daemons, attach/remote helpers) inherit the environment from the
+/// shell that spawned them, so they must never be diverted onto the REPL.
+fn ui_v2_requested(cli: &Cli) -> bool {
+    if std::env::var(UI_SELECT_ENV).as_deref() != Ok("v2") || cli.command.is_some() {
+        return false;
+    }
+    // Session continuation and the hidden entry points are legacy-shell
+    // behaviours; diverting them onto the REPL would silently drop the request.
+    let internal_entry = cli.continue_session
+        || cli.sandbox_daemon
+        || cli.sandbox_socket.is_some()
+        || cli.sandbox_worker
+        || cli.pty_daemon
+        || cli.pty_socket.is_some()
+        || cli.pty_session.is_some()
+        || cli.kill_pty_session
+        || cli.pty_attach.is_some()
+        || cli.remote_sessions
+        || cli.remote_attach.is_some()
+        || cli.remote_policy_show
+        || cli.remote_policy_install.is_some()
+        || cli.remote_policy_install_stdin
+        || cli.remote_session_rename.is_some()
+        || cli.remote_session_kill.is_some()
+        || cli.remote_session_replay.is_some()
+        || cli.replay_tail.is_some()
+        || cli.remote_audit_events
+        || cli.remote_diagnose
+        || cli.checks.is_some()
+        || cli.enforce_read_only
+        || cli.since.is_some();
+    !internal_entry
+}
+
+/// Run the v2 REPL; `false` means "fall back to the legacy shell".
+///
+/// A missing terminal is not an error the user can act on by retrying, so it is
+/// reported as a one-line hint and the legacy path takes over — never a panic
+/// and never a REPL that reads a pipe forever.
+fn try_ui_v2() -> bool {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        eprintln!("aish: AISH_UI=v2 needs a terminal on stdin and stdout; using the legacy shell");
+        return false;
+    }
+    match aish_tui::repl::run_standalone(UI_V2_PROMPT, aish_tui::repl::default_history_path()) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("aish: AISH_UI=v2 REPL failed ({err}); using the legacy shell");
+            false
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
+
+    // AISH_UI=v2: hand the process to the dual-channel REPL before anything
+    // else touches config, logging or the legacy shell loop. Every failure
+    // path (no tty, REPL error) falls through to the unchanged legacy launch.
+    if ui_v2_requested(&cli) && try_ui_v2() {
+        return;
+    }
+
     let config_path = cli.config.clone();
     // Record the explicit --config for the welcome panel ("config:" line)
     // before anything else reads it; see cli_config_source().

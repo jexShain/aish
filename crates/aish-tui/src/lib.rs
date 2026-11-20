@@ -19,6 +19,7 @@
 //! are the reason this crate exists rather than ad-hoc `println!`s in the shell.
 
 pub mod caps;
+pub mod completion;
 pub mod component;
 pub mod editor;
 pub mod frame;
@@ -26,11 +27,14 @@ pub mod highlight;
 pub mod input;
 pub mod render;
 pub mod renderer;
+pub mod repl;
 
 pub use caps::detect_caps;
+pub use completion::{common_prefix, token_range, Candidate, CompletionSource, WordListSource};
 pub use component::{render_lines_to_viewport, Component, Container, InputHandled, Interactive};
 pub use frame::{Frame, HistoryBatch};
 pub use render::{
     prepare_line, prepare_lines, strip_escapes, visible_width, PreparedLine, TAB_WIDTH,
 };
 pub use renderer::{Renderer, TerminalCaps};
+pub use repl::{Repl, ReplAction, ReplConfig};

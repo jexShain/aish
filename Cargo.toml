@@ -138,6 +138,7 @@ aish-context = { path = "crates/aish-context" }
 aish-skills = { path = "crates/aish-skills" }
 aish-memory = { path = "crates/aish-memory" }
 aish-ui = { path = "crates/aish-ui" }
+aish-tui = { path = "crates/aish-tui" }
 aish-tools = { path = "crates/aish-tools" }
 aish-shell = { path = "crates/aish-shell" }
 aish-scripts = { path = "crates/aish-scripts" }
