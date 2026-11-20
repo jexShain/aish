@@ -26,22 +26,28 @@ pub mod component;
 pub mod editor;
 pub mod frame;
 pub mod highlight;
+pub mod hud;
 pub mod input;
 pub mod output;
+pub mod panel;
 pub mod render;
 pub mod renderer;
 pub mod repl;
+pub mod shell_repl;
 
 pub use caps::detect_caps;
 pub use completion::{common_prefix, token_range, Candidate, CompletionSource, WordListSource};
 pub use component::{render_lines_to_viewport, Component, Container, InputHandled, Interactive};
 pub use frame::{Frame, HistoryBatch};
+pub use hud::HudState;
 pub use output::{OutputSink, QueueSink, StdoutSink};
+pub use panel::{EntryTone, PanelAction, PanelEntry, PanelTab, SupervisorPanel};
 pub use render::{
     prepare_line, prepare_lines, strip_escapes, visible_width, PreparedLine, TAB_WIDTH,
 };
 pub use renderer::{Renderer, TerminalCaps};
 pub use repl::{Repl, ReplAction, ReplConfig};
+pub use shell_repl::run_shell_repl;
 
 use std::sync::Arc;
 
@@ -63,6 +69,15 @@ static GLOBAL_SINK: RwLock<Option<Arc<dyn OutputSink>>> = RwLock::new(None);
 /// producer starts writing: every later [`global_sink`] call returns it.
 pub fn install_global_sink(sink: Arc<dyn OutputSink>) {
     *GLOBAL_SINK.write() = Some(sink);
+}
+
+/// Remove the installed sink, restoring the [`StdoutSink`] fallback.
+///
+/// The interactive REPL owns the terminal only while it runs; a launch that
+/// hands the process back (fallback after a failure, a test driving both paths)
+/// must not leave producers queueing rows nobody will drain.
+pub fn clear_global_sink() {
+    *GLOBAL_SINK.write() = None;
 }
 
 /// The installed process-wide sink, or a [`StdoutSink`] when none is.

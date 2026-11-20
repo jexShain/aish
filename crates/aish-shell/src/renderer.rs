@@ -242,9 +242,37 @@ fn render_table_to_segments(lines: &[&str], width: usize) -> Option<richrs::segm
 
 /// Record output data to a shared recorder if one is present.
 fn record_to_shared(recorder: &Option<SharedRecorder>, data: &str) {
-    if let Some(ref sr) = recorder {
+    if let Some(sr) = recorder {
         crate::recorder::shared_record_output(sr, data);
     }
+}
+
+/// Push already-rendered console bytes through the global sink.
+///
+/// The console renders into a capture buffer so the exact bytes it would have
+/// written (including its color-system decision) reach the sink instead of
+/// `stdout`. A trailing fragment is committed immediately: the caller hands us
+/// a finished block, not a stream.
+fn write_through_sink(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let sink = aish_tui::global_sink();
+    sink.raw(text);
+    if !text.ends_with('\n') {
+        sink.flush_raw();
+    }
+}
+
+/// Whether the installed sink writes straight to stdout.
+///
+/// Cursor-motion tricks (moving up over an already painted row) only make
+/// sense there; a queued sink owns no cursor position, so the caller must fall
+/// back to emitting plain rows.
+pub(crate) fn sink_writes_to_stdout() -> bool {
+    aish_tui::global_sink()
+        .as_any()
+        .is::<aish_tui::StdoutSink>()
 }
 
 /// Render a fenced code block with syntax highlighting.
@@ -265,15 +293,17 @@ fn render_code_block(
     if !lang.is_empty() {
         let lang_ansi = format!("{}\n", theme::bold_faint(lang));
         record_to_shared(shared_recorder, &lang_ansi);
-        println!("{}", theme::bold_faint(lang));
+        write_through_sink(&lang_ansi);
     }
 
     // Syntax-highlighted code
     let syntax = Syntax::new(code_trimmed, lang).theme("base16-ocean.dark");
     let segments = syntax.render(width);
     record_to_shared(shared_recorder, &segments.to_ansi());
+    console.begin_capture();
     let _ = console.write_segments(&segments);
     let _ = console.flush();
+    write_through_sink(&console.end_capture());
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +360,7 @@ impl ShellRenderer {
                     let lines: Vec<&str> = content.lines().collect();
                     if let Some(segs) = render_table_to_segments(&lines, self.terminal_width) {
                         self.record_output(&segs.to_ansi());
-                        let _ = self.console.write_segments(&segs);
+                        self.write_segments(&segs);
                     }
                     last_was_markdown = false;
                 }
@@ -343,17 +373,30 @@ impl ShellRenderer {
                         }
                         self.record_output(&ansi);
                     }
-                    let _ = self.console.write_segments(&segs);
+                    self.write_segments(&segs);
                     last_was_markdown = true;
                 }
             }
         }
-        let _ = self.console.flush();
-        let _ = io::stdout().flush();
-        if last_was_markdown {
+        if last_was_markdown && sink_writes_to_stdout() {
+            // richrs leaves a trailing blank row behind a markdown block; the
+            // direct path removes it in place. A sink has no cursor, so the
+            // row is simply not emitted there.
             print!("\x1b[1A\x1b[M");
             let _ = io::stdout().flush();
         }
+    }
+
+    /// Write rendered segments to the console, then push the bytes to the sink.
+    ///
+    /// Capturing keeps the console's own color-system decision (it downgrades
+    /// to plain text when the terminal cannot color) while routing the result
+    /// through the frame-safe channel.
+    fn write_segments(&mut self, segments: &richrs::segment::Segments) {
+        self.console.begin_capture();
+        let _ = self.console.write_segments(segments);
+        let _ = self.console.flush();
+        write_through_sink(&self.console.end_capture());
     }
 
     /// Append a streaming delta — prints gray text for real-time feedback.
@@ -365,17 +408,16 @@ impl ShellRenderer {
         let styled = theme::muted(delta);
         self.record_output(&styled);
         self.streaming_active = true;
-        print!("{}", styled);
-        let _ = io::stdout().flush();
+        out_raw!("{}", styled);
     }
 
-    /// Finalize streaming — print a newline and reset state.
+    /// Finalize streaming — commit the partial row and reset state.
     pub fn finalize_stream(&mut self) {
         if !self.streaming_active {
             return;
         }
         self.streaming_active = false;
-        println!("\x1b[0m");
+        out_line!("\x1b[0m");
     }
 
     /// Reset state (call at GenerationStart).
@@ -398,7 +440,7 @@ impl ShellRenderer {
     /// Print a blank line as a visual spacer between content blocks.
     pub fn render_separator(&mut self) {
         self.record_output("\r\n");
-        println!();
+        out_line!("");
         let _ = std::io::stdout().flush();
     }
 }

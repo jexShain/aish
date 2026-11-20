@@ -647,17 +647,53 @@ fn ui_v2_requested(cli: &Cli) -> bool {
     !internal_entry
 }
 
-/// Run the v2 REPL; `false` means "fall back to the legacy shell".
+/// Whether the v2 UI was requested by this invocation.
+///
+/// Set once in `main` from [`ui_v2_requested`]: the decision needs the parsed
+/// CLI (hidden entry points must never be diverted), but it is acted on only
+/// after the config was loaded and the shell built, so a fallback to the legacy
+/// loop is a plain `false` rather than a restart.
+static UI_V2_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the v2 shell should run right now.
 ///
 /// A missing terminal is not an error the user can act on by retrying, so it is
 /// reported as a one-line hint and the legacy path takes over — never a panic
 /// and never a REPL that reads a pipe forever.
-fn try_ui_v2() -> bool {
+fn ui_v2_ready() -> bool {
+    if !UI_V2_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         eprintln!("aish: AISH_UI=v2 needs a terminal on stdin and stdout; using the legacy shell");
         return false;
     }
-    match aish_tui::repl::run_standalone(UI_V2_PROMPT, aish_tui::repl::default_history_path()) {
+    true
+}
+
+/// Drive `shell` from the dual-channel REPL; `false` means "fall back".
+///
+/// Every submitted line goes through [`aish_shell::AishShell::process_line`] —
+/// the same classification and execution path the legacy readline loop uses —
+/// so the two front ends cannot drift. Product output reaches the terminal
+/// through the REPL's queue sink, which is why a background LLM stream cannot
+/// tear a frame.
+fn run_ui_v2(shell: &mut aish_shell::AishShell) -> bool {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("aish: AISH_UI=v2 runtime failed ({err}); using the legacy shell");
+            return false;
+        }
+    };
+    let history_path = aish_tui::repl::default_history_path();
+    match aish_tui::run_shell_repl(UI_V2_PROMPT, history_path, |line| {
+        if shell.process_line(line, &runtime) {
+            aish_tui::ReplAction::Exit
+        } else {
+            aish_tui::ReplAction::Continue
+        }
+    }) {
         Ok(()) => true,
         Err(err) => {
             eprintln!("aish: AISH_UI=v2 REPL failed ({err}); using the legacy shell");
@@ -669,12 +705,11 @@ fn try_ui_v2() -> bool {
 fn main() {
     let cli = Cli::parse();
 
-    // AISH_UI=v2: hand the process to the dual-channel REPL before anything
-    // else touches config, logging or the legacy shell loop. Every failure
-    // path (no tty, REPL error) falls through to the unchanged legacy launch.
-    if ui_v2_requested(&cli) && try_ui_v2() {
-        return;
-    }
+    // AISH_UI=v2: remember the decision now, while the parsed CLI is still in
+    // hand (the hidden entry points must never be diverted). It is acted on
+    // once the config is loaded and the shell exists, so every failure path
+    // falls through to the unchanged legacy launch.
+    UI_V2_ACTIVE.store(ui_v2_requested(&cli), std::sync::atomic::Ordering::SeqCst);
 
     let config_path = cli.config.clone();
     // Record the explicit --config for the welcome panel ("config:" line)
@@ -2154,6 +2189,13 @@ fn run_shell_normal(mut config: aish_config::ConfigModel) {
     }
     match aish_shell::AishShell::new(config, config_source.as_deref()) {
         Ok(mut shell) => {
+            // AISH_UI=v2: the dual-channel REPL drives the same shell through
+            // `process_line`. A failure leaves the shell untouched and falls
+            // through to the legacy loop below.
+            if ui_v2_ready() && run_ui_v2(&mut shell) {
+                shell.shutdown();
+                return;
+            }
             if let Err(e) = shell.run() {
                 shell.shutdown();
                 eprintln!("Shell error: {}", e);

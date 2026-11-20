@@ -16,6 +16,7 @@
 
 pub mod ai_handler;
 pub mod animation;
+#[macro_use]
 pub mod app;
 pub mod autosuggest;
 pub mod commands;

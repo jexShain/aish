@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Dual-channel (history + viewport) terminal renderer for aish"
 
 [dependencies]
+aish-supervisor.workspace = true
 crossterm.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true

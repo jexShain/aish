@@ -595,10 +595,10 @@ pub fn default_history_path() -> Option<PathBuf> {
 /// Every terminal mode the REPL changes is restored here, including on a panic
 /// (which unwinds through this guard) — a REPL that leaves the tty in raw mode
 /// makes the parent shell unusable.
-struct TerminalGuard;
+pub(crate) struct TerminalGuard;
 
 impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
+    pub(crate) fn enter() -> io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         Ok(Self)
     }
@@ -664,7 +664,7 @@ const SCAN_CAP: usize = 20_000;
 /// The cap keeps the *shortest* names: that is where the heavily used commands
 /// live (`ls`, `cd`, `git`), and a cutoff by directory order would drop them
 /// for whichever packages happened to be read last.
-fn demo_words() -> Vec<String> {
+pub(crate) fn demo_words() -> Vec<String> {
     let mut words = vec![
         "/help".to_string(),
         "/exit".to_string(),

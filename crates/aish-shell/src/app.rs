@@ -35,6 +35,39 @@ use crate::security_panel::{build_security_panel, security_panel_rows, security_
 use crate::theme;
 use crate::types::ShellState;
 
+/// Emit one finished line through the global sink (frame-safe).
+///
+/// The sink appends the newline, so this is `println!` with the guarantee that
+/// the row is committed as one atomic history write. With no sink installed
+/// [`aish_tui::global_sink`] hands out a [`aish_tui::StdoutSink`], which is
+/// byte-for-byte the legacy `println!` behavior.
+macro_rules! out_line {
+    ($($arg:tt)*) => {
+        aish_tui::global_sink().line(&format!($($arg)*))
+    };
+}
+
+/// Emit a raw fragment (streaming deltas) through the global sink.
+///
+/// Unlike [`out_line`] no newline is appended: the sink buffers the fragment
+/// and commits it when a `\n` arrives or the producer calls `flush_raw`.
+macro_rules! out_raw {
+    ($($arg:tt)*) => {
+        aish_tui::global_sink().raw(&format!($($arg)*))
+    };
+}
+
+/// Whether the installed sink writes straight to stdout.
+///
+/// Cursor-motion tricks (moving up over an already painted overlay) are only
+/// meaningful on that path: a queued sink owns no cursor position, so the
+/// overlay is re-emitted as plain rows instead.
+fn sink_is_stdout() -> bool {
+    aish_tui::global_sink()
+        .as_any()
+        .is::<aish_tui::StdoutSink>()
+}
+
 /// Format prompt + command as displayed after Enter (without trailing newline).
 fn format_user_submitted_line(prompt: &str, command: &str) -> String {
     format!("{prompt}{command}")
@@ -2002,12 +2035,19 @@ impl AishShell {
                 let clear_reasoning = || {
                     let prev = reasoning_lines_displayed_ref.swap(0, Ordering::SeqCst);
                     if prev > 0 {
-                        print!("\x1b[{}A", prev);
-                        for _ in 0..prev {
-                            print!("\r\x1b[K\n");
+                        if sink_is_stdout() {
+                            print!("\x1b[{}A", prev);
+                            for _ in 0..prev {
+                                print!("\r\x1b[K\n");
+                            }
+                            print!("\x1b[{}A", prev);
+                            let _ = io::stdout().flush();
+                        } else {
+                            // No cursor to move: the overlay rows are already
+                            // history, so blanking them would erase output.
+                            // Drop the buffered partially painted row instead.
+                            aish_tui::global_sink().flush_raw();
                         }
-                        print!("\x1b[{}A", prev);
-                        let _ = io::stdout().flush();
                     }
                     reasoning_active_ref.store(false, Ordering::SeqCst);
                 };
@@ -2076,7 +2116,7 @@ impl AishShell {
                         if ttft >= 0.1 {
                             let mut ttft_args = std::collections::HashMap::new();
                             ttft_args.insert("time".to_string(), format!("{:.1}", ttft));
-                            println!(
+                            out_line!(
                                 "{}",
                                 theme::faint(&aish_i18n::t_with_args(
                                     "shell.thinking_time",
@@ -2096,7 +2136,7 @@ impl AishShell {
                         animation_ref.stop();
                         if !compaction_notice_shown_ref.swap(true, Ordering::SeqCst) {
                             if let Some(message) = context_compaction_notice(&event) {
-                                println!("{}", theme::faint(&message));
+                                out_line!("{}", theme::faint(&message));
                             }
                         }
                     }
@@ -2177,7 +2217,7 @@ impl AishShell {
                                         &shared_recorder_cb,
                                         &ai_prefix,
                                     );
-                                    print!("{}", ai_prefix);
+                                    out_raw!("{}", ai_prefix);
                                 }
                                 // Accumulate delta and print raw text
                                 renderer_ref.lock().unwrap().append_delta(delta);
@@ -2195,6 +2235,16 @@ impl AishShell {
                         if let Some(delta) = event.data.get("delta").and_then(|d| d.as_str()) {
                             if !delta.is_empty() {
                                 animation_ref.stop();
+                                // A queued sink has no cursor to move up, so
+                                // the in-place spinner overlay cannot be
+                                // repainted. Stream the reasoning text
+                                // instead: the sink buffers the unterminated
+                                // tail and commits each finished row once.
+                                if !sink_is_stdout() {
+                                    out_raw!("{}", delta);
+                                    reasoning_active_ref.store(true, Ordering::SeqCst);
+                                    return None;
+                                }
                                 let mut buf = reasoning_buf_ref.lock().unwrap();
                                 buf.push_str(delta);
 
@@ -2340,7 +2390,7 @@ impl AishShell {
                             }
                             // Ensure we're on a fresh line after content streaming
                             if content_started_flag.load(Ordering::SeqCst) {
-                                println!();
+                                out_line!("");
                             }
                             let tool_line =
                                 if let Some(ctx) = crate::llm_event_ui::sub_agent_context(&event) {
@@ -2363,7 +2413,7 @@ impl AishShell {
                                 &shared_recorder_cb,
                                 &format!("{}\n", tool_line),
                             );
-                            println!("{}", tool_line);
+                            out_line!("{}", tool_line);
                             let _ = io::stdout().flush();
                             // Start progress spinner for non-interactive tools.
                             // Skip animation when the tool needs interactive
@@ -2485,7 +2535,7 @@ impl AishShell {
                                         &shared_recorder_cb,
                                         &preview_ansi,
                                     );
-                                    print!("{}", preview_ansi);
+                                    out_raw!("{}", preview_ansi);
                                     let _ = io::stdout().flush();
                                     // Only record to expand history when output is
                                     // actually collapsed (total_lines > 2).
@@ -2546,7 +2596,7 @@ impl AishShell {
                                     &shared_recorder_cb,
                                     &checklist_ansi,
                                 );
-                                print!("{}", checklist_ansi);
+                                out_raw!("{}", checklist_ansi);
                                 let _ = io::stdout().flush();
                             }
                         }
@@ -2573,7 +2623,7 @@ impl AishShell {
                                                 .map(|l| format!("{}   {}", rail, l))
                                                 .collect::<Vec<_>>()
                                                 .join("\n");
-                                            println!("{}", diff_ansi);
+                                            out_raw!("{}", diff_ansi);
                                             let _ = io::stdout().flush();
                                         }
                                     }
@@ -2603,7 +2653,7 @@ impl AishShell {
                                 &shared_recorder_cb,
                                 &format!("{}\n", status_line),
                             );
-                            println!("{}", status_line);
+                            out_line!("{}", status_line);
                             let _ = io::stdout().flush();
                         }
                     }
@@ -2640,7 +2690,7 @@ impl AishShell {
                             .and_then(|p| p.as_str())
                             .unwrap_or("");
                         if !prompt_text.is_empty() {
-                            println!("{}", theme::accent(prompt_text));
+                            out_line!("{}", theme::accent(prompt_text));
                         }
                     }
                     _ => {}
@@ -3264,14 +3314,14 @@ impl AishShell {
                         let new_phase = self.ai_handler.toggle_plan_mode(&self.session_uuid);
                         match new_phase {
                             aish_core::PlanPhase::Planning => {
-                                println!(
+                                out_line!(
                                     "{}",
                                     theme::bold(&theme::warning(&t("shell.plan_mode_enabled")))
                                 );
-                                println!("{}", theme::faint(&t("shell.plan_mode_hint")));
+                                out_line!("{}", theme::faint(&t("shell.plan_mode_hint")));
                             }
                             aish_core::PlanPhase::Normal => {
-                                println!("{}", theme::warning(&t("shell.plan_mode_disabled")));
+                                out_line!("{}", theme::warning(&t("shell.plan_mode_disabled")));
                             }
                         }
                         continue;
@@ -3367,512 +3417,8 @@ impl AishShell {
             };
             let input = input.trim();
 
-            if input.is_empty() {
-                continue;
-            }
-
-            // The user reached a real command: the upgrade changelog summary
-            // (if any) has now been on screen, so its marker can advance.
-            // Transient launches that exit before this point stay pending.
-            if let Some(v) = self.pending_changelog_marker.take() {
-                prompt::commit_last_changelog_version(&v);
-            }
-
-            // Add to history
-            self.state.history.push(input.to_string());
-
-            // Reset streamed-content flag before each AI call
-            self.streamed_content.store(false, Ordering::SeqCst);
-
-            // Classify and route
-            match input::classify_input(input) {
-                crate::types::InputIntent::Empty => {}
-                crate::types::InputIntent::Ai => {
-                    let mut question = input::extract_ai_question(input);
-
-                    // If just ";" with no question and there's a pending error,
-                    // trigger error correction instead of a normal AI query.
-                    if question.is_empty() && self.state.can_correct_error {
-                        crate::recorder::shared_record_input(&self.shared_recorder, ";\n");
-                        if let Some(ref cmd) = self.state.last_command.clone() {
-                            // Spawn-only turn: no main-session OpStart will
-                            // re-sync op_gen, so keep the generation unchanged
-                            // or every sub-agent progress event is rejected.
-                            let old_sigint = self.install_ai_sigint_handler_opts(false);
-                            let mut esc_watcher = CrosstermEscWatcher::start(
-                                self.ai_handler.cancellation_token_arc(),
-                            );
-                            let token_ptr =
-                                self.ai_handler.cancellation_token() as *const CancellationToken;
-                            // Redact secrets before the failed command and its
-                            // output enter the diagnosis prompt.
-                            let (safe_cmd, _) =
-                                self.secret_vault.lock().unwrap().redact_output(cmd);
-                            let (safe_output, _) = self
-                                .secret_vault
-                                .lock()
-                                .unwrap()
-                                .redact_output(&self.state.last_output);
-                            let exit_code = self.state.last_exit_code;
-                            let result = runtime.block_on(async {
-                                tokio::select! {
-                                    r = self.ai_handler.handle_error_correction(
-                                        &safe_cmd,
-                                        exit_code,
-                                        &safe_output,
-                                    ) => r,
-                                    _ = poll_cancelled(token_ptr) => {
-                                        Err(aish_core::AishError::Cancelled)
-                                    }
-                                }
-                            });
-                            esc_watcher.stop();
-                            Self::restore_ai_sigint_handler(old_sigint);
-
-                            match result {
-                                Ok(correction) => {
-                                    match &correction.command {
-                                        Some(corrected) if corrected.trim() == safe_cmd.trim() => {
-                                            // Issue #545: the model echoed the
-                                            // original failed command back as the
-                                            // "fix". Re-running a command that
-                                            // just failed unchanged is never a fix.
-                                            // Compare against `safe_cmd` (the
-                                            // redacted form the AI actually saw)
-                                            // — otherwise a command containing a
-                                            // secret placeholder never matches and
-                                            // the guard silently fails for exactly
-                                            // the commands most likely to need it.
-                                            let warn_line = theme::warning(&format!(
-                                                "\u{26a0} {}",
-                                                t("shell.error_correction.same_as_failed")
-                                            ));
-                                            println!("{}", warn_line);
-                                            crate::recorder::shared_record_output(
-                                                &self.shared_recorder,
-                                                &format!("{}\r\n", warn_line),
-                                            );
-                                            self.state.can_correct_error = false;
-                                        }
-                                        Some(corrected) => {
-                                            // Display corrected command and description
-                                            let corrected_line = format!(
-                                                "{} {}",
-                                                t("shell.error_correction.corrected_command_title"),
-                                                theme::accent(&theme::bold(corrected))
-                                            );
-                                            println!("{}", corrected_line);
-                                            crate::recorder::shared_record_output(
-                                                &self.shared_recorder,
-                                                &format!("{}\r\n", corrected_line),
-                                            );
-                                            if let Some(ref desc) = correction.description {
-                                                if !desc.is_empty() {
-                                                    println!("   {}", desc);
-                                                    crate::recorder::shared_record_output(
-                                                        &self.shared_recorder,
-                                                        &format!("   {}\r\n", desc),
-                                                    );
-                                                }
-                                            }
-                                            // Ask user confirmation: Y/n
-                                            let prompt = format!(
-                                                "{}{}{}",
-                                                t("shell.error_correction.confirm_execute_prefix"),
-                                                theme::accent(&theme::bold(corrected)),
-                                                t("shell.error_correction.confirm_execute_suffix")
-                                            );
-                                            print!("{}", prompt);
-                                            crate::recorder::shared_record_output(
-                                                &self.shared_recorder,
-                                                &prompt,
-                                            );
-                                            let _ = std::io::stdout().flush();
-                                            let mut answer = String::new();
-                                            if std::io::stdin().read_line(&mut answer).is_err() {
-                                                continue;
-                                            }
-                                            crate::recorder::shared_record_input(
-                                                &self.shared_recorder,
-                                                &answer,
-                                            );
-                                            let answer = answer.trim().to_lowercase();
-                                            if answer == "y" || answer == "yes" || answer.is_empty()
-                                            {
-                                                // InputGuard: AI-corrected commands must
-                                                // clear the same gate as user-typed ones,
-                                                // even after the Y/n approval above.
-                                                if self.screen_shell_command(corrected) {
-                                                    let exit_code =
-                                                        self.execute_external_command(corrected);
-                                                    self.record_history(corrected, exit_code);
-                                                }
-                                            }
-                                            self.state.can_correct_error = false;
-                                        }
-                                        None => {
-                                            // No valid command, show description if available
-                                            let warn_line = theme::warning(&format!(
-                                                "\u{26a0} {}",
-                                                t("shell.error_correction.no_valid_command")
-                                            ));
-                                            println!("{}", warn_line);
-                                            crate::recorder::shared_record_output(
-                                                &self.shared_recorder,
-                                                &format!("{}\r\n", warn_line),
-                                            );
-                                            if let Some(ref desc) = correction.description {
-                                                let clean = desc
-                                                    .split("Insufficient context")
-                                                    .next()
-                                                    .unwrap_or(desc)
-                                                    .trim();
-                                                if !clean.is_empty() {
-                                                    println!("   {}", clean);
-                                                    crate::recorder::shared_record_output(
-                                                        &self.shared_recorder,
-                                                        &format!("   {}\r\n", clean),
-                                                    );
-                                                }
-                                            }
-                                            let hint_line = format!(
-                                                "   {}",
-                                                theme::accent(&t(
-                                                    "shell.error_correction.retry_hint"
-                                                ))
-                                            );
-                                            println!("{}", hint_line);
-                                            crate::recorder::shared_record_output(
-                                                &self.shared_recorder,
-                                                &format!("{}\r\n", hint_line),
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(aish_core::AishError::Cancelled) => {
-                                    self.animation.stop();
-                                    self.sub_agent_animation.stop();
-                                    crate::recorder::shared_record_output(
-                                        &self.shared_recorder,
-                                        &format!("{}\r\n", theme::warning("Interrupted")),
-                                    );
-                                    println!("{}", theme::warning("Interrupted"));
-                                }
-                                Err(e) => {
-                                    self.animation.stop();
-                                    // Errors are already displayed via the LlmEventType::Error
-                                    // event callback — avoid printing twice. Only handle
-                                    // non-LLM errors that bypass the event system.
-                                    if !matches!(
-                                        e,
-                                        aish_core::AishError::Llm(_)
-                                            | aish_core::AishError::IterationLimit
-                                            | aish_core::AishError::EmptyResponse
-                                            | aish_core::AishError::IncompleteResponse
-                                    ) {
-                                        let msg = t("shell.error.llm_error_message")
-                                            .replace("{error}", &e.to_string());
-                                        eprintln!("{}", theme::error(&msg));
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                    }
-
-                    // InputGuard pre-check for AI prompts
-                    if !self.screen_ai_prompt(&question) {
-                        continue;
-                    }
-
-                    // Security gate: detect secrets in AI input
-                    if !self.check_security_gate(&mut question) {
-                        continue;
-                    }
-
-                    // Record sanitized user input after security check passes.
-                    // Use the original prefix (; or ；) so the cast replay shows
-                    // the AI trigger character.
-                    let ai_prefix = if input.starts_with('\u{ff1b}') {
-                        "\u{ff1b}"
-                    } else {
-                        ";"
-                    };
-                    crate::recorder::shared_record_input(
-                        &self.shared_recorder,
-                        &format!("{}{}\n", ai_prefix, question),
-                    );
-
-                    let old_sigint = self.install_ai_sigint_handler();
-                    let mut esc_watcher =
-                        CrosstermEscWatcher::start(self.ai_handler.cancellation_token_arc());
-                    let token_ptr =
-                        self.ai_handler.cancellation_token() as *const CancellationToken;
-                    let ai_start = std::time::Instant::now();
-                    let result = runtime.block_on(async {
-                        tokio::select! {
-                            r = self.ai_handler.handle_question(&question) => r,
-                            _ = poll_cancelled(token_ptr) => {
-                                Err(aish_core::AishError::Cancelled)
-                            }
-                        }
-                    });
-                    let ai_elapsed = ai_start.elapsed().as_secs_f64();
-                    esc_watcher.stop();
-                    Self::restore_ai_sigint_handler(old_sigint);
-                    self.sync_state_from_pty_cwd();
-
-                    let did_stream = self.streamed_content.load(Ordering::SeqCst);
-
-                    match result {
-                        Ok(response) => {
-                            if self.ai_handler.cancellation_token().is_cancelled() {
-                                self.sub_agent_animation.stop();
-                                // Agent short-circuit cancel returns Ok("") — show the same
-                                // user-facing line as Err(Cancelled). Do not treat as success
-                                // (no plan approval / history-as-ok).
-                                println!("{}", theme::warning(&t("shell.interrupted")));
-                            } else {
-                                if !did_stream && !response.trim().is_empty() {
-                                    // Non-streaming fallback: print full response with formatting
-                                    let mut sep_renderer = ShellRenderer::new();
-                                    sep_renderer.set_shared_recorder(self.shared_recorder.clone());
-                                    sep_renderer.render_separator();
-                                    print_md_with_recording(&response, &self.shared_recorder);
-                                    sep_renderer.render_separator();
-                                } else if did_stream {
-                                    // Streaming display already handled by event callback
-                                    // No additional output needed here.
-                                }
-
-                                // Fold auxiliary sessions' reported usage
-                                // (SSH followups / remote queries) into the
-                                // main totals so the footer shows real
-                                // consumption.
-                                let mut stats = self.ai_handler.session_token_stats();
-                                {
-                                    let aux = self
-                                        .auxiliary_usage
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner());
-                                    stats.merge_totals(&aux);
-                                }
-                                // oh-my-pi anchors the status-line context% on
-                                // the provider's real prompt-token count (actual
-                                // wire consumption of this request); the local
-                                // bytes/4 estimate is only the fallback.
-                                let ctx_tokens = if stats.last_prompt_tokens > 0 {
-                                    stats.last_prompt_tokens
-                                } else {
-                                    self.ai_handler.last_prompt_estimate()
-                                };
-                                let ctx_window = self.ai_handler.context_window_tokens() as u64;
-                                let ctx_percent = ctx_tokens
-                                    .checked_mul(100)
-                                    .and_then(|v| v.checked_div(ctx_window))
-                                    .unwrap_or(0)
-                                    .min(100)
-                                    as u8;
-                                let compaction = self.ai_handler.last_turn_compaction();
-                                let footer = theme::response_footer(
-                                    &self.config.model,
-                                    stats.total_tokens(),
-                                    stats.total_output,
-                                    ctx_percent,
-                                    ctx_window,
-                                    compaction,
-                                    Some(ai_elapsed),
-                                );
-                                crate::recorder::shared_record_output(
-                                    &self.shared_recorder,
-                                    &format!("{}\n", footer),
-                                );
-                                println!("{}", footer);
-                                let _ = std::io::stdout().flush();
-
-                                self.persist_session_snapshot();
-
-                                self.review_pending_plan();
-
-                                self.record_history(input, 0);
-                            }
-                        }
-                        Err(aish_core::AishError::Cancelled) => {
-                            self.animation.stop();
-                            self.sub_agent_animation.stop();
-                            println!("{}", theme::warning(&t("shell.interrupted")));
-                        }
-                        Err(e) => {
-                            if !matches!(
-                                e,
-                                aish_core::AishError::Llm(_)
-                                    | aish_core::AishError::IterationLimit
-                                    | aish_core::AishError::EmptyResponse
-                                    | aish_core::AishError::IncompleteResponse
-                            ) {
-                                let msg = t("shell.error.llm_error_message")
-                                    .replace("{error}", &e.to_string());
-                                eprintln!("{}", theme::error(&msg));
-                            }
-                            // Issue #452: if the failure happened mid-turn
-                            // after tools ran, the partial evidence was just
-                            // committed to the context — tell the user it
-                            // survived and persist the snapshot to disk.
-                            self.report_partial_turn_saved();
-                            self.record_history(input, 1);
-                        }
-                    }
-                }
-                crate::types::InputIntent::Help => {
-                    let result = self.state.handle_builtin("help", &[]);
-                    if let Some(output) = result.output {
-                        println!("{}", output);
-                        if !output.is_empty() {
-                            crate::recorder::shared_record_output(
-                                &self.shared_recorder,
-                                &format!("{}\n", output),
-                            );
-                        }
-                    }
-                    self.record_history(input, 0);
-                }
-                crate::types::InputIntent::BuiltinCommand => {
-                    if self.dispatch_builtin_line(input) {
-                        break;
-                    }
-                }
-                crate::types::InputIntent::SpecialCommand => {
-                    if self.handle_special_command(input) {
-                        self.record_history(input, 0);
-                    }
-                }
-                crate::types::InputIntent::OperatorCommand | crate::types::InputIntent::Command => {
-                    // NL detection runs BEFORE shell screening. Otherwise
-                    // NL-looking input like "how do I kill a process?" would
-                    // hit shell Confirm rules (kill) before the user gets a
-                    // chance to route it to AI, where Confirm rules are
-                    // intentionally skipped.
-                    let nl_verdict = crate::nl_detect::detect(input);
-                    if nl_verdict.is_natural_language {
-                        let prompt_msg = t("shell.nl_detection.confirm_ask_ai");
-                        print!("{} ", prompt_msg);
-                        let _ = std::io::stdout().flush();
-                        let mut answer = String::new();
-                        if std::io::stdin().read_line(&mut answer).is_err() {
-                            // Fall through to command execution on read error
-                        } else {
-                            let ans = answer.trim().to_lowercase();
-                            if ans != "n" && ans != "no" {
-                                // Route to AI
-                                let mut question = input.trim().to_string();
-
-                                // Record user input for cast file
-                                crate::recorder::shared_record_input(
-                                    &self.shared_recorder,
-                                    &format!("{}\n", question),
-                                );
-
-                                // InputGuard pre-check for NL-routed AI input
-                                if !self.screen_ai_prompt(input) {
-                                    continue;
-                                }
-
-                                // Security gate: same secret check as the normal AI path
-                                if !self.check_security_gate(&mut question) {
-                                    continue;
-                                }
-
-                                let old_sigint = self.install_ai_sigint_handler();
-                                let mut esc_watcher = CrosstermEscWatcher::start(
-                                    self.ai_handler.cancellation_token_arc(),
-                                );
-                                let token_ptr = self.ai_handler.cancellation_token()
-                                    as *const CancellationToken;
-                                let result = runtime.block_on(async {
-                                    tokio::select! {
-                                        r = self.ai_handler.handle_question(&question) => r,
-                                        _ = poll_cancelled(token_ptr) => {
-                                            Err(aish_core::AishError::Cancelled)
-                                        }
-                                    }
-                                });
-                                esc_watcher.stop();
-                                Self::restore_ai_sigint_handler(old_sigint);
-                                self.sync_state_from_pty_cwd();
-
-                                let did_stream = self.streamed_content.load(Ordering::SeqCst);
-                                match result {
-                                    Ok(response) => {
-                                        if self.ai_handler.cancellation_token().is_cancelled() {
-                                            self.sub_agent_animation.stop();
-                                            // Same as Err(Cancelled): do not persist/history as success.
-                                            println!("{}", theme::warning(&t("shell.interrupted")));
-                                        } else {
-                                            if !did_stream && !response.trim().is_empty() {
-                                                let mut sep_renderer = ShellRenderer::new();
-                                                sep_renderer.set_shared_recorder(
-                                                    self.shared_recorder.clone(),
-                                                );
-                                                sep_renderer.render_separator();
-                                                print_md_with_recording(
-                                                    &response,
-                                                    &self.shared_recorder,
-                                                );
-                                                sep_renderer.render_separator();
-                                            }
-                                            self.persist_session_snapshot();
-                                            // Plan review first: the approval
-                                            // prompt needs the finished turn.
-                                            self.review_pending_plan();
-                                            self.record_history(input, 0);
-                                        }
-                                    }
-                                    Err(aish_core::AishError::Cancelled) => {
-                                        self.animation.stop();
-                                        self.sub_agent_animation.stop();
-                                        println!("{}", theme::warning(&t("shell.interrupted")));
-                                    }
-                                    Err(e) => {
-                                        if !matches!(
-                                            e,
-                                            aish_core::AishError::Llm(_)
-                                                | aish_core::AishError::IterationLimit
-                                                | aish_core::AishError::EmptyResponse
-                                                | aish_core::AishError::IncompleteResponse
-                                        ) {
-                                            let msg = t("shell.error.llm_error_message")
-                                                .replace("{error}", &e.to_string());
-                                            eprintln!("{}", theme::error(&msg));
-                                        }
-                                        self.report_partial_turn_saved();
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                    }
-
-                    // InputGuard pre-check for the (now confirmed) shell
-                    // execution path. NL routing above already ran the AI
-                    // variant; we only get here when the input will really
-                    // execute as a shell command.
-                    if !self.screen_shell_command(input) {
-                        continue;
-                    }
-
-                    self.set_phase(ShellPhase::Running);
-                    let exit_code = self.execute_external_command(input);
-                    self.set_phase(ShellPhase::Editing);
-                    self.record_history(input, exit_code);
-                    self.reset_interruption();
-
-                    self.track_command_failure_state(input, exit_code);
-                }
-                crate::types::InputIntent::ScriptCall => {
-                    let exit_code = self.execute_script(input);
-                    self.record_history(input, exit_code);
-                    self.track_command_failure_state(input, exit_code);
-                }
+            if self.process_line(input, &runtime) {
+                break;
             }
         }
 
@@ -3928,6 +3474,523 @@ impl AishShell {
         self.shutdown();
 
         Ok(())
+    }
+
+    /// Process one submitted line. Returns `true` when the shell should exit.
+    ///
+    /// `run` calls this for every line its rustyline reader accepts; the
+    /// dual-channel TUI builds its own editor and calls this directly, so both
+    /// front ends share one classification and execution path.
+    ///
+    /// Popup handling (`/` fill, `@` file mention) stays on the legacy path: the
+    /// new editor has its own completion menu, so a submitted line goes straight
+    /// to classification and the builtin handlers take it from there.
+    pub fn process_line(&mut self, input: &str, runtime: &tokio::runtime::Runtime) -> bool {
+        let input = input.trim();
+
+        if input.is_empty() {
+            return false;
+        }
+
+        // The user reached a real command: the upgrade changelog summary
+        // (if any) has now been on screen, so its marker can advance.
+        // Transient launches that exit before this point stay pending.
+        if let Some(v) = self.pending_changelog_marker.take() {
+            prompt::commit_last_changelog_version(&v);
+        }
+
+        // Add to history
+        self.state.history.push(input.to_string());
+
+        // Reset streamed-content flag before each AI call
+        self.streamed_content.store(false, Ordering::SeqCst);
+
+        // Classify and route
+        match input::classify_input(input) {
+            crate::types::InputIntent::Empty => {}
+            crate::types::InputIntent::Ai => {
+                let mut question = input::extract_ai_question(input);
+
+                // If just ";" with no question and there's a pending error,
+                // trigger error correction instead of a normal AI query.
+                if question.is_empty() && self.state.can_correct_error {
+                    crate::recorder::shared_record_input(&self.shared_recorder, ";\n");
+                    if let Some(ref cmd) = self.state.last_command.clone() {
+                        // Spawn-only turn: no main-session OpStart will
+                        // re-sync op_gen, so keep the generation unchanged
+                        // or every sub-agent progress event is rejected.
+                        let old_sigint = self.install_ai_sigint_handler_opts(false);
+                        let mut esc_watcher =
+                            CrosstermEscWatcher::start(self.ai_handler.cancellation_token_arc());
+                        let token_ptr =
+                            self.ai_handler.cancellation_token() as *const CancellationToken;
+                        // Redact secrets before the failed command and its
+                        // output enter the diagnosis prompt.
+                        let (safe_cmd, _) = self.secret_vault.lock().unwrap().redact_output(cmd);
+                        let (safe_output, _) = self
+                            .secret_vault
+                            .lock()
+                            .unwrap()
+                            .redact_output(&self.state.last_output);
+                        let exit_code = self.state.last_exit_code;
+                        let result = runtime.block_on(async {
+                            tokio::select! {
+                                r = self.ai_handler.handle_error_correction(
+                                    &safe_cmd,
+                                    exit_code,
+                                    &safe_output,
+                                ) => r,
+                                _ = poll_cancelled(token_ptr) => {
+                                    Err(aish_core::AishError::Cancelled)
+                                }
+                            }
+                        });
+                        esc_watcher.stop();
+                        Self::restore_ai_sigint_handler(old_sigint);
+
+                        match result {
+                            Ok(correction) => {
+                                match &correction.command {
+                                    Some(corrected) if corrected.trim() == safe_cmd.trim() => {
+                                        // Issue #545: the model echoed the
+                                        // original failed command back as the
+                                        // "fix". Re-running a command that
+                                        // just failed unchanged is never a fix.
+                                        // Compare against `safe_cmd` (the
+                                        // redacted form the AI actually saw)
+                                        // — otherwise a command containing a
+                                        // secret placeholder never matches and
+                                        // the guard silently fails for exactly
+                                        // the commands most likely to need it.
+                                        let warn_line = theme::warning(&format!(
+                                            "\u{26a0} {}",
+                                            t("shell.error_correction.same_as_failed")
+                                        ));
+                                        out_line!("{}", warn_line);
+                                        crate::recorder::shared_record_output(
+                                            &self.shared_recorder,
+                                            &format!("{}\r\n", warn_line),
+                                        );
+                                        self.state.can_correct_error = false;
+                                    }
+                                    Some(corrected) => {
+                                        // Display corrected command and description
+                                        let corrected_line = format!(
+                                            "{} {}",
+                                            t("shell.error_correction.corrected_command_title"),
+                                            theme::accent(&theme::bold(corrected))
+                                        );
+                                        out_line!("{}", corrected_line);
+                                        crate::recorder::shared_record_output(
+                                            &self.shared_recorder,
+                                            &format!("{}\r\n", corrected_line),
+                                        );
+                                        if let Some(ref desc) = correction.description {
+                                            if !desc.is_empty() {
+                                                out_line!("   {}", desc);
+                                                crate::recorder::shared_record_output(
+                                                    &self.shared_recorder,
+                                                    &format!("   {}\r\n", desc),
+                                                );
+                                            }
+                                        }
+                                        // Ask user confirmation: Y/n
+                                        let prompt = format!(
+                                            "{}{}{}",
+                                            t("shell.error_correction.confirm_execute_prefix"),
+                                            theme::accent(&theme::bold(corrected)),
+                                            t("shell.error_correction.confirm_execute_suffix")
+                                        );
+                                        // No newline: the answer is read
+                                        // from stdin on the same row, so the
+                                        // fragment is flushed before blocking.
+                                        crate::recorder::shared_record_output(
+                                            &self.shared_recorder,
+                                            &prompt,
+                                        );
+                                        aish_tui::global_sink().raw(&prompt);
+                                        aish_tui::global_sink().flush_raw();
+                                        let mut answer = String::new();
+                                        if std::io::stdin().read_line(&mut answer).is_err() {
+                                            return false;
+                                        }
+                                        crate::recorder::shared_record_input(
+                                            &self.shared_recorder,
+                                            &answer,
+                                        );
+                                        let answer = answer.trim().to_lowercase();
+                                        if answer == "y" || answer == "yes" || answer.is_empty() {
+                                            // InputGuard: AI-corrected commands must
+                                            // clear the same gate as user-typed ones,
+                                            // even after the Y/n approval above.
+                                            if self.screen_shell_command(corrected) {
+                                                let exit_code =
+                                                    self.execute_external_command(corrected);
+                                                self.record_history(corrected, exit_code);
+                                            }
+                                        }
+                                        self.state.can_correct_error = false;
+                                    }
+                                    None => {
+                                        // No valid command, show description if available
+                                        let warn_line = theme::warning(&format!(
+                                            "\u{26a0} {}",
+                                            t("shell.error_correction.no_valid_command")
+                                        ));
+                                        out_line!("{}", warn_line);
+                                        crate::recorder::shared_record_output(
+                                            &self.shared_recorder,
+                                            &format!("{}\r\n", warn_line),
+                                        );
+                                        if let Some(ref desc) = correction.description {
+                                            let clean = desc
+                                                .split("Insufficient context")
+                                                .next()
+                                                .unwrap_or(desc)
+                                                .trim();
+                                            if !clean.is_empty() {
+                                                out_line!("   {}", clean);
+                                                crate::recorder::shared_record_output(
+                                                    &self.shared_recorder,
+                                                    &format!("   {}\r\n", clean),
+                                                );
+                                            }
+                                        }
+                                        let hint_line = format!(
+                                            "   {}",
+                                            theme::accent(&t("shell.error_correction.retry_hint"))
+                                        );
+                                        out_line!("{}", hint_line);
+                                        crate::recorder::shared_record_output(
+                                            &self.shared_recorder,
+                                            &format!("{}\r\n", hint_line),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(aish_core::AishError::Cancelled) => {
+                                self.animation.stop();
+                                self.sub_agent_animation.stop();
+                                crate::recorder::shared_record_output(
+                                    &self.shared_recorder,
+                                    &format!("{}\r\n", theme::warning("Interrupted")),
+                                );
+                                out_line!("{}", theme::warning("Interrupted"));
+                            }
+                            Err(e) => {
+                                self.animation.stop();
+                                // Errors are already displayed via the LlmEventType::Error
+                                // event callback — avoid printing twice. Only handle
+                                // non-LLM errors that bypass the event system.
+                                if !matches!(
+                                    e,
+                                    aish_core::AishError::Llm(_)
+                                        | aish_core::AishError::IterationLimit
+                                        | aish_core::AishError::EmptyResponse
+                                        | aish_core::AishError::IncompleteResponse
+                                ) {
+                                    let msg = t("shell.error.llm_error_message")
+                                        .replace("{error}", &e.to_string());
+                                    eprintln!("{}", theme::error(&msg));
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                }
+
+                // InputGuard pre-check for AI prompts
+                if !self.screen_ai_prompt(&question) {
+                    return false;
+                }
+
+                // Security gate: detect secrets in AI input
+                if !self.check_security_gate(&mut question) {
+                    return false;
+                }
+
+                // Record sanitized user input after security check passes.
+                // Use the original prefix (; or ；) so the cast replay shows
+                // the AI trigger character.
+                let ai_prefix = if input.starts_with('\u{ff1b}') {
+                    "\u{ff1b}"
+                } else {
+                    ";"
+                };
+                crate::recorder::shared_record_input(
+                    &self.shared_recorder,
+                    &format!("{}{}\n", ai_prefix, question),
+                );
+
+                let old_sigint = self.install_ai_sigint_handler();
+                let mut esc_watcher =
+                    CrosstermEscWatcher::start(self.ai_handler.cancellation_token_arc());
+                let token_ptr = self.ai_handler.cancellation_token() as *const CancellationToken;
+                let ai_start = std::time::Instant::now();
+                let result = runtime.block_on(async {
+                    tokio::select! {
+                        r = self.ai_handler.handle_question(&question) => r,
+                        _ = poll_cancelled(token_ptr) => {
+                            Err(aish_core::AishError::Cancelled)
+                        }
+                    }
+                });
+                let ai_elapsed = ai_start.elapsed().as_secs_f64();
+                esc_watcher.stop();
+                Self::restore_ai_sigint_handler(old_sigint);
+                self.sync_state_from_pty_cwd();
+
+                let did_stream = self.streamed_content.load(Ordering::SeqCst);
+
+                match result {
+                    Ok(response) => {
+                        if self.ai_handler.cancellation_token().is_cancelled() {
+                            self.sub_agent_animation.stop();
+                            // Agent short-circuit cancel returns Ok("") — show the same
+                            // user-facing line as Err(Cancelled). Do not treat as success
+                            // (no plan approval / history-as-ok).
+                            out_line!("{}", theme::warning(&t("shell.interrupted")));
+                        } else {
+                            if !did_stream && !response.trim().is_empty() {
+                                // Non-streaming fallback: print full response with formatting
+                                let mut sep_renderer = ShellRenderer::new();
+                                sep_renderer.set_shared_recorder(self.shared_recorder.clone());
+                                sep_renderer.render_separator();
+                                print_md_with_recording(&response, &self.shared_recorder);
+                                sep_renderer.render_separator();
+                            } else if did_stream {
+                                // Streaming display already handled by event callback
+                                // No additional output needed here.
+                            }
+
+                            // Fold auxiliary sessions' reported usage
+                            // (SSH followups / remote queries) into the
+                            // main totals so the footer shows real
+                            // consumption.
+                            let mut stats = self.ai_handler.session_token_stats();
+                            {
+                                let aux = self
+                                    .auxiliary_usage
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                stats.merge_totals(&aux);
+                            }
+                            // oh-my-pi anchors the status-line context% on
+                            // the provider's real prompt-token count (actual
+                            // wire consumption of this request); the local
+                            // bytes/4 estimate is only the fallback.
+                            let ctx_tokens = if stats.last_prompt_tokens > 0 {
+                                stats.last_prompt_tokens
+                            } else {
+                                self.ai_handler.last_prompt_estimate()
+                            };
+                            let ctx_window = self.ai_handler.context_window_tokens() as u64;
+                            let ctx_percent = ctx_tokens
+                                .checked_mul(100)
+                                .and_then(|v| v.checked_div(ctx_window))
+                                .unwrap_or(0)
+                                .min(100) as u8;
+                            let compaction = self.ai_handler.last_turn_compaction();
+                            let footer = theme::response_footer(
+                                &self.config.model,
+                                stats.total_tokens(),
+                                stats.total_output,
+                                ctx_percent,
+                                ctx_window,
+                                compaction,
+                                Some(ai_elapsed),
+                            );
+                            crate::recorder::shared_record_output(
+                                &self.shared_recorder,
+                                &format!("{}\n", footer),
+                            );
+                            out_line!("{}", footer);
+                            let _ = std::io::stdout().flush();
+
+                            self.persist_session_snapshot();
+
+                            self.review_pending_plan();
+
+                            self.record_history(input, 0);
+                        }
+                    }
+                    Err(aish_core::AishError::Cancelled) => {
+                        self.animation.stop();
+                        self.sub_agent_animation.stop();
+                        out_line!("{}", theme::warning(&t("shell.interrupted")));
+                    }
+                    Err(e) => {
+                        if !matches!(
+                            e,
+                            aish_core::AishError::Llm(_)
+                                | aish_core::AishError::IterationLimit
+                                | aish_core::AishError::EmptyResponse
+                                | aish_core::AishError::IncompleteResponse
+                        ) {
+                            let msg = t("shell.error.llm_error_message")
+                                .replace("{error}", &e.to_string());
+                            eprintln!("{}", theme::error(&msg));
+                        }
+                        // Issue #452: if the failure happened mid-turn
+                        // after tools ran, the partial evidence was just
+                        // committed to the context — tell the user it
+                        // survived and persist the snapshot to disk.
+                        self.report_partial_turn_saved();
+                        self.record_history(input, 1);
+                    }
+                }
+            }
+            crate::types::InputIntent::Help => {
+                let result = self.state.handle_builtin("help", &[]);
+                if let Some(output) = result.output {
+                    out_line!("{}", output);
+                    if !output.is_empty() {
+                        crate::recorder::shared_record_output(
+                            &self.shared_recorder,
+                            &format!("{}\n", output),
+                        );
+                    }
+                }
+                self.record_history(input, 0);
+            }
+            crate::types::InputIntent::BuiltinCommand => {
+                if self.dispatch_builtin_line(input) {
+                    return true;
+                }
+            }
+            crate::types::InputIntent::SpecialCommand => {
+                if self.handle_special_command(input) {
+                    self.record_history(input, 0);
+                }
+            }
+            crate::types::InputIntent::OperatorCommand | crate::types::InputIntent::Command => {
+                // NL detection runs BEFORE shell screening. Otherwise
+                // NL-looking input like "how do I kill a process?" would
+                // hit shell Confirm rules (kill) before the user gets a
+                // chance to route it to AI, where Confirm rules are
+                // intentionally skipped.
+                let nl_verdict = crate::nl_detect::detect(input);
+                if nl_verdict.is_natural_language {
+                    let prompt_msg = t("shell.nl_detection.confirm_ask_ai");
+                    aish_tui::global_sink().raw(&format!("{} ", prompt_msg));
+                    aish_tui::global_sink().flush_raw();
+                    let mut answer = String::new();
+                    if std::io::stdin().read_line(&mut answer).is_err() {
+                        // Fall through to command execution on read error
+                    } else {
+                        let ans = answer.trim().to_lowercase();
+                        if ans != "n" && ans != "no" {
+                            // Route to AI
+                            let mut question = input.trim().to_string();
+
+                            // Record user input for cast file
+                            crate::recorder::shared_record_input(
+                                &self.shared_recorder,
+                                &format!("{}\n", question),
+                            );
+
+                            // InputGuard pre-check for NL-routed AI input
+                            if !self.screen_ai_prompt(input) {
+                                return false;
+                            }
+
+                            // Security gate: same secret check as the normal AI path
+                            if !self.check_security_gate(&mut question) {
+                                return false;
+                            }
+
+                            let old_sigint = self.install_ai_sigint_handler();
+                            let mut esc_watcher = CrosstermEscWatcher::start(
+                                self.ai_handler.cancellation_token_arc(),
+                            );
+                            let token_ptr =
+                                self.ai_handler.cancellation_token() as *const CancellationToken;
+                            let result = runtime.block_on(async {
+                                tokio::select! {
+                                    r = self.ai_handler.handle_question(&question) => r,
+                                    _ = poll_cancelled(token_ptr) => {
+                                        Err(aish_core::AishError::Cancelled)
+                                    }
+                                }
+                            });
+                            esc_watcher.stop();
+                            Self::restore_ai_sigint_handler(old_sigint);
+                            self.sync_state_from_pty_cwd();
+
+                            let did_stream = self.streamed_content.load(Ordering::SeqCst);
+                            match result {
+                                Ok(response) => {
+                                    if self.ai_handler.cancellation_token().is_cancelled() {
+                                        self.sub_agent_animation.stop();
+                                        // Same as Err(Cancelled): do not persist/history as success.
+                                        out_line!("{}", theme::warning(&t("shell.interrupted")));
+                                    } else {
+                                        if !did_stream && !response.trim().is_empty() {
+                                            let mut sep_renderer = ShellRenderer::new();
+                                            sep_renderer
+                                                .set_shared_recorder(self.shared_recorder.clone());
+                                            sep_renderer.render_separator();
+                                            print_md_with_recording(
+                                                &response,
+                                                &self.shared_recorder,
+                                            );
+                                            sep_renderer.render_separator();
+                                        }
+                                        self.persist_session_snapshot();
+                                        // Plan review first: the approval
+                                        // prompt needs the finished turn.
+                                        self.review_pending_plan();
+                                        self.record_history(input, 0);
+                                    }
+                                }
+                                Err(aish_core::AishError::Cancelled) => {
+                                    self.animation.stop();
+                                    self.sub_agent_animation.stop();
+                                    out_line!("{}", theme::warning(&t("shell.interrupted")));
+                                }
+                                Err(e) => {
+                                    if !matches!(
+                                        e,
+                                        aish_core::AishError::Llm(_)
+                                            | aish_core::AishError::IterationLimit
+                                            | aish_core::AishError::EmptyResponse
+                                            | aish_core::AishError::IncompleteResponse
+                                    ) {
+                                        let msg = t("shell.error.llm_error_message")
+                                            .replace("{error}", &e.to_string());
+                                        eprintln!("{}", theme::error(&msg));
+                                    }
+                                    self.report_partial_turn_saved();
+                                }
+                            }
+                            return false;
+                        }
+                    }
+                }
+
+                // InputGuard pre-check for the (now confirmed) shell
+                // execution path. NL routing above already ran the AI
+                // variant; we only get here when the input will really
+                // execute as a shell command.
+                if !self.screen_shell_command(input) {
+                    return false;
+                }
+
+                self.set_phase(ShellPhase::Running);
+                let exit_code = self.execute_external_command(input);
+                self.set_phase(ShellPhase::Editing);
+                self.record_history(input, exit_code);
+                self.reset_interruption();
+
+                self.track_command_failure_state(input, exit_code);
+            }
+            crate::types::InputIntent::ScriptCall => {
+                let exit_code = self.execute_script(input);
+                self.record_history(input, exit_code);
+                self.track_command_failure_state(input, exit_code);
+            }
+        }
+        false
     }
 
     /// Echo prompt + submitted command the way rustyline would after Enter.
