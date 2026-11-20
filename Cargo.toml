@@ -21,6 +21,7 @@ members = [
     "crates/aish-shell",
     "crates/aish-cli",
     "crates/aish-prompts",
+    "crates/aish-supervisor",
 ]
 
 [workspace.package]
@@ -139,6 +140,7 @@ aish-skills = { path = "crates/aish-skills" }
 aish-memory = { path = "crates/aish-memory" }
 aish-ui = { path = "crates/aish-ui" }
 aish-tui = { path = "crates/aish-tui" }
+aish-supervisor = { path = "crates/aish-supervisor" }
 aish-tools = { path = "crates/aish-tools" }
 aish-shell = { path = "crates/aish-shell" }
 aish-scripts = { path = "crates/aish-scripts" }

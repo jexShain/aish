@@ -1,0 +1,16 @@
+[package]
+name = "aish-supervisor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aish-core.workspace = true
+aish-tools.workspace = true
+aish-pty.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -283,6 +283,7 @@ dependencies = [
  "aish-session",
  "aish-skills",
  "aish-tools",
+ "aish-tui",
  "aish-ui",
  "async-trait",
  "base64 0.22.1",
@@ -338,6 +339,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aish-supervisor"
+version = "1.1.0"
+dependencies = [
+ "aish-core",
+ "aish-pty",
+ "aish-tools",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aish-tools"
 version = "1.1.0"
 dependencies = [
@@ -370,6 +385,7 @@ dependencies = [
 name = "aish-tui"
 version = "1.1.0"
 dependencies = [
+ "aish-supervisor",
  "crossterm 0.28.1",
  "parking_lot",
  "tempfile",
