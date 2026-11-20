@@ -391,6 +391,14 @@ impl<W: Write, R: Read> Repl<W, R> {
                     break;
                 }
                 self.refresh_ghost();
+                // A submitted line runs its command inline, which may queue
+                // product output through the sink. Commit it now instead of
+                // waiting for the next read: a piped batch of commands would
+                // otherwise execute every one of them before the first
+                // repaint, leaving their outputs below all the prompts.
+                if self.sink_pending() {
+                    self.draw()?;
+                }
             }
             if exit {
                 break;
@@ -501,6 +509,20 @@ impl<W: Write, R: Read> Repl<W, R> {
         let viewport = render_lines_to_viewport(rows, caps.width);
         let history = self.take_history(caps.width);
         self.renderer.draw(Frame { history, viewport })
+    }
+
+    /// Whether the configured sink queued rows that are not on screen yet.
+    ///
+    /// Used to decide whether a keystroke must be followed by a repaint: a
+    /// submitted command runs inline and may queue its output, and that output
+    /// must not wait for the next read, or a piped batch would print every
+    /// prompt before the first command's output.
+    fn sink_pending(&self) -> bool {
+        self.config
+            .sink
+            .as_deref()
+            .and_then(|sink| sink.as_any().downcast_ref::<QueueSink>())
+            .is_some_and(|queue| queue.has_pending())
     }
 
     /// Commit every row the configured sink queued since the last frame.
@@ -1714,7 +1736,9 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst) > 1,
             "provider was not called per frame"
         );
-        assert!(bytes.contains("[1] "), "first frame missing: {bytes:?}");
+        // The cursor highlight follows the prompt immediately (no separating
+        // space at an empty buffer), so match the marker only.
+        assert!(bytes.contains("[1]"), "first frame missing: {bytes:?}");
     }
 
     #[test]

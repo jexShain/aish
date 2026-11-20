@@ -15,10 +15,15 @@
 
 pub mod audit;
 pub mod error;
+pub mod output;
 pub mod plan;
 pub mod types;
 
 pub use audit::{AuditEvent, AuditEventType, AuditSink, NullAuditSink};
 pub use error::{AishError, Result};
+pub use output::{
+    clear_global_sink, global_sink, install_global_sink, screen_owned, write_bytes, OutputSink,
+    StdoutSink,
+};
 pub use plan::*;
 pub use types::*;

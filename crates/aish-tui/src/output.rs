@@ -1,5 +1,11 @@
 //! Product-output sinks: the single place product text may enter the terminal.
 //!
+//! The trait, the process-global slot and the plain-stdout default live in
+//! [`aish_core::output`], because the lowest producer — the PTY relay in
+//! `aish-pty` — must be able to honour them without depending on this crate.
+//! This module re-exports them under their historical `aish_tui` names and
+//! adds the queue implementation the interactive REPL drains.
+//!
 //! # Why not `println!`
 //!
 //! A frame is one *atomic* write. The renderer brackets it with a hidden
@@ -32,91 +38,13 @@
 
 use std::any::Any;
 use std::collections::VecDeque;
-use std::io::{self, Write};
 
 use parking_lot::Mutex;
 
-/// Sink for product output that must never interleave with a frame.
-///
-/// Implementors must be cheap to call from any thread: the REPL, loggers and
-/// streaming callbacks all write through the same object while a paint may be
-/// in progress on another thread.
-pub trait OutputSink: Send + Sync {
-    /// Append one finished line (newline added by the sink).
-    ///
-    /// This is the normal path for command output and log records: `text` is
-    /// one row, and it is terminated for you.
-    fn line(&self, text: &str);
-
-    /// Append a raw fragment (streaming deltas); the sink buffers it and
-    /// commits complete lines. Trailing partial line is flushed by `flush_raw`.
-    ///
-    /// Use this when the producer cannot know where a row ends (an LLM token
-    /// stream, a child process's byte chunks): every `\n` in `text` completes
-    /// a row, and whatever follows the last `\n` stays buffered.
-    fn raw(&self, text: &str);
-
-    /// Commit any buffered partial raw line.
-    ///
-    /// Call when the producer knows a row ended without a newline (end of
-    /// stream, end of a tool result). A no-op when nothing is buffered.
-    fn flush_raw(&self);
-
-    /// Ask for a repaint (no-op for sinks that write immediately).
-    ///
-    /// Implementations that buffer (a future scrollback-aware sink) may use
-    /// this to schedule one; the REPL already repaints every frame.
-    fn request_repaint(&self);
-
-    /// Downcast hook, so the REPL can recognize the concrete sink it drains.
-    ///
-    /// The REPL needs `QueueSink`'s `drain` method, which cannot live on the
-    /// trait: a sink that writes immediately has nothing to drain. An inherent
-    /// method plus this hook keeps the trait minimal for implementors.
-    fn as_any(&self) -> &dyn Any;
-}
-
-/// Default sink: writes straight to stdout (legacy behavior, used by tests
-/// and by the legacy shell path).
-///
-/// Nothing is buffered and nothing is coordinated with a renderer, so this is
-/// only correct when no frame owns the screen. It exists so callers that are
-/// agnostic about the UI mode have something to write to.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct StdoutSink;
-
-impl OutputSink for StdoutSink {
-    fn line(&self, text: &str) {
-        let mut out = io::stdout().lock();
-        // A closed pipe is how `aish ... | head` ends: nothing to report and
-        // nothing to retry, but a real error is worth a trace.
-        if let Err(err) = out
-            .write_all(text.as_bytes())
-            .and_then(|()| out.write_all(b"\n"))
-        {
-            tracing::debug!(%err, "stdout sink write failed");
-        }
-        let _ = out.flush();
-    }
-
-    fn raw(&self, text: &str) {
-        let mut out = io::stdout().lock();
-        if let Err(err) = out.write_all(text.as_bytes()) {
-            tracing::debug!(%err, "stdout sink write failed");
-        }
-        let _ = out.flush();
-    }
-
-    fn flush_raw(&self) {
-        let _ = io::stdout().flush();
-    }
-
-    fn request_repaint(&self) {}
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+pub use aish_core::output::{
+    clear_global_sink, global_sink, install_global_sink, screen_owned, write_bytes, OutputSink,
+    StdoutSink,
+};
 
 /// Lines and the unterminated tail of a [`QueueSink`].
 ///
@@ -155,6 +83,16 @@ impl QueueSink {
     pub fn drain(&self) -> Vec<String> {
         let mut state = self.state.lock();
         state.lines.drain(..).collect()
+    }
+
+    /// Whether rows (or a completed fragment) are waiting to be committed.
+    ///
+    /// A [`Repl`](crate::repl::Repl) checks this after every keystroke: a
+    /// submitted command runs inline and may queue output, which must reach the
+    /// screen before the next prompt is painted.
+    pub fn has_pending(&self) -> bool {
+        let state = self.state.lock();
+        !state.lines.is_empty() || !state.partial.is_empty()
     }
 }
 
@@ -198,6 +136,12 @@ impl OutputSink for QueueSink {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// The REPL paints frames and commits queued rows between them, so nothing
+    /// else may touch fd 1 while this sink is installed.
+    fn owns_screen(&self) -> bool {
+        true
     }
 }
 
@@ -294,7 +238,14 @@ mod tests {
     }
 
     #[test]
-    fn stdout_sink_writes_verbatim() {
+    fn queue_sink_owns_the_screen() {
+        // Relay code keys off this to decide whether fd 1 is safe to touch.
+        assert!(QueueSink::new().owns_screen());
+        assert!(!StdoutSink.owns_screen());
+    }
+
+    #[test]
+    fn recording_sink_writes_verbatim() {
         let sink = RecordingSink::default();
         sink.line("one");
         sink.raw("two");

@@ -95,10 +95,12 @@ version = "1.1.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
+ "parking_lot",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.21",
+ "tracing",
  "uuid",
 ]
 
@@ -215,6 +217,7 @@ dependencies = [
  "dirs 5.0.1",
  "libc",
  "nix 0.29.0",
+ "parking_lot",
  "regex",
  "serde",
  "serde_json",
@@ -386,6 +389,7 @@ dependencies = [
 name = "aish-tui"
 version = "1.1.0"
 dependencies = [
+ "aish-core",
  "aish-supervisor",
  "crossterm 0.28.1",
  "parking_lot",

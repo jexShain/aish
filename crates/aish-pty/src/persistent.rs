@@ -55,8 +55,20 @@ where
     true
 }
 
-/// Write child output to the real terminal verbatim (plus the CRLF fixup in
-/// [`crate::term_stream::normalize_crlf`]).
+/// Write child output to the terminal, honouring the process-wide output sink.
+///
+/// When no renderer owns the screen this writes fd 1 directly (plus the CRLF
+/// fixup in [`crate::term_stream::normalize_crlf`]). When a renderer *does*
+/// own the screen, a direct fd 1 write would land inside the frame currently
+/// on the wire: the terminal then scrolls by an amount the renderer never saw,
+/// so the next frame repaints stale rows and the child's output glues itself to
+/// the prompt line. In that mode the bytes are handed to
+/// [`aish_core::output::write_bytes`] instead, which queues them for the REPL to
+/// commit as history *between* frames.
+///
+/// The CRLF fixup runs on both paths, and before queueing on purpose: the
+/// queue splits rows on `\n`, so translating afterwards would leave the `\r`
+/// inside the row.
 ///
 /// aish used to delete terminal device-query *requests* here for commands that
 /// were not on the interactive whitelist. That broke full-screen programs: the
@@ -67,6 +79,10 @@ where
 /// protection without editing the child's byte stream.
 fn write_stdout_all(buf: &[u8]) {
     let normalized = crate::term_stream::normalize_crlf(buf);
+    if aish_core::output::screen_owned() {
+        aish_core::output::write_bytes(&normalized);
+        return;
+    }
     // Return value intentionally ignored: callers fire-and-forget stdout writes.
     let _ = write_all_with_retry(&normalized, |remaining| {
         let rc = unsafe {
@@ -7790,6 +7806,100 @@ fn scan_output_for_ssh_failure(output: &str) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sink double that records what the relay hands over instead of writing
+    /// fd 1 (libtest does not capture raw fd writes, so a real write would
+    /// both pollute the report and be unobservable).
+    #[derive(Default)]
+    struct RecordingSink {
+        written: parking_lot::Mutex<Vec<u8>>,
+        owns_screen: bool,
+    }
+
+    impl RecordingSink {
+        fn bytes(&self) -> Vec<u8> {
+            self.written.lock().clone()
+        }
+    }
+
+    impl aish_core::output::OutputSink for RecordingSink {
+        fn line(&self, text: &str) {
+            let mut written = self.written.lock();
+            written.extend_from_slice(text.as_bytes());
+            written.push(b'\n');
+        }
+
+        fn raw(&self, text: &str) {
+            self.written.lock().extend_from_slice(text.as_bytes());
+        }
+
+        fn flush_raw(&self) {}
+
+        fn request_repaint(&self) {}
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn owns_screen(&self) -> bool {
+            self.owns_screen
+        }
+    }
+
+    /// The output sink is process state, so the tests touching it must not run
+    /// concurrently. Restores the pristine state on drop, including on panic.
+    static SINK_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    struct SinkGuard;
+
+    impl Drop for SinkGuard {
+        fn drop(&mut self) {
+            aish_core::output::clear_global_sink();
+        }
+    }
+
+    fn lock_sink() -> (parking_lot::MutexGuard<'static, ()>, SinkGuard) {
+        let guard = SINK_LOCK.lock();
+        aish_core::output::clear_global_sink();
+        (guard, SinkGuard)
+    }
+
+    /// With a renderer owning the screen, the relay must not touch fd 1: the
+    /// bytes go to the sink, CRLF-normalized so the queue splits rows cleanly.
+    #[test]
+    fn write_stdout_all_routes_to_sink_when_screen_is_owned() {
+        let (_guard, _sink_guard) = lock_sink();
+        let sink = Arc::new(RecordingSink {
+            owns_screen: true,
+            ..RecordingSink::default()
+        });
+        aish_core::output::install_global_sink(
+            Arc::clone(&sink) as Arc<dyn aish_core::output::OutputSink>
+        );
+
+        write_stdout_all(b"a\r\nb");
+
+        // CRLF is normalized to LF *before* queueing, so the sink sees plain
+        // rows instead of a trailing carriage return inside each one.
+        assert_eq!(sink.bytes(), b"a\nb");
+    }
+
+    /// Without a renderer the relay keeps the legacy behavior: verbatim bytes
+    /// to fd 1 and nothing queued (nobody would drain it).
+    #[test]
+    fn write_stdout_all_writes_stdout_when_screen_is_free() {
+        let (_guard, _sink_guard) = lock_sink();
+        let sink = Arc::new(RecordingSink::default());
+        aish_core::output::install_global_sink(
+            Arc::clone(&sink) as Arc<dyn aish_core::output::OutputSink>
+        );
+
+        // A single newline is redirected to /dev/null by libtest, so this is
+        // observable only through the absence of sink traffic.
+        write_stdout_all(b"\n");
+
+        assert!(sink.bytes().is_empty(), "legacy path queued bytes");
+    }
 
     /// Start a PersistentPty for tests, retrying transient allocation
     /// failures. `cargo test --workspace` runs hundreds of tests in parallel;
