@@ -36,7 +36,10 @@ pub mod repl;
 pub mod shell_repl;
 
 pub use caps::detect_caps;
-pub use completion::{common_prefix, token_range, Candidate, CompletionSource, WordListSource};
+pub use completion::{
+    common_prefix, path_words, token_range, Candidate, CompletionSource, SlashCommandSource,
+    WordListSource,
+};
 pub use component::{render_lines_to_viewport, Component, Container, InputHandled, Interactive};
 pub use frame::{Frame, HistoryBatch};
 pub use hud::HudState;
@@ -53,16 +56,25 @@ pub use output::{
     QueueSink, StdoutSink,
 };
 
+/// Serializes every test that touches the process-wide sink.
+///
+/// The sink is one global slot, so a test that installs one would otherwise be
+/// observable by any concurrently running test that asserts on the default
+/// ("nobody installed anything"). Every such test takes this lock and resets the
+/// slot, here and in `repl`/`shell_repl`.
+#[cfg(test)]
+pub(crate) fn lock_global_sink() -> parking_lot::MutexGuard<'static, ()> {
+    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let guard = TEST_LOCK.lock();
+    clear_global_sink();
+    guard
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::sync::Arc;
-
-    /// The installed sink is process state, so the tests touching it must not
-    /// run concurrently: one's install would otherwise be visible to the
-    /// other's "nothing is installed" assertion.
-    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// Serialize plus reset, restoring the pristine state even on panic.
     struct GlobalGuard;
@@ -73,9 +85,10 @@ mod tests {
         }
     }
 
+    /// The shared lock makes "nobody installed a sink" a precondition of every
+    /// test here; the guard restores it on the way out, panic or not.
     fn lock_global() -> (parking_lot::MutexGuard<'static, ()>, GlobalGuard) {
-        let guard = TEST_LOCK.lock();
-        clear_global_sink();
+        let guard = crate::lock_global_sink();
         (guard, GlobalGuard)
     }
 

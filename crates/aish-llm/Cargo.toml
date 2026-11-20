@@ -26,3 +26,6 @@ langfuse-ergonomic.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 aish-tools.workspace = true
+# End-to-end HUD regression: the event stream a spawn produces is fed into the
+# real tracker, so "the run never finishes" cannot return unnoticed.
+aish-supervisor.workspace = true

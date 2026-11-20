@@ -135,14 +135,74 @@ fn event_ms(event: &LlmEvent) -> u64 {
     (event.timestamp * 1000.0) as u64
 }
 
+/// Current wall-clock time in milliseconds, on the same scale as [`event_ms`].
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn is_sub_agent_event(event: &LlmEvent) -> bool {
     event.data.get("source").and_then(|v| v.as_str()) == Some("sub_agent")
+}
+
+/// A terminal event that retires a run: either explicitly labelled
+/// `source=sub_agent`, or carrying a `spawn_id` without a `source` at all.
+///
+/// The second form is the fallback for terminal events emitted by paths that
+/// never installed the sub-agent event proxy. A `source` that names something
+/// else (e.g. a parent-session event) is never treated as sub-agent terminal.
+fn is_sub_agent_terminal_event(event: &LlmEvent) -> bool {
+    if event.event_type != LlmEventType::OpEnd {
+        return false;
+    }
+    if event
+        .data
+        .get("spawn_id")
+        .and_then(|v| v.as_str())
+        .is_none()
+    {
+        return false;
+    }
+    match event.data.get("source") {
+        None => true,
+        Some(source) => source.as_str() == Some("sub_agent"),
+    }
+}
+
+/// Map one event onto an existing run, returning whether it changed anything.
+fn apply_event(run: &mut AgentRun, event: &LlmEvent, at_ms: u64) -> bool {
+    match event.event_type {
+        LlmEventType::GenerationStart => false,
+        LlmEventType::ContentDelta => match content_delta_text(event) {
+            Some(text) => run.push_text(text),
+            None => false,
+        },
+        LlmEventType::ToolExecutionStart => {
+            run.tool_calls += 1;
+            true
+        }
+        LlmEventType::OpEnd => {
+            let state = if event.data.get("reason").and_then(|v| v.as_str()) == Some("cancelled") {
+                AgentState::Cancelled
+            } else {
+                AgentState::Completed
+            };
+            run.finish(state, at_ms)
+        }
+        LlmEventType::Cancelled => run.finish(AgentState::Cancelled, at_ms),
+        LlmEventType::Error => run.finish(AgentState::Failed, at_ms),
+        _ => false,
+    }
 }
 
 /// Tracks sub-agent runs from LlmEvents.
 #[derive(Debug, Default)]
 pub struct AgentTracker {
     runs: HashMap<String, AgentRun>,
+    /// Wall-clock ms of the last event seen per run, used by [`finish_stale`].
+    last_activity_ms: HashMap<String, u64>,
     /// Descriptions harvested from parent `Agent` tool calls, waiting for the
     /// sub-agent run they spawned to appear.
     pending_descriptions: Vec<String>,
@@ -156,7 +216,11 @@ impl AgentTracker {
     /// Feed one event. Returns true when the snapshot changed.
     pub fn observe(&mut self, event: &LlmEvent) -> bool {
         if !is_sub_agent_event(event) {
-            return self.observe_parent_event(event);
+            return if is_sub_agent_terminal_event(event) {
+                self.observe_terminal_without_source(event)
+            } else {
+                self.observe_parent_event(event)
+            };
         }
         let Some(spawn_id) = event
             .data
@@ -179,40 +243,33 @@ impl AgentTracker {
             self.attach_pending_description(&spawn_id);
             changed = true;
         }
+        self.last_activity_ms.insert(spawn_id.clone(), at_ms);
 
         let Some(run) = self.runs.get_mut(&spawn_id) else {
             return changed;
         };
         changed |= run.merge_metadata(event);
+        changed |= apply_event(run, event, at_ms);
+        changed
+    }
 
-        match event.event_type {
-            LlmEventType::GenerationStart => {}
-            LlmEventType::ContentDelta => {
-                if let Some(text) = content_delta_text(event) {
-                    changed |= run.push_text(text);
-                }
-            }
-            LlmEventType::ToolExecutionStart => {
-                run.tool_calls += 1;
-                changed = true;
-            }
-            LlmEventType::OpEnd => {
-                let state =
-                    if event.data.get("reason").and_then(|v| v.as_str()) == Some("cancelled") {
-                        AgentState::Cancelled
-                    } else {
-                        AgentState::Completed
-                    };
-                changed |= run.finish(state, at_ms);
-            }
-            LlmEventType::Cancelled => {
-                changed |= run.finish(AgentState::Cancelled, at_ms);
-            }
-            LlmEventType::Error => {
-                changed |= run.finish(AgentState::Failed, at_ms);
-            }
-            _ => {}
-        }
+    /// Terminal `OpEnd` that carries a `spawn_id` but no `source`: some spawn
+    /// paths emit their run identity without installing the sub-agent event
+    /// proxy. Such an event may only retire a known run — it never creates one,
+    /// because without `source` we cannot tell an agent event from a
+    /// parent-session event that happens to carry a `spawn_id`.
+    fn observe_terminal_without_source(&mut self, event: &LlmEvent) -> bool {
+        let Some(spawn_id) = event.data.get("spawn_id").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let at_ms = event_ms(event);
+        let Some(run) = self.runs.get_mut(spawn_id) else {
+            return false;
+        };
+        self.last_activity_ms
+            .insert(spawn_id.to_string(), event_ms(event));
+        let mut changed = run.merge_metadata(event);
+        changed |= apply_event(run, event, at_ms);
         changed
     }
 
@@ -296,6 +353,58 @@ impl AgentTracker {
     /// Drop finished runs, keeping only live ones.
     pub fn clear_finished(&mut self) {
         self.runs.retain(|_, run| !run.state.is_finished());
+    }
+
+    /// Drop runs that finished more than `retention_ms` ago.
+    ///
+    /// A finished run stays visible long enough to be read ("completed · 3
+    /// tools") and then leaves the live view, so a shell with history does not
+    /// accumulate rows forever. Runs that never finished are always kept.
+    pub fn prune_finished(&mut self, retention_ms: u64) -> usize {
+        let now_ms = wall_clock_ms();
+        let before = self.runs.len();
+        self.runs.retain(|_, run| match run.finished_at_ms {
+            Some(finished_at) => now_ms.saturating_sub(finished_at) < retention_ms,
+            None => true,
+        });
+        let removed = before - self.runs.len();
+        if removed > 0 {
+            self.last_activity_ms
+                .retain(|spawn_id, _| self.runs.contains_key(spawn_id));
+        }
+        removed
+    }
+
+    /// Fail-safe for a run that never reported a terminal event: finish every
+    /// `Running` run whose last event is older than `idle_ms`.
+    ///
+    /// Returns the number of runs retired. `idle_ms == 0` retires nothing, so a
+    /// caller that has not decided on a threshold cannot flush live agents by
+    /// accident. A run with no recorded activity is retired immediately, since
+    /// no event ever reached the tracker for it.
+    pub fn finish_stale(&mut self, idle_ms: u64) -> usize {
+        if idle_ms == 0 {
+            return 0;
+        }
+        let now_ms = wall_clock_ms();
+        let mut retired = 0;
+        for (spawn_id, run) in self.runs.iter_mut() {
+            if run.state != AgentState::Running {
+                continue;
+            }
+            let last = self
+                .last_activity_ms
+                .get(spawn_id)
+                .copied()
+                .unwrap_or(run.started_at_ms);
+            if now_ms.saturating_sub(last) < idle_ms {
+                continue;
+            }
+            if run.finish(AgentState::Completed, now_ms) {
+                retired += 1;
+            }
+        }
+        retired
     }
 }
 
@@ -533,5 +642,159 @@ mod tests {
         ));
         assert!(tracker.observe(&sub_agent_event(LlmEventType::OpEnd, json!({}), 2.0)));
         assert!(!tracker.observe(&sub_agent_event(LlmEventType::OpEnd, json!({}), 3.0)));
+    }
+
+    #[test]
+    fn running_count_returns_zero_after_terminal_event() {
+        // The HUD derives busy/idle from this count alone: a run that reports
+        // its terminal `OpEnd` must never linger as `running`.
+        let mut tracker = AgentTracker::new();
+        tracker.observe(&sub_agent_event(
+            LlmEventType::GenerationStart,
+            json!({}),
+            1.0,
+        ));
+        tracker.observe(&sub_agent_event(
+            LlmEventType::GenerationEnd,
+            json!({}),
+            1.4,
+        ));
+        assert_eq!(
+            tracker.running_count(),
+            1,
+            "quiet between turns is not done"
+        );
+
+        tracker.observe(&sub_agent_event(
+            LlmEventType::OpEnd,
+            json!({"reason": "completed"}),
+            1.5,
+        ));
+        assert_eq!(tracker.running_count(), 0);
+        assert_eq!(tracker.runs()[0].state, AgentState::Completed);
+    }
+
+    #[test]
+    fn terminal_event_without_source_still_finishes() {
+        // A spawn path that never installs the sub-agent event proxy emits the
+        // terminal `OpEnd` with a bare `spawn_id`. It must still retire the run.
+        let mut tracker = AgentTracker::new();
+        tracker.observe(&sub_agent_event(
+            LlmEventType::GenerationStart,
+            json!({}),
+            1.0,
+        ));
+        let terminal = LlmEvent {
+            event_type: LlmEventType::OpEnd,
+            data: json!({"spawn_id": "spawn-1", "reason": "completed"}),
+            timestamp: 2.0,
+            metadata: None,
+        };
+        assert!(tracker.observe(&terminal));
+        assert_eq!(tracker.runs()[0].state, AgentState::Completed);
+        assert_eq!(tracker.running_count(), 0);
+    }
+
+    #[test]
+    fn sourceless_terminal_event_does_not_create_a_run() {
+        // Without `source` we cannot tell an agent event from a parent-session
+        // event that happens to carry a `spawn_id`; only known runs may finish.
+        let mut tracker = AgentTracker::new();
+        let terminal = LlmEvent {
+            event_type: LlmEventType::OpEnd,
+            data: json!({"spawn_id": "unknown", "reason": "completed"}),
+            timestamp: 2.0,
+            metadata: None,
+        };
+        assert!(!tracker.observe(&terminal));
+        assert!(tracker.runs().is_empty());
+    }
+
+    #[test]
+    fn foreign_source_terminal_event_is_ignored() {
+        let mut tracker = AgentTracker::new();
+        tracker.observe(&sub_agent_event(
+            LlmEventType::GenerationStart,
+            json!({}),
+            1.0,
+        ));
+        let mut event = sub_agent_event(LlmEventType::OpEnd, json!({}), 2.0);
+        event.data["source"] = json!("observer");
+        assert!(!tracker.observe(&event));
+        assert_eq!(tracker.running_count(), 1);
+    }
+
+    #[test]
+    fn finish_stale_retires_idle_runs_only() {
+        let mut tracker = AgentTracker::new();
+        // Activity stamped in the far past: stale relative to wall clock.
+        tracker.observe(&sub_agent_event(
+            LlmEventType::GenerationStart,
+            json!({}),
+            1.0,
+        ));
+        // A second run that just reported activity.
+        let now = wall_clock_ms() as f64 / 1000.0;
+        let mut live = sub_agent_event(LlmEventType::GenerationStart, json!({}), now);
+        live.data["spawn_id"] = json!("spawn-live");
+        tracker.observe(&live);
+
+        assert_eq!(tracker.finish_stale(60_000), 1);
+        let states: Vec<_> = tracker
+            .runs()
+            .into_iter()
+            .map(|run| (run.spawn_id, run.state))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                ("spawn-1".to_string(), AgentState::Completed),
+                ("spawn-live".to_string(), AgentState::Running),
+            ]
+        );
+        assert_eq!(tracker.running_count(), 1);
+        // Idempotent: nothing left to retire.
+        assert_eq!(tracker.finish_stale(60_000), 0);
+    }
+
+    #[test]
+    fn finish_stale_with_zero_idle_retires_nothing() {
+        let mut tracker = AgentTracker::new();
+        tracker.observe(&sub_agent_event(
+            LlmEventType::GenerationStart,
+            json!({}),
+            1.0,
+        ));
+        assert_eq!(tracker.finish_stale(0), 0);
+        assert_eq!(tracker.running_count(), 1);
+    }
+
+    #[test]
+    fn prune_finished_drops_old_terminal_runs() {
+        let mut tracker = AgentTracker::new();
+        tracker.observe(&sub_agent_event(
+            LlmEventType::GenerationStart,
+            json!({}),
+            1.0,
+        ));
+        tracker.observe(&sub_agent_event(LlmEventType::OpEnd, json!({}), 1.5));
+
+        // The synthetic 1970 timestamp is ancient relative to the wall clock,
+        // so it is past any retention window.
+        assert_eq!(tracker.prune_finished(3_000), 1);
+        assert!(tracker.runs().is_empty());
+        assert_eq!(tracker.running_count(), 0);
+    }
+
+    #[test]
+    fn prune_finished_keeps_running_runs() {
+        let mut tracker = AgentTracker::new();
+        tracker.observe(&sub_agent_event(
+            LlmEventType::GenerationStart,
+            json!({}),
+            1.0,
+        ));
+        assert_eq!(tracker.prune_finished(0), 0);
+        assert_eq!(tracker.runs().len(), 1);
     }
 }

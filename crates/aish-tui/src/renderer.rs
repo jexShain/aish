@@ -145,6 +145,14 @@ impl<W: Write> Renderer<W> {
         self.out
     }
 
+    /// Borrow the byte sink, for tests that assert *while* a callback runs.
+    ///
+    /// [`Renderer::into_inner`] consumes the renderer, which a test cannot do
+    /// from inside the submit callback it is testing.
+    pub fn out(&self) -> &W {
+        &self.out
+    }
+
     /// Write `bytes` straight to the sink, outside any paint transaction.
     ///
     /// Only for sequences that are not part of a frame — the REPL's final

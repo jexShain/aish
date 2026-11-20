@@ -28,7 +28,7 @@
 //! next Up starts from the newest entry again instead of re-editing an old
 //! line invisibly.
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use crate::highlight::{DIM, RESET};
 use crate::input::{InputEvent, Key};
@@ -700,20 +700,38 @@ impl Editor {
 
     /// Render the editor at `width` columns.
     ///
-    /// The prompt prefixes the first row; the buffer soft-wraps, hard-wrapping
+    /// The prompt prefixes the first row — or takes a row of its own when its
+    /// *visible* width fills the terminal, since a prompt carrying SGR spans has
+    /// far fewer visible columns than bytes. The buffer soft-wraps, hard-wrapping
     /// at the width the terminal itself would use. The cursor is painted with
-    /// reverse video (a space when it sits past the last character), and a
-    /// ghost completion is appended in dim text when the cursor is at the end
-    /// of the buffer.
+    /// reverse video (a space when it sits past the last character, the final
+    /// glyph when the row is full), and a ghost completion is appended in dim
+    /// text when the cursor is at the end of the buffer — never past the width.
     pub fn render(&self, width: u16) -> Vec<String> {
         let width = width.max(1) as usize;
-        let prompt_w = self.prompt.width();
-        // The first row of the first logical line shares space with the prompt;
-        // never let that budget reach zero (a prompt wider than the terminal
-        // degrades to one column rather than looping).
-        let first_avail = width.saturating_sub(prompt_w).max(1);
+        // The prompt is a product string and may carry SGR colour spans (the
+        // default prompt always does), so its *visible* width is what eats into
+        // the first row. Measuring the raw string would count every escape byte
+        // as a column, shrinking the first row's budget close to zero and
+        // wrapping the first typed character onto a second row.
+        let prompt_w = crate::render::visible_width(&self.prompt) as usize;
+        // A prompt at least as wide as the terminal leaves no column for the
+        // buffer beside it, so it takes a row of its own and the buffer starts
+        // below — never a one-column sliver that would wrap the first typed
+        // character onto a second row.
+        let prompt_shares_row = prompt_w < width;
+        let first_avail = if prompt_shares_row {
+            width - prompt_w
+        } else {
+            width
+        };
 
         let mut rows: Vec<String> = Vec::new();
+        // A prompt that cannot share a row takes the whole first row, so the
+        // buffer's first row starts below it.
+        if !prompt_shares_row {
+            rows.push(self.prompt.clone());
+        }
         let mut cursor_row = 0usize;
         let mut cursor_col = 0u16;
         let mut cursor_found = false;
@@ -737,7 +755,7 @@ impl Editor {
             );
             if let Some((row, col)) = hit {
                 cursor_row = rows.len() + row;
-                let prompt_offset = if logical_index == 0 && row == 0 {
+                let prompt_offset = if prompt_shares_row && logical_index == 0 && row == 0 {
                     prompt_w
                 } else {
                     0
@@ -750,19 +768,25 @@ impl Editor {
             offset += logical.len() + 1;
         }
 
-        if rows.is_empty() {
-            rows.push(String::new());
+        // `split` always yields at least one logical line, so `rows` holds at
+        // least one row (plus the prompt row when it could not share).
+        if prompt_shares_row {
+            rows[0] = format!("{}{}", self.prompt, rows[0]);
         }
-        rows[0] = format!("{}{}", self.prompt, rows[0]);
 
         if !cursor_found {
             // Defensive: every cursor position inside the buffer maps to a row,
             // but a future mutation must never leave the caret unrendered.
             cursor_row = rows.len() - 1;
-            cursor_col = rows[cursor_row].width() as u16;
+            cursor_col = crate::render::visible_width(&rows[cursor_row]);
         }
 
-        let mut rows = crate::highlight::render_with_cursor(rows, cursor_row, cursor_col);
+        // `render_with_cursor` keeps the caret inside the row: when it sits past
+        // the text on a row that already fills the terminal, it reverses the
+        // last glyph rather than appending a cell past the right edge (which
+        // would soft-wrap the row once autowrap is restored between frames).
+        let mut rows =
+            crate::highlight::render_with_cursor(rows, cursor_row, cursor_col, width as u16);
 
         // Ghost completion is painted after the cursor cell: the caret is what
         // the suggested text would replace, so the dim span starts immediately
@@ -770,7 +794,16 @@ impl Editor {
         if self.cursor == self.buffer.len() {
             if let Some(ghost) = &self.ghost {
                 let ghost = one_line(ghost);
-                let taken = usize::from(cursor_col) + 1;
+                // `one_line` maps every control byte (including ESC) to a
+                // space, so the ghost carries no escapes and its measured width
+                // is its visible width. The caret sits at the end of the buffer
+                // here, so the painted row (text plus the reverse-video cell) is
+                // already as wide as it gets: the ghost may only fill the cells
+                // that remain. A row pushed past the terminal width would
+                // soft-wrap, and the renderer's row budget would desynchronize
+                // from the screen.
+                let taken =
+                    crate::render::visible_width(rows.get(cursor_row).map_or("", |r| r)) as usize;
                 let room = width.saturating_sub(taken);
                 let ghost = truncate_to_width(&ghost, room);
                 if !ghost.is_empty() {
@@ -808,10 +841,13 @@ fn wrap_logical(
     for ch in text.chars() {
         let avail = if rows.len() == 1 { first } else { rest };
         let cw = char_width(ch);
-        // A wide glyph that does not fit in the last column moves to the next
-        // row rather than splitting across the terminal's edge. A cursor resting
-        // exactly at the budget therefore records the *next* row below.
-        if col + cw > avail && col > 0 {
+        // Only a glyph that genuinely does not fit wraps: a wide glyph that
+        // would be split across the terminal's edge, or any glyph reaching past
+        // the budget because the row already holds something. A narrow glyph
+        // that lands exactly on the last column stays on its row — the caret
+        // then rests in that last cell, which is what a terminal with a pending
+        // wrap shows, instead of a phantom empty row below the input.
+        if col > 0 && col + cw > avail {
             rows.push(String::new());
             col = 0;
         }
@@ -826,13 +862,6 @@ fn wrap_logical(
         hit = Some((rows.len() - 1, col));
     }
 
-    if let Some((row, hit_col)) = hit {
-        let avail = if row == 0 { first } else { rest };
-        if hit_col >= avail && row + 1 == rows.len() {
-            rows.push(String::new());
-            hit = Some((row + 1, 0));
-        }
-    }
     (rows, hit)
 }
 
@@ -1309,5 +1338,160 @@ mod tests {
         editor.insert_str(" 漢字");
         assert!(editor.replace_before_cursor(2, "漢"));
         assert_eq!(editor.buffer(), "git sta 漢");
+    }
+
+    /// The prompt the product actually paints: SGR colour spans around the
+    /// badge, the path and the arrow. Only its visible columns may count.
+    const ANSI_PROMPT: &str = "\x1b[38;2;0;180;255m◆ aish\x1b[0m \x1b[38;2;156;163;176m~/n/x/g/aish-bg-task\x1b[0m\x1b[38;2;0;255;136m➜\x1b[0m ";
+
+    #[test]
+    fn single_char_at_various_widths_keeps_cursor_on_first_row() {
+        // The reported bug: typing one character at any width pushed the caret
+        // onto a second row because the prompt's escape bytes were counted as
+        // columns.
+        for width in [200u16, 120, 100, 80, 60, 40, 35, 34, 33, 32, 31] {
+            let mut editor = Editor::new(ANSI_PROMPT);
+            editor.insert_char('l');
+            let rows = editor.render(width);
+            assert_eq!(rows.len(), 1, "width {width}: rows {rows:?}");
+            assert_eq!(plain(&rows[0]), "◆ aish ~/n/x/g/aish-bg-task➜ l ");
+            assert!(
+                rows[0].contains(crate::highlight::CURSOR_ON),
+                "width {width}"
+            );
+            // The caret cell must be the reverse-video space right after 'l'.
+            assert!(
+                rows[0].contains(&format!("l{} ", crate::highlight::CURSOR_ON)),
+                "width {width}: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_with_ansi_counts_visible_width_only() {
+        // 29 visible columns behind 65 bytes of escapes.
+        let mut editor = Editor::new(ANSI_PROMPT);
+        assert_eq!(crate::render::visible_width(ANSI_PROMPT), 29);
+        editor.insert_str("0123456789");
+        // Width 40 leaves 11 columns beside the prompt: all ten digits fit.
+        let rows = editor.render(40);
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(plain(&rows[0]), "◆ aish ~/n/x/g/aish-bg-task➜ 0123456789 ");
+        // Width 35 leaves 6, so the tail wraps — and it wraps at the *visible*
+        // budget, not at 94 columns of escapes.
+        let rows = editor.render(35);
+        assert_eq!(rows.len(), 2, "rows: {rows:?}");
+        assert_eq!(plain(&rows[0]), "◆ aish ~/n/x/g/aish-bg-task➜ 012345");
+        assert_eq!(plain(&rows[1]), "6789 ");
+    }
+
+    #[test]
+    fn full_row_cursor_stays_on_same_row() {
+        // A narrow glyph landing exactly on the last column must not open a
+        // phantom row below: the caret rests in that last cell.
+        let mut editor = Editor::new("> ");
+        editor.insert_str("01234567");
+        let rows = editor.render(10);
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(plain(&rows[0]), "> 01234567");
+        // The last glyph is reversed instead of an extra cell being appended.
+        assert!(
+            rows[0].ends_with(&format!(
+                "{}{}{}",
+                crate::highlight::CURSOR_ON,
+                '7',
+                crate::highlight::CURSOR_OFF
+            )),
+            "{rows:?}"
+        );
+        assert_eq!(crate::render::visible_width(&rows[0]), 10);
+
+        // One more character does have to wrap.
+        editor.insert_char('8');
+        let rows = editor.render(10);
+        assert_eq!(rows.len(), 2, "rows: {rows:?}");
+        assert_eq!(plain(&rows[0]), "> 01234567");
+        assert_eq!(plain(&rows[1]), "8 ");
+    }
+
+    #[test]
+    fn wide_char_at_boundary_wraps() {
+        // '世' needs two columns; with one column left it moves to the next row
+        // rather than being split across the terminal's edge.
+        let mut editor = Editor::new("> ");
+        editor.insert_str("abcdefg世");
+        let rows = editor.render(10);
+        assert_eq!(rows.len(), 2, "rows: {rows:?}");
+        assert_eq!(plain(&rows[0]), "> abcdefg");
+        assert_eq!(plain(&rows[1]), "世 ");
+
+        // With room for both columns it stays put.
+        let mut editor = Editor::new("> ");
+        editor.insert_str("abcdef世");
+        let rows = editor.render(10);
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(plain(&rows[0]), "> abcdef世");
+
+        // A wide glyph as the very first character still gets a full row.
+        let mut editor = Editor::new("> ");
+        editor.insert_str("世");
+        let rows = editor.render(10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(plain(&rows[0]), "> 世 ");
+    }
+
+    #[test]
+    fn ghost_never_exceeds_width() {
+        let mut editor = Editor::new("> ");
+        editor.insert_str("git");
+        editor.set_ghost(Some(" checkout feature/very-long-branch-name".into()));
+        for width in [10u16, 12, 16, 24, 40, 80] {
+            let rows = editor.render(width);
+            for row in &rows {
+                assert!(
+                    crate::render::visible_width(row) <= width,
+                    "width {width}: row {row:?} measures {}",
+                    crate::render::visible_width(row)
+                );
+            }
+            // The ghost survives only while it fits; a full row drops it.
+            if width > 6 {
+                assert!(rows[0].contains(crate::highlight::DIM), "width {width}");
+            }
+        }
+        // A row that is already full leaves no cell for the ghost.
+        let mut full = Editor::new("> ");
+        full.insert_str("01234567");
+        full.set_ghost(Some("xyz".into()));
+        let rows = full.render(10);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].contains(crate::highlight::DIM), "{rows:?}");
+        assert_eq!(crate::render::visible_width(&rows[0]), 10);
+
+        // The ghost is cut on the room it actually has, never past the edge.
+        let mut tight = Editor::new("> ");
+        tight.insert_str("ab");
+        tight.set_ghost(Some("cdefghij".into()));
+        let rows = tight.render(10);
+        assert_eq!(plain(&rows[0]), "> ab cdefg");
+        assert_eq!(crate::render::visible_width(&rows[0]), 10);
+        assert!(rows[0].contains(crate::highlight::DIM));
+    }
+
+    #[test]
+    fn prompt_wider_than_terminal_takes_its_own_row() {
+        // A prompt that fills the terminal leaves no column beside it, so the
+        // buffer starts on the next row instead of in a one-column sliver.
+        let mut editor = Editor::new(ANSI_PROMPT);
+        editor.insert_char('l');
+        for width in [29u16, 20, 10, 1] {
+            let rows = editor.render(width);
+            assert_eq!(rows.len(), 2, "width {width}: rows {rows:?}");
+            assert_eq!(plain(&rows[1]).trim_end(), "l");
+            assert!(
+                rows[1].contains(crate::highlight::CURSOR_ON),
+                "width {width}"
+            );
+        }
     }
 }

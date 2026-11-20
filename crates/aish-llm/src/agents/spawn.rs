@@ -2,16 +2,18 @@
 
 use std::sync::Arc;
 
-use aish_core::{AishError, LlmEvent};
+use aish_core::{AishError, LlmEvent, LlmEventType};
 use uuid::Uuid;
 
 use crate::prompt::PromptContext;
 use crate::session::LlmSession;
 use crate::types::{ChatMessage, LlmCallbackResult, ToolSpec};
 
-use super::event_metadata::forward_sub_agent_event_with_skill;
+use super::event_metadata::{
+    enrich_event_data_with_sub_agent_labels, forward_sub_agent_event_with_skill,
+};
 use super::registry::AgentRegistry;
-use super::tool_loop::{run_tool_loop_until_done, LoopStatus, ToolLoopConfig};
+use super::tool_loop::{now_timestamp, run_tool_loop_until_done, LoopStatus, ToolLoopConfig};
 use super::tools::{parent_has_skill_tool, resolve_tools_for_agent};
 
 /// Global ceiling on sub-agent turns (applied via [`effective_max_turns`]).
@@ -22,6 +24,16 @@ pub fn effective_max_turns(def_max_turns: u32) -> u32 {
     def_max_turns.min(GLOBAL_MAX_TURNS)
 }
 
+/// Identity of a sub-agent run, used to stamp the terminal `OpEnd` event that
+/// retires the run in the supervisor. `None` for plain spawns that carry no
+/// registry identity.
+#[derive(Debug, Clone)]
+pub struct SpawnTerminalLabels {
+    pub agent_type: String,
+    pub spawn_id: String,
+    pub skill_name: Option<String>,
+}
+
 /// Configuration for [`spawn`].
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -29,6 +41,9 @@ pub struct SpawnConfig {
     pub system_message: Option<String>,
     pub prompt_context: PromptContext,
     pub context_messages: Vec<ChatMessage>,
+    /// When set, [`spawn`] emits a terminal `OpEnd` carrying these labels once
+    /// the tool loop returns.
+    pub terminal: Option<SpawnTerminalLabels>,
 }
 
 impl Default for SpawnConfig {
@@ -38,6 +53,7 @@ impl Default for SpawnConfig {
             system_message: None,
             prompt_context: PromptContext::MainChat,
             context_messages: Vec::new(),
+            terminal: None,
         }
     }
 }
@@ -84,6 +100,11 @@ impl<'a> SpawnRequest<'a> {
 
 /// Create an isolated sub-session from `parent`, apply `configure`, then run the tool loop
 /// with parent→child cancellation cascade.
+///
+/// When [`SpawnConfig::terminal`] is set, one `OpEnd` event carrying the run
+/// identity is emitted after the loop returns. The tool loop itself only emits
+/// `GenerationStart`/`GenerationEnd`, so without this event a supervisor
+/// derived from the stream would keep the run in `Running` forever.
 pub async fn spawn<F>(
     parent: &LlmSession,
     prompt: &str,
@@ -93,6 +114,13 @@ pub async fn spawn<F>(
 where
     F: FnOnce(&mut LlmSession),
 {
+    let SpawnConfig {
+        max_turns,
+        system_message,
+        prompt_context,
+        context_messages,
+        terminal,
+    } = config;
     let mut sub = parent.create_subsession();
     configure(&mut sub);
 
@@ -100,13 +128,13 @@ where
     let sub_cancel = sub.cancellation_token_arc();
 
     let loop_config = ToolLoopConfig {
-        max_turns: config.max_turns,
-        system_message: config.system_message,
-        prompt_context: config.prompt_context,
+        max_turns,
+        system_message,
+        prompt_context,
         ..ToolLoopConfig::default()
     };
     let user_msg = ChatMessage::user(prompt);
-    let run = run_tool_loop_until_done(&sub, &user_msg, &config.context_messages, &loop_config);
+    let run = run_tool_loop_until_done(&sub, &user_msg, &context_messages, &loop_config);
 
     let outcome = tokio::select! {
         outcome = run => outcome,
@@ -119,6 +147,10 @@ where
     // billed exactly like main-session turns). Totals only — see
     // TokenStats::merge_totals for why last_prompt_tokens is skipped.
     parent.merge_token_stats(&sub.token_stats());
+
+    if let Some(labels) = terminal {
+        emit_terminal_event(&sub, &labels, outcome.status);
+    }
 
     SpawnResult {
         text: outcome.text,
@@ -133,6 +165,37 @@ where
         },
         partial_messages: outcome.new_messages,
     }
+}
+
+/// Machine-readable terminal reason for a finished sub-agent run.
+fn terminal_reason(status: LoopStatus) -> &'static str {
+    match status {
+        LoopStatus::Complete => "completed",
+        LoopStatus::Incomplete => "max_turns",
+        LoopStatus::Cancelled => "cancelled",
+        LoopStatus::Fatal => "error",
+    }
+}
+
+/// Emit the single `OpEnd` that retires a sub-agent run.
+///
+/// The identity fields are written here rather than relying on the installed
+/// event proxy, so a spawn without a proxy still produces a self-describing
+/// terminal event. Enrichment is idempotent: the proxy overwrites the same
+/// four fields with identical values.
+fn emit_terminal_event(sub: &LlmSession, labels: &SpawnTerminalLabels, status: LoopStatus) {
+    let data = enrich_event_data_with_sub_agent_labels(
+        serde_json::json!({ "reason": terminal_reason(status) }),
+        &labels.agent_type,
+        &labels.spawn_id,
+        labels.skill_name.as_deref(),
+    );
+    sub.emit_event(LlmEvent {
+        event_type: LlmEventType::OpEnd,
+        data,
+        timestamp: now_timestamp(),
+        metadata: None,
+    });
 }
 
 /// Stable, machine-readable category for a sub-agent fatal error.
@@ -192,6 +255,11 @@ where
                 subagent_type: agent_type.clone(),
             },
             context_messages: request.context_messages,
+            terminal: Some(SpawnTerminalLabels {
+                agent_type: agent_type.clone(),
+                spawn_id: spawn_id.clone(),
+                skill_name: skill_name.clone(),
+            }),
         },
         |sub| {
             sub.set_tool_execution_policy(tool_execution_policy);
@@ -998,6 +1066,271 @@ mod tests {
         assert!(sub_events
             .iter()
             .any(|event| event.event_type == LlmEventType::ToolExecutionStart));
+    }
+
+    #[tokio::test]
+    async fn sub_agent_emits_terminal_opend_event() {
+        use aish_core::LlmEventType;
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+
+        // The tool loop only emits GenerationStart/GenerationEnd, so a tracker
+        // fed its stream alone would keep the run `Running` forever and the HUD
+        // would never stop spinning (#P1). `spawn_request` must add exactly one
+        // terminal `OpEnd` stamped with the run identity.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_cb = Arc::clone(&captured);
+
+        let mut parent = LlmSession::new("http://localhost", "key", "model", None, None);
+        parent.register_tool(Box::new(MockTool::new("grep")));
+        parent.set_event_callback(Arc::new(move |event| {
+            captured_cb.lock().push(event);
+            None
+        }));
+
+        let registry = AgentRegistry::builtin();
+        let _ = spawn_builtin(
+            &parent,
+            &registry,
+            "explore",
+            "find nginx",
+            |sub, _specs| {
+                configure_spawn_test(
+                    sub,
+                    vec![
+                        Ok(mock_tool_call_response(&[("c1", "grep", "{}")])),
+                        Ok(mock_text_response("done")),
+                    ],
+                );
+            },
+        )
+        .await
+        .expect("spawn_builtin should succeed");
+
+        let events = captured.lock();
+        let terminals: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event_type == LlmEventType::OpEnd
+                    && event.data.get("source").and_then(|v| v.as_str()) == Some("sub_agent")
+            })
+            .collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "exactly one sub-agent OpEnd per spawn: {:?}",
+            events
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect::<Vec<_>>()
+        );
+        let terminal = terminals[0];
+        assert_eq!(terminal.data["agent_type"], "explore");
+        assert_eq!(terminal.data["depth"], 1);
+        assert_eq!(terminal.data["reason"], "completed");
+        let spawn_id = terminal
+            .data
+            .get("spawn_id")
+            .and_then(|value| value.as_str())
+            .expect("terminal OpEnd must carry spawn_id");
+        assert!(Uuid::parse_str(spawn_id).is_ok(), "spawn_id must be a UUID");
+        // The terminal event closes the same run the progress events opened.
+        let started_id = events
+            .iter()
+            .find(|event| event.event_type == LlmEventType::GenerationStart)
+            .and_then(|event| event.data.get("spawn_id"))
+            .and_then(|value| value.as_str());
+        assert_eq!(started_id, Some(spawn_id));
+    }
+
+    #[tokio::test]
+    async fn terminal_opend_reason_tracks_outcome() {
+        use aish_core::{AishError, LlmEventType};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+
+        async fn terminal_reason_for(
+            responses: Vec<Result<crate::client::LlmResponse, AishError>>,
+            max_turns: u32,
+        ) -> String {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let captured_cb = Arc::clone(&captured);
+            let mut parent = LlmSession::new("http://localhost", "key", "model", None, None);
+            parent.set_event_callback(Arc::new(move |event| {
+                captured_cb.lock().push(event);
+                None
+            }));
+            let _ = spawn(
+                &parent,
+                "task",
+                SpawnConfig {
+                    max_turns,
+                    terminal: Some(SpawnTerminalLabels {
+                        agent_type: "explore".to_string(),
+                        spawn_id: "spawn-fixed".to_string(),
+                        skill_name: None,
+                    }),
+                    ..Default::default()
+                },
+                |sub| {
+                    disable_context_budget(sub);
+                    sub.set_test_chat_responses(responses);
+                    sub.register_tool(Box::new(MockTool::new("grep")));
+                },
+            )
+            .await;
+            let events = captured.lock();
+            let terminal = events
+                .iter()
+                .find(|event| event.event_type == LlmEventType::OpEnd)
+                .expect("terminal OpEnd");
+            assert_eq!(terminal.data["source"], "sub_agent");
+            terminal.data["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }
+
+        assert_eq!(
+            terminal_reason_for(vec![Ok(mock_text_response("done"))], 5).await,
+            "completed"
+        );
+        assert_eq!(
+            terminal_reason_for(
+                vec![Ok(mock_tool_call_response(&[("c1", "grep", "{}")]))],
+                1
+            )
+            .await,
+            "max_turns"
+        );
+        assert_eq!(
+            terminal_reason_for(vec![Err(AishError::Llm("boom".into()))], 5).await,
+            "error"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_opend_is_emitted_for_cancelled_spawn() {
+        use aish_core::LlmEventType;
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_cb = Arc::clone(&captured);
+        let mut parent = LlmSession::new("http://localhost", "key", "model", None, None);
+        parent.set_event_callback(Arc::new(move |event| {
+            captured_cb.lock().push(event);
+            None
+        }));
+        parent.cancellation_token().cancel();
+
+        let result = spawn(
+            &parent,
+            "long task",
+            SpawnConfig {
+                max_turns: 5,
+                terminal: Some(SpawnTerminalLabels {
+                    agent_type: "explore".to_string(),
+                    spawn_id: "spawn-cancel".to_string(),
+                    skill_name: None,
+                }),
+                ..Default::default()
+            },
+            |sub| disable_context_budget(sub),
+        )
+        .await;
+        assert_eq!(result.status, LoopStatus::Cancelled);
+
+        let events = captured.lock();
+        let terminal = events
+            .iter()
+            .find(|event| event.event_type == LlmEventType::OpEnd)
+            .expect("cancelled spawn must still emit a terminal OpEnd");
+        assert_eq!(terminal.data["source"], "sub_agent");
+        assert_eq!(terminal.data["spawn_id"], "spawn-cancel");
+        assert_eq!(terminal.data["reason"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn spawn_without_terminal_labels_emits_no_opend() {
+        // Plain `spawn` callers have no run identity; emitting a sourceless
+        // OpEnd would pollute the parent turn's event stream.
+        use aish_core::LlmEventType;
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_cb = Arc::clone(&captured);
+        let mut parent = LlmSession::new("http://localhost", "key", "model", None, None);
+        parent.set_event_callback(Arc::new(move |event| {
+            captured_cb.lock().push(event);
+            None
+        }));
+
+        let result = spawn(&parent, "task", SpawnConfig::default(), |sub| {
+            disable_context_budget(sub);
+            sub.set_test_chat_responses(vec![Ok(mock_text_response("done"))]);
+        })
+        .await;
+        assert_eq!(result.status, LoopStatus::Complete);
+
+        let events = captured.lock();
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == LlmEventType::OpEnd));
+    }
+
+    #[tokio::test]
+    async fn spawned_run_leaves_supervisor_idle() {
+        // End-to-end shape of the HUD bug: the supervisor only sees the event
+        // stream, so the stream alone must be enough to retire a finished run.
+        // Before the terminal OpEnd was emitted, `running_agents()` stayed at 1
+        // and the footer spun forever.
+        let mut supervisor = aish_supervisor::Supervisor::new();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_cb = Arc::clone(&seen);
+
+        let mut parent = LlmSession::new("http://localhost", "key", "model", None, None);
+        parent.register_tool(Box::new(MockTool::new("grep")));
+        parent.set_event_callback(Arc::new(move |event| {
+            seen_cb.lock().push(event);
+            None
+        }));
+
+        let registry = AgentRegistry::builtin();
+        let result = spawn_builtin(
+            &parent,
+            &registry,
+            "explore",
+            "find nginx",
+            |sub, _specs| {
+                configure_spawn_test(
+                    sub,
+                    vec![
+                        Ok(mock_tool_call_response(&[("c1", "grep", "{}")])),
+                        Ok(mock_text_response("done")),
+                    ],
+                );
+            },
+        )
+        .await
+        .expect("spawn_builtin should succeed");
+        assert_eq!(result.status, LoopStatus::Complete);
+
+        for event in seen.lock().iter() {
+            supervisor.observe(event);
+        }
+
+        assert_eq!(
+            supervisor.running_agents(),
+            0,
+            "a finished sub-agent must not stay running in the supervisor"
+        );
+        let runs = supervisor.snapshot().agents;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].agent_type, "explore");
+        assert_eq!(runs[0].state, aish_supervisor::AgentState::Completed);
+        assert_eq!(runs[0].tool_calls, 1);
     }
 
     #[tokio::test]

@@ -20,6 +20,17 @@
 //! [`QueueSink`] whose rows are committed as history immediately before every
 //! paint.
 //!
+//! The submit callback runs inline on the REPL's thread, and a product callback
+//! (an AI turn, a long command) can occupy it for seconds. Nothing would paint
+//! during that time, so rows queued by that very callback would only surface
+//! after it returned — the tool card and the streamed answer would appear all
+//! at once at the end. The REPL therefore *parks* the live band around the
+//! callback (see [`Repl::park`]): one frame with an empty viewport releases the
+//! screen, the queue sink is swapped for the direct writer the terminal is
+//! already used to, and the callback's output lands as it is produced. On the
+//! way back the queue sink is reinstalled, the frame memo is invalidated (the
+//! callback moved the cursor) and the band is repainted from scratch.
+//!
 //! # Testability
 //!
 //! [`Repl`] is generic over `Read`/`Write`, so a unit test drives it with
@@ -53,7 +64,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::caps::detect_caps;
 use crate::completion::{
-    common_prefix, token_range, Candidate, CompletionSource, WordListSource, MAX_CANDIDATES,
+    common_prefix, token_range, Candidate, CompletionSource, SlashCommandSource, WordListSource,
+    MAX_CANDIDATES,
 };
 use crate::component::{render_lines_to_viewport, InputHandled, Interactive};
 use crate::editor::Editor;
@@ -66,8 +78,65 @@ use crate::panel::{PanelAction, SupervisorPanel};
 use crate::render::{prepare_line, visible_width};
 use crate::renderer::{Renderer, TerminalCaps};
 
+/// Enable output processing (`OPOST`/`ONLCR`) on the terminal for the park.
+///
+/// Returns the attributes to restore, or `None` when they cannot be changed
+/// (not a tty, or the platform is not unix). Crossterm's raw mode clears these
+/// flags, so without this a bare `\n` from [`crate::output::StdoutSink`] moves
+/// the cursor down without returning to column 1.
+#[cfg(unix)]
+fn enable_output_processing() -> Option<libc::termios> {
+    let fd = libc::STDOUT_FILENO;
+    // SAFETY: `termios` is a plain C struct; zeroed is a valid starting point
+    // that `tcgetattr` overwrites, and `fd` is stdout (an open descriptor).
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+        return None;
+    }
+    let mut flags = saved;
+    flags.c_oflag |= libc::OPOST | libc::ONLCR;
+    // SAFETY: `flags` is a fully initialized termios for the fd we just read.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &flags) } != 0 {
+        return None;
+    }
+    Some(saved)
+}
+
+/// Put the terminal attributes back as the park found them.
+#[cfg(unix)]
+fn restore_output_processing(saved: libc::termios) {
+    let fd = libc::STDOUT_FILENO;
+    // SAFETY: `saved` came from `tcgetattr` on this same fd.
+    unsafe {
+        libc::tcsetattr(fd, libc::TCSANOW, &saved);
+    }
+}
+
+/// RAII restore for a parked REPL.
+///
+/// Drop runs on the unwind path too: a product callback that panics must not
+/// leave the process-wide sink pointing at the direct writer, or every later
+/// producer would write to a terminal the renderer believes it owns and the
+/// next frame would repaint over the rows that landed in between.
+struct ParkGuard<'a, W: Write, R: Read> {
+    repl: &'a mut Repl<W, R>,
+    /// The sink to put back in the process-wide slot, or `None` when the park
+    /// did not swap one.
+    restore: Option<Arc<dyn OutputSink>>,
+}
+
+impl<W: Write, R: Read> Drop for ParkGuard<'_, W, R> {
+    fn drop(&mut self) {
+        self.repl.unpark(self.restore.take());
+    }
+}
+
 /// Completion menu rows the viewport may show at once.
-pub const MENU_ROWS: usize = 8;
+///
+/// Ten rows hold the most-used head of the slash-command catalogue (`/model`,
+/// `/status`, `/live_sessions` all land inside it) without the menu eating the
+/// viewport of a small terminal.
+pub const MENU_ROWS: usize = 10;
 
 /// Maximum output rows one command may commit (a `yes` run must not fill the
 /// scrollback with a million rows in one batch).
@@ -231,6 +300,18 @@ pub struct Repl<W: Write, R: Read> {
     panel_open: bool,
     /// Whether [`Repl::finish`] already wrote the terminal restore sequence.
     restored: bool,
+    /// Sink installed process-wide while the screen is parked.
+    ///
+    /// A [`crate::output::StdoutSink`] in production: the product's streaming
+    /// code keys its legacy cursor-motion overlays off that exact type, and
+    /// those overlays are correct while the band is released. Tests substitute
+    /// a recording sink so they can assert on what the callback wrote without
+    /// touching fd 1.
+    park_sink: Arc<dyn OutputSink>,
+    /// Terminal attributes to restore once the park ends, saved when the park
+    /// re-enabled output processing on the tty.
+    #[cfg(unix)]
+    park_tty: Option<libc::termios>,
 }
 
 impl<W: Write, R: Read> Repl<W, R> {
@@ -274,6 +355,9 @@ impl<W: Write, R: Read> Repl<W, R> {
             panel: SupervisorPanel::new(),
             panel_open: false,
             restored: false,
+            park_sink: Arc::new(crate::output::StdoutSink),
+            #[cfg(unix)]
+            park_tty: None,
         }
     }
 
@@ -628,6 +712,93 @@ impl<W: Write, R: Read> Repl<W, R> {
         self.restored
     }
 
+    /// Give the screen back to the product for the duration of a callback.
+    ///
+    /// The submit callback runs inline, and a product callback (an AI turn, a
+    /// long command) can hold the thread for seconds. While it does, no frame
+    /// is painted, so a [`QueueSink`] would accumulate the callback's rows and
+    /// surface them only at the end: the tool card and the streamed answer
+    /// would appear in one burst instead of as they happen.
+    ///
+    /// Parking removes both obstacles:
+    ///
+    /// * one frame with an **empty viewport** clears the live band (prompt,
+    ///   ghost text, menu, HUD) and leaves the cursor on a fresh row, the same
+    ///   state [`Repl::finish`] leaves the terminal in;
+    /// * the configured [`QueueSink`] is swapped out of the process-wide slot
+    ///   for a [`DirectSink`], so producers write straight to the terminal —
+    ///   what the legacy shell does — and their output shows up as it is
+    ///   produced.
+    ///
+    /// The returned guard restores both ([`Repl::unpark`]), on the normal and
+    /// on the unwinding path alike.
+    ///
+    /// A REPL with no sink — or one whose sink is not the installed global
+    /// sink — parks nothing: there is no queue to drain and no screen state to
+    /// release, so the callback runs exactly as it did before parking existed.
+    fn park(&mut self) -> io::Result<ParkGuard<'_, W, R>> {
+        let restore = self
+            .config
+            .sink
+            .as_ref()
+            .filter(|sink| sink.owns_screen() && Arc::ptr_eq(&crate::output::global_sink(), sink))
+            .cloned();
+        let Some(restore) = restore else {
+            return Ok(ParkGuard {
+                repl: self,
+                restore: None,
+            });
+        };
+
+        // Release the band before switching sinks: the frame must go through
+        // the renderer (which still owns the memo), and the row the callback's
+        // output will follow has to be committed first.
+        self.drain_sink();
+        self.sync_geometry();
+        let width = self.renderer.caps().width;
+        let history = self.take_history(width);
+        self.renderer.draw(Frame {
+            history,
+            viewport: Vec::new(),
+        })?;
+
+        crate::output::install_global_sink(Arc::clone(&self.park_sink));
+        // StdoutSink writes bare `\n`, relying on the tty to return to column
+        // 1. The TUI holds the terminal in crossterm's raw mode, which clears
+        // `OPOST`, so those newlines would staircase the shown output. Turn
+        // output processing back on for the park — the legacy shell never
+        // clears it — and restore crossterm's attributes afterwards.
+        #[cfg(unix)]
+        if self.auto_resize {
+            self.park_tty = enable_output_processing();
+        }
+        Ok(ParkGuard {
+            repl: self,
+            restore: Some(restore),
+        })
+    }
+
+    /// Take the screen back after a parked callback.
+    ///
+    /// The callback wrote straight to the terminal, so every remembered row is
+    /// stale: the memo is invalidated and the next paint rewrites the whole
+    /// band. Putting the queue sink back in the process-wide slot is what makes
+    /// producers queue rows for the REPL again.
+    ///
+    /// Called exactly once, from [`ParkGuard::drop`] — including on the unwind
+    /// path, so a panicking callback still leaves the process consistent.
+    fn unpark(&mut self, restore: Option<Arc<dyn OutputSink>>) {
+        let Some(sink) = restore else {
+            return;
+        };
+        #[cfg(unix)]
+        if let Some(saved) = self.park_tty.take() {
+            restore_output_processing(saved);
+        }
+        crate::output::install_global_sink(sink);
+        self.renderer.invalidate();
+    }
+
     /// Handle one input unit; `Ok(true)` means the REPL should exit.
     fn dispatch<F>(&mut self, event: &InputEvent, on_submit: &mut F) -> io::Result<bool>
     where
@@ -692,7 +863,18 @@ impl<W: Write, R: Read> Repl<W, R> {
         self.commit_line(line);
         self.remember(line);
 
-        match on_submit(line) {
+        // Release the screen for the callback's whole duration: it runs inline
+        // and may take seconds, and nothing would paint the rows it produces
+        // until it returned. The guard puts the sink and the frame memo back
+        // however the callback ends.
+        let action = {
+            let parked = self.park()?;
+            let action = on_submit(line);
+            drop(parked);
+            action
+        };
+
+        match action {
             ReplAction::Continue => Ok(false),
             ReplAction::Exit => Ok(true),
             ReplAction::Clear => {
@@ -1002,7 +1184,16 @@ pub fn run_standalone(prompt: &str, history_path: Option<PathBuf>) -> io::Result
         hud: None,
         panel: None,
     };
-    let sources: Vec<Box<dyn CompletionSource>> = vec![Box::new(WordListSource::new(demo_words()))];
+    // The demo product owns exactly these commands; the product entry point
+    // (`crate::run_shell_repl`) hands in the shell's real catalogue instead.
+    let slash: Vec<(String, String)> = ["/help", "/exit", "/clear"]
+        .into_iter()
+        .map(|name| (name.to_string(), String::new()))
+        .collect();
+    let sources: Vec<Box<dyn CompletionSource>> = vec![
+        Box::new(SlashCommandSource::new(slash)),
+        Box::new(WordListSource::new(crate::completion::path_words())),
+    ];
     let mut repl = Repl::new(
         io::BufWriter::with_capacity(8192, io::stdout()),
         io::stdin(),
@@ -1017,73 +1208,6 @@ pub fn run_standalone(prompt: &str, history_path: Option<PathBuf>) -> io::Result
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         other => other,
     }
-}
-
-/// Maximum number of `PATH` executables offered as completions.
-///
-/// A real desktop `PATH` holds thousands of entries, more than a completion
-/// source is worth scanning per keystroke.
-const DEMO_WORD_CAP: usize = 500;
-
-/// Upper bound on directory entries inspected while building the vocabulary.
-const SCAN_CAP: usize = 20_000;
-
-/// Completion vocabulary: builtins first, then executables found on `PATH`.
-///
-/// The cap keeps the *shortest* names: that is where the heavily used commands
-/// live (`ls`, `cd`, `git`), and a cutoff by directory order would drop them
-/// for whichever packages happened to be read last.
-pub(crate) fn demo_words() -> Vec<String> {
-    let mut words = vec![
-        "/help".to_string(),
-        "/exit".to_string(),
-        "/clear".to_string(),
-    ];
-    let Some(path) = std::env::var_os("PATH") else {
-        return words;
-    };
-
-    let mut found: Vec<String> = Vec::new();
-    for dir in std::env::split_paths(&path) {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            // Bound the scan: a pathological directory (a package cache, a
-            // tensor blob dir) must not stall startup.
-            if found.len() >= SCAN_CAP {
-                break;
-            }
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if !meta.is_file() || !is_executable(&meta) {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                if !name.starts_with('.') {
-                    found.push(name.to_string());
-                }
-            }
-        }
-    }
-
-    found.sort_unstable();
-    found.dedup();
-    found.sort_by_key(|name| (name.chars().count(), name.clone()));
-    words.extend(found.into_iter().take(DEMO_WORD_CAP));
-    words
-}
-
-#[cfg(unix)]
-fn is_executable(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_meta: &std::fs::Metadata) -> bool {
-    true
 }
 
 /// Demo product: slash commands, otherwise `bash -c` with committed output.
@@ -1397,15 +1521,17 @@ mod tests {
     }
 
     #[test]
-    fn menu_is_capped_at_eight_rows() {
+    fn menu_is_capped_at_ten_rows() {
+        // Two candidates past the cap, so the overflow hint must appear.
         let mut repl = repl(
             b"c\t",
             words(&[
                 "cmd0", "cmd1", "cmd2", "cmd3", "cmd4", "cmd5", "cmd6", "cmd7", "cmd8", "cmd9",
+                "cmd10", "cmd11",
             ]),
         );
         run(&mut repl, |_| ReplAction::Continue);
-        assert_eq!(repl.menu().len(), 10);
+        assert_eq!(repl.menu().len(), 12);
         let rows = repl.menu_rows();
         assert_eq!(rows.len(), MENU_ROWS + 1, "overflow hint missing");
         assert!(rows.last().unwrap().contains('…'));
@@ -1847,5 +1973,233 @@ mod tests {
             1,
             "restore sequence emitted more than once: {bytes:?}"
         );
+    }
+
+    // ── park / unpark around the submit callback ───────────────────────────
+
+    /// Sink that records everything written while the screen is parked.
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        written: Mutex<Vec<String>>,
+    }
+
+    impl RecordingSink {
+        fn rows(&self) -> Vec<String> {
+            self.written.lock().expect("lock").clone()
+        }
+    }
+
+    impl OutputSink for RecordingSink {
+        fn line(&self, text: &str) {
+            self.written.lock().expect("lock").push(text.to_string());
+        }
+
+        fn raw(&self, text: &str) {
+            self.written.lock().expect("lock").push(text.to_string());
+        }
+
+        fn flush_raw(&self) {}
+
+        fn request_repaint(&self) {}
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// REPL installed as the process-wide sink, so `park` performs a real swap.
+    fn parked_repl(
+        input: &[u8],
+        queue: &Arc<QueueSink>,
+        park_sink: Arc<dyn OutputSink>,
+    ) -> Repl<Vec<u8>, Cursor<Vec<u8>>> {
+        let mut repl = repl_with_sink(input, queue);
+        repl.park_sink = park_sink;
+        crate::output::install_global_sink(Arc::clone(queue) as Arc<dyn OutputSink>);
+        repl
+    }
+
+    #[test]
+    fn park_restores_queue_sink_after_submit() {
+        let _lock = crate::lock_global_sink();
+        let queue = Arc::new(QueueSink::new());
+        let recording: Arc<dyn OutputSink> = Arc::new(RecordingSink::default());
+        let mut repl = parked_repl(b"line\r", &queue, Arc::clone(&recording));
+
+        let mut installed_during = None;
+        run(&mut repl, |_| {
+            installed_during = Some(crate::global_sink());
+            ReplAction::Continue
+        });
+
+        let during = installed_during.expect("callback did not run");
+        assert!(
+            Arc::ptr_eq(&during, &recording),
+            "the callback did not run against the direct sink"
+        );
+        // The queue is back: later producers queue instead of painting.
+        assert!(
+            Arc::ptr_eq(
+                &crate::global_sink(),
+                &(queue.clone() as Arc<dyn OutputSink>)
+            ),
+            "unpark did not restore the queue sink"
+        );
+        assert!(crate::screen_owned(), "the renderer lost the screen");
+    }
+
+    #[test]
+    fn park_writes_through_the_direct_sink_during_submit() {
+        let _lock = crate::lock_global_sink();
+        let queue = Arc::new(QueueSink::new());
+        let recording = Arc::new(RecordingSink::default());
+        let mut repl = parked_repl(
+            b"go\r",
+            &queue,
+            Arc::clone(&recording) as Arc<dyn OutputSink>,
+        );
+
+        run(&mut repl, |_| {
+            // What an AI turn or a tool does: produce rows while it runs. They
+            // must reach the terminal now, not after the callback returns.
+            crate::global_sink().line("tool card");
+            crate::global_sink().raw("streamed ");
+            crate::global_sink().flush_raw();
+            assert_eq!(
+                recording.rows(),
+                ["tool card", "streamed "],
+                "callback output was not written through the direct sink"
+            );
+            ReplAction::Continue
+        });
+
+        // Nothing of it was queued: the queue sink was not installed.
+        assert!(
+            queue.drain().is_empty(),
+            "rows were queued instead of written"
+        );
+    }
+
+    #[test]
+    fn park_guard_restores_on_panic() {
+        let _lock = crate::lock_global_sink();
+        let queue = Arc::new(QueueSink::new());
+        let mut repl = parked_repl(
+            b"boom\r",
+            &queue,
+            Arc::new(RecordingSink::default()) as Arc<dyn OutputSink>,
+        );
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(&mut repl, |_| panic!("callback exploded"));
+        }));
+        assert!(panicked.is_err(), "the callback did not panic");
+        // The guard ran while unwinding, so the process-wide slot is sane and
+        // the next paint cannot land on top of the callback's rows.
+        assert!(
+            Arc::ptr_eq(
+                &crate::global_sink(),
+                &(queue.clone() as Arc<dyn OutputSink>)
+            ),
+            "a panicking callback left the direct sink installed"
+        );
+        assert!(crate::screen_owned(), "the dead screen stayed parked");
+    }
+
+    #[test]
+    fn no_sink_config_does_not_touch_global() {
+        let _lock = crate::lock_global_sink();
+        let foreign = Arc::new(QueueSink::new());
+        crate::output::install_global_sink(Arc::clone(&foreign) as Arc<dyn OutputSink>);
+
+        // No `sink` configured: the REPL is a pure input component and must not
+        // swap the slot — that sink belongs to somebody else.
+        let mut repl = repl(b"x\r", Vec::new());
+        run(&mut repl, |_| ReplAction::Continue);
+
+        assert!(
+            Arc::ptr_eq(
+                &crate::global_sink(),
+                &(foreign.clone() as Arc<dyn OutputSink>)
+            ),
+            "a sink-less REPL swapped the process-wide sink"
+        );
+    }
+
+    /// Byte sink shared with the test, so it can look at the screen *while* the
+    /// submit callback is still running.
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedWriter {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("lock")).into_owned()
+        }
+    }
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn park_releases_the_live_band_before_the_callback() {
+        let _lock = crate::lock_global_sink();
+        let queue = Arc::new(QueueSink::new());
+        crate::output::install_global_sink(Arc::clone(&queue) as Arc<dyn OutputSink>);
+
+        let writer = SharedWriter::default();
+        let mut repl = Repl::with_caps(
+            writer.clone(),
+            Cursor::new(b"echo hi\r".to_vec()),
+            ReplConfig {
+                prompt: "> ".to_string(),
+                prompt_provider: None,
+                history_path: None,
+                auto_suggest: false,
+                sink: Some(Arc::clone(&queue) as Arc<dyn OutputSink>),
+                hud: None,
+                panel: None,
+            },
+            Vec::new(),
+            CAPS,
+        );
+        repl.park_sink = Arc::new(RecordingSink::default());
+
+        let mut seen = None;
+        let mut owned_during = None;
+        let submitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&submitted);
+        repl.run(|line| {
+            record.lock().expect("lock").push(line.to_string());
+            seen = Some(writer.text());
+            owned_during = Some(crate::screen_owned());
+            ReplAction::Continue
+        })
+        .expect("REPL run");
+
+        assert_eq!(submitted.lock().expect("lock").as_slice(), ["echo hi"]);
+        let bytes = seen.expect("callback did not run");
+        // The submitted row is history by now, and the last frame written was
+        // the empty viewport: it ends with the cursor being shown again.
+        assert!(
+            bytes.contains("> echo hi"),
+            "the submitted line was not committed before the callback: {bytes:?}"
+        );
+        assert!(
+            bytes.ends_with("\x1b[?25h"),
+            "the band was not cleared before the callback: {bytes:?}"
+        );
+        // Nothing owned the screen while the callback ran: it could write fd 1
+        // directly, exactly like the legacy path.
+        assert_eq!(owned_during, Some(false), "the screen was still parked");
+        // And the queue is back once the REPL resumed.
+        assert!(crate::screen_owned(), "the REPL never took the screen back");
     }
 }

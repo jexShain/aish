@@ -21,10 +21,10 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::completion::{CompletionSource, WordListSource};
+use crate::completion::{path_words, CompletionSource, SlashCommandSource, WordListSource};
 use crate::output::{OutputSink, QueueSink};
 use crate::repl::{
-    demo_words, HudSource, PanelHandle, PromptSource, Repl, ReplAction, ReplConfig, TerminalGuard,
+    HudSource, PanelHandle, PromptSource, Repl, ReplAction, ReplConfig, TerminalGuard,
 };
 
 /// Run the interactive shell REPL, calling `on_submit` for every accepted line.
@@ -37,6 +37,11 @@ use crate::repl::{
 /// state (working directory, exit code, background tasks) is visible without
 /// the REPL knowing anything about it.
 ///
+/// `slash_commands` is the product's slash-command catalogue as
+/// `(name, description)` pairs, in menu order. The shell owns the catalogue but
+/// this crate sits *below* it in the dependency graph, so the caller passes it
+/// in rather than the REPL reaching for it.
+///
 /// `hud` and `panel` are the supervision integrations: `None` for either means
 /// the REPL paints and reads exactly what it did before the feature existed.
 ///
@@ -48,6 +53,7 @@ use crate::repl::{
 pub fn run_shell_repl<F>(
     prompt: PromptSource,
     history_path: Option<PathBuf>,
+    slash_commands: Vec<(String, String)>,
     hud: Option<HudSource>,
     panel: Option<Arc<PanelHandle>>,
     on_submit: F,
@@ -76,7 +82,14 @@ where
         hud,
         panel,
     };
-    let sources: Vec<Box<dyn CompletionSource>> = vec![Box::new(WordListSource::new(demo_words()))];
+    // Slash commands first: they only answer for a `/`-prefixed token, so the
+    // catalogue never crowds out a command or path candidate.
+    let mut sources: Vec<Box<dyn CompletionSource>> = Vec::new();
+    let slash_source = SlashCommandSource::new(slash_commands);
+    if !slash_source.is_empty() {
+        sources.push(Box::new(slash_source));
+    }
+    sources.push(Box::new(WordListSource::new(path_words())));
     let mut repl = Repl::new(
         io::BufWriter::with_capacity(8192, io::stdout()),
         io::stdin(),
@@ -114,14 +127,11 @@ fn restore_sink() {
 mod tests {
     use super::*;
 
-    /// The global sink is process state, so the tests that touch it must not
-    /// run concurrently with each other.
-    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
     #[test]
     fn install_then_restore_swaps_the_global_sink() {
-        let _guard = TEST_LOCK.lock();
-        restore_sink();
+        // Shared with every other test that installs a process-wide sink.
+        let _guard = crate::lock_global_sink();
+        assert!(!crate::screen_owned());
         assert!(crate::global_sink().as_any().is::<crate::StdoutSink>());
 
         let sink = Arc::new(QueueSink::new());
@@ -137,8 +147,7 @@ mod tests {
 
     #[test]
     fn submitted_lines_reach_the_callback() {
-        let _guard = TEST_LOCK.lock();
-        restore_sink();
+        let _guard = crate::lock_global_sink();
 
         let mut repl = Repl::with_caps(
             Vec::new(),
@@ -172,8 +181,7 @@ mod tests {
 
     #[test]
     fn exit_action_stops_the_loop() {
-        let _guard = TEST_LOCK.lock();
-        restore_sink();
+        let _guard = crate::lock_global_sink();
 
         let mut repl = Repl::with_caps(
             Vec::new(),

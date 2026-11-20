@@ -79,6 +79,15 @@ fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     }
 }
 
+/// How long a finished sub-agent run stays in the live snapshot.
+///
+/// The panel is the "who is working right now" screen, but a run that just
+/// finished should stay readable for a moment instead of vanishing the instant
+/// its terminal event lands. After this window the row is dropped, so a shell
+/// with a long history does not accumulate agent rows (and `Agents(n)` in the
+/// panel header returns to zero).
+const FINISHED_RUN_RETENTION_MS: u64 = 3_000;
+
 /// Owns the agent tracker and produces snapshots on demand.
 pub struct Supervisor {
     agents: AgentTracker,
@@ -106,6 +115,9 @@ impl Supervisor {
 
     /// Take a full snapshot (re-reads tasks/sessions from their sources).
     pub fn snapshot(&mut self) -> SupervisorSnapshot {
+        // Finished runs age out of the live view so the panel header and the
+        // HUD describe what is running, not everything that ever ran.
+        self.agents.prune_finished(FINISHED_RUN_RETENTION_MS);
         self.last = SupervisorSnapshot {
             agents: self.agents.runs(),
             tasks: tasks::snapshot(),
@@ -122,6 +134,14 @@ impl Supervisor {
     /// Number of sub-agent runs still running.
     pub fn running_agents(&self) -> usize {
         self.agents.running_count()
+    }
+
+    /// Retire runs that stopped reporting for `idle_ms`; returns how many were
+    /// finished. Fail-safe for a spawn path that never emitted a terminal
+    /// event — without it the HUD would stay busy forever. Not called by the
+    /// render path: a live-but-quiet agent must not be declared finished.
+    pub fn finish_stale(&mut self, idle_ms: u64) -> usize {
+        self.agents.finish_stale(idle_ms)
     }
 }
 

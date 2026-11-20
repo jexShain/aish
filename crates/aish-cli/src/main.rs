@@ -839,6 +839,7 @@ fn run_ui_v2(shell: &mut aish_shell::AishShell) -> bool {
     match aish_tui::run_shell_repl(
         prompt,
         history_path,
+        aish_shell::slash_command_catalog(),
         Some(hud_source),
         Some(panel),
         |line| {
