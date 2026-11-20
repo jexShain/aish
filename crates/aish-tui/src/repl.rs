@@ -60,7 +60,7 @@ use crate::editor::Editor;
 use crate::frame::{Frame, HistoryBatch};
 use crate::highlight::{DIM, RESET};
 use crate::hud::HudState;
-use crate::input::{InputEvent, InputParser, Key};
+use crate::input::{InputEvent, InputParser, Key, ESCAPE_INACTIVITY};
 use crate::output::{OutputSink, QueueSink};
 use crate::panel::{PanelAction, SupervisorPanel};
 use crate::render::{prepare_line, visible_width};
@@ -277,6 +277,34 @@ impl<W: Write, R: Read> Repl<W, R> {
         }
     }
 
+    /// Whether the reader has bytes ready within [`ESCAPE_INACTIVITY`].
+    ///
+    /// Used to decide whether a pending lone ESC heads a longer sequence (a
+    /// real key press) or is the Escape key itself. `Read` has no readiness
+    /// API, so this polls the file descriptor when the reader is a real stdin;
+    /// a test reader (a `Cursor`) always reports ready, which keeps the tests
+    /// deterministic.
+    fn reader_ready(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = std::io::stdin().as_raw_fd();
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = ESCAPE_INACTIVITY.as_millis() as libc::c_int;
+            // `poll` may be interrupted; a negative return also means "not
+            // ready", which settles the ESC rather than blocking.
+            unsafe { libc::poll(&mut poll_fd, 1, timeout) > 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
     /// Adopt the terminal's current geometry before painting.
     ///
     /// A resize invalidates the renderer's frame memo and changes the width
@@ -350,6 +378,17 @@ impl<W: Write, R: Read> Repl<W, R> {
             }
 
             if pending.is_empty() {
+                // A lone ESC may head a longer sequence (arrow keys, Alt+char),
+                // so it must not be emitted immediately — but it also must not
+                // wait forever, or the next keystroke typed 100 ms later would
+                // be swallowed as `Alt(ch)`. Poll with the escape timeout and
+                // settle the pending bytes when it expires.
+                if !self.parser.pending().is_empty() && !self.reader_ready() {
+                    pending.extend(self.parser.flush());
+                    if !pending.is_empty() {
+                        continue;
+                    }
+                }
                 let read = match self.reader.read(&mut chunk) {
                     Ok(0) => {
                         // EOF: settle a trailing ambiguous sequence (a bare

@@ -39,6 +39,13 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 const MAX_PASTE_BYTES: usize = 1024 * 1024;
 /// How long a paste may sit without new bytes before it is abandoned.
 pub const PASTE_INACTIVITY: Duration = Duration::from_secs(1);
+/// How long a lone ESC may sit before it is committed as the Escape key.
+///
+/// A terminal sends Alt+<char> as ESC + char, so an ESC cannot be emitted
+/// immediately; but waiting forever made the next keystroke (600 ms later, far
+/// past any terminal sequence) be swallowed as `Alt(ch)`, which the editor does
+/// not bind. 50 ms is below human typing speed and above any real sequence.
+pub const ESCAPE_INACTIVITY: Duration = Duration::from_millis(50);
 /// A CSI parameter run longer than this is not a key this parser understands.
 const MAX_CSI_BYTES: usize = 64;
 

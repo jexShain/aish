@@ -8,6 +8,7 @@ description = "Dual-channel (history + viewport) terminal renderer for aish"
 
 [dependencies]
 aish-core.workspace = true
+libc.workspace = true
 aish-supervisor.workspace = true
 crossterm.workspace = true
 parking_lot.workspace = true

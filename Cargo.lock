@@ -392,6 +392,7 @@ dependencies = [
  "aish-core",
  "aish-supervisor",
  "crossterm 0.28.1",
+ "libc",
  "parking_lot",
  "tempfile",
  "thiserror 2.0.21",
