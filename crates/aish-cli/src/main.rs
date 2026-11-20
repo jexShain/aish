@@ -74,6 +74,10 @@ struct Cli {
     #[arg(short = 'c', long = "continue")]
     continue_session: bool,
 
+    /// Use the legacy rustyline front end instead of the dual-channel TUI
+    #[arg(long = "legacy-ui")]
+    legacy_ui: bool,
+
     #[arg(long, hide = true)]
     sandbox_daemon: bool,
 
@@ -604,24 +608,43 @@ enum RegistryAction {
     Remove { name: String },
 }
 
-/// Environment variable selecting the next-generation UI.
+/// Environment variable selecting the shell front end.
+///
+/// The dual-channel TUI is the default; `AISH_UI=legacy` (or `--legacy-ui`)
+/// falls back to the rustyline loop.
 const UI_SELECT_ENV: &str = "AISH_UI";
 
-/// Prompt of the v2 REPL launched by `AISH_UI=v2`.
-const UI_V2_PROMPT: &str = "◆ aish ➜ ";
+/// Value of [`UI_SELECT_ENV`] that selects the legacy rustyline front end.
+const UI_LEGACY_VALUE: &str = "legacy";
 
-/// Whether this invocation should run the v2 REPL instead of the legacy shell.
+/// Whether this invocation should run the legacy rustyline shell.
 ///
-/// Only a plain interactive launch qualifies: the hidden entry points (sandbox
-/// and PTY daemons, attach/remote helpers) inherit the environment from the
-/// shell that spawned them, so they must never be diverted onto the REPL.
-fn ui_v2_requested(cli: &Cli) -> bool {
-    if std::env::var(UI_SELECT_ENV).as_deref() != Ok("v2") || cli.command.is_some() {
-        return false;
+/// The dual-channel REPL is the default for a plain interactive launch; the
+/// legacy loop is opted into with `AISH_UI=legacy` or `--legacy-ui` (and kept
+/// for every non-interactive launch, where the REPL cannot own a terminal).
+///
+/// The hidden entry points (sandbox and PTY daemons, attach/remote helpers)
+/// always use the legacy path: they inherit the environment from the shell that
+/// spawned them, so an inherited `AISH_UI` must never divert them.
+fn legacy_ui_requested(cli: &Cli) -> bool {
+    let env_legacy = std::env::var(UI_SELECT_ENV).as_deref() == Ok(UI_LEGACY_VALUE);
+    legacy_ui_requested_for(cli, env_legacy)
+}
+
+/// The selection itself, with the environment read by the caller.
+///
+/// Split out so the decision is a pure function of the parsed CLI and one
+/// boolean: a test never has to mutate the process environment.
+fn legacy_ui_requested_for(cli: &Cli, env_legacy: bool) -> bool {
+    if cli.command.is_some() {
+        return true;
+    }
+    if cli.legacy_ui || env_legacy {
+        return true;
     }
     // Session continuation and the hidden entry points are legacy-shell
     // behaviours; diverting them onto the REPL would silently drop the request.
-    let internal_entry = cli.continue_session
+    cli.continue_session
         || cli.sandbox_daemon
         || cli.sandbox_socket.is_some()
         || cli.sandbox_worker
@@ -643,19 +666,18 @@ fn ui_v2_requested(cli: &Cli) -> bool {
         || cli.remote_diagnose
         || cli.checks.is_some()
         || cli.enforce_read_only
-        || cli.since.is_some();
-    !internal_entry
+        || cli.since.is_some()
 }
 
-/// Whether the v2 UI was requested by this invocation.
+/// Whether the dual-channel UI is enabled for this invocation.
 ///
-/// Set once in `main` from [`ui_v2_requested`]: the decision needs the parsed
-/// CLI (hidden entry points must never be diverted), but it is acted on only
-/// after the config was loaded and the shell built, so a fallback to the legacy
-/// loop is a plain `false` rather than a restart.
+/// Set once in `main` from [`legacy_ui_requested`]: the decision needs the
+/// parsed CLI (hidden entry points must never be diverted), but it is acted on
+/// only after the config was loaded and the shell built, so a fallback to the
+/// legacy loop is a plain `false` rather than a restart.
 static UI_V2_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether the v2 shell should run right now.
+/// Whether the dual-channel shell should run right now.
 ///
 /// A missing terminal is not an error the user can act on by retrying, so it is
 /// reported as a one-line hint and the legacy path takes over — never a panic
@@ -665,10 +687,58 @@ fn ui_v2_ready() -> bool {
         return false;
     }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        eprintln!("aish: AISH_UI=v2 needs a terminal on stdin and stdout; using the legacy shell");
+        eprintln!(
+            "aish: the dual-channel UI needs a terminal on stdin and stdout; using the legacy shell"
+        );
         return false;
     }
     true
+}
+
+/// Snapshot of the shell state the prompt is rendered from.
+///
+/// [`run_ui_v2`]'s prompt provider runs between submitted lines, and every
+/// field here (working directory, exit code, plan mode, recording flag) only
+/// changes inside [`aish_shell::AishShell::process_line`]. Refreshing the
+/// snapshot after each call is therefore always current, and keeps the prompt
+/// provider free of a borrow the REPL could not hand it.
+#[derive(Clone)]
+struct PromptState {
+    cwd: String,
+    model: String,
+    last_exit_code: i32,
+    mode: &'static str,
+    recording: bool,
+    prompt_style: Option<String>,
+}
+
+impl PromptState {
+    /// Read the current state from `shell`.
+    fn read(shell: &aish_shell::AishShell) -> Self {
+        Self {
+            cwd: shell.state.cwd.clone(),
+            model: shell.config.model.clone(),
+            last_exit_code: shell.state.last_exit_code,
+            mode: match shell.ai_handler.plan_phase() {
+                aish_core::PlanPhase::Planning => "plan",
+                aish_core::PlanPhase::Normal => "aish",
+            },
+            recording: shell.is_recording(),
+            prompt_style: shell.config.prompt_style.clone(),
+        }
+    }
+
+    /// Render the prompt string for this state.
+    fn render(&self) -> String {
+        aish_shell::prompt::render_prompt(
+            &self.cwd,
+            &self.model,
+            self.last_exit_code,
+            self.mode,
+            self.recording,
+            self.prompt_style.as_deref(),
+        )
+    }
 }
 
 /// Drive `shell` from the dual-channel REPL; `false` means "fall back".
@@ -678,11 +748,15 @@ fn ui_v2_ready() -> bool {
 /// so the two front ends cannot drift. Product output reaches the terminal
 /// through the REPL's queue sink, which is why a background LLM stream cannot
 /// tear a frame.
+///
+/// The prompt is re-rendered from the live shell state on every frame, so the
+/// working directory, the exit-code arrow and the background-task badge match
+/// what the legacy loop shows.
 fn run_ui_v2(shell: &mut aish_shell::AishShell) -> bool {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
-            eprintln!("aish: AISH_UI=v2 runtime failed ({err}); using the legacy shell");
+            eprintln!("aish: dual-channel UI runtime failed ({err}); using the legacy shell");
             return false;
         }
     };
@@ -748,13 +822,31 @@ fn run_ui_v2(shell: &mut aish_shell::AishShell) -> bool {
         }),
     });
 
+    // The prompt is re-rendered from the live shell state on every frame, so
+    // `cd`, a failing command, plan mode and the recording badge all reach the
+    // screen exactly as they do on the legacy path.
+    let prompt_state = std::sync::Arc::new(std::sync::Mutex::new(PromptState::read(shell)));
+    let prompt: aish_tui::PromptSource = {
+        let prompt_state = std::sync::Arc::clone(&prompt_state);
+        std::sync::Arc::new(move || {
+            prompt_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .render()
+        })
+    };
+
     match aish_tui::run_shell_repl(
-        UI_V2_PROMPT,
+        prompt,
         history_path,
         Some(hud_source),
         Some(panel),
         |line| {
-            if shell.process_line(line, &runtime) {
+            let exit = shell.process_line(line, &runtime);
+            // Every field the prompt paints is updated by `process_line`, so
+            // the next frame must render from the post-execution state.
+            *prompt_state.lock().unwrap_or_else(|e| e.into_inner()) = PromptState::read(shell);
+            if exit {
                 aish_tui::ReplAction::Exit
             } else {
                 aish_tui::ReplAction::Continue
@@ -763,7 +855,7 @@ fn run_ui_v2(shell: &mut aish_shell::AishShell) -> bool {
     ) {
         Ok(()) => true,
         Err(err) => {
-            eprintln!("aish: AISH_UI=v2 REPL failed ({err}); using the legacy shell");
+            eprintln!("aish: dual-channel REPL failed ({err}); using the legacy shell");
             false
         }
     }
@@ -772,11 +864,14 @@ fn run_ui_v2(shell: &mut aish_shell::AishShell) -> bool {
 fn main() {
     let cli = Cli::parse();
 
-    // AISH_UI=v2: remember the decision now, while the parsed CLI is still in
-    // hand (the hidden entry points must never be diverted). It is acted on
-    // once the config is loaded and the shell exists, so every failure path
-    // falls through to the unchanged legacy launch.
-    UI_V2_ACTIVE.store(ui_v2_requested(&cli), std::sync::atomic::Ordering::SeqCst);
+    // The dual-channel UI is the default: remember the decision now, while the
+    // parsed CLI is still in hand (the hidden entry points must never be
+    // diverted). It is acted on once the config is loaded and the shell exists,
+    // so every failure path falls through to the unchanged legacy launch.
+    UI_V2_ACTIVE.store(
+        !legacy_ui_requested(&cli),
+        std::sync::atomic::Ordering::SeqCst,
+    );
 
     let config_path = cli.config.clone();
     // Record the explicit --config for the welcome panel ("config:" line)
@@ -2256,7 +2351,7 @@ fn run_shell_normal(mut config: aish_config::ConfigModel) {
     }
     match aish_shell::AishShell::new(config, config_source.as_deref()) {
         Ok(mut shell) => {
-            // AISH_UI=v2: the dual-channel REPL drives the same shell through
+            // The dual-channel REPL drives the same shell through
             // `process_line`. A failure leaves the shell untouched and falls
             // through to the legacy loop below.
             if ui_v2_ready() && run_ui_v2(&mut shell) {
@@ -3327,6 +3422,77 @@ impl OscScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse a bare `aish` command line (no arguments).
+    fn bare_cli() -> Cli {
+        <Cli as clap::Parser>::try_parse_from(["aish"]).expect("a bare invocation parses")
+    }
+
+    #[test]
+    fn plain_interactive_launch_uses_the_dual_channel_ui() {
+        // The dual-channel REPL is the default: only an explicit opt-out or a
+        // hidden entry point may divert the launch.
+        assert!(!legacy_ui_requested_for(&bare_cli(), false));
+        // The environment opt-out is honoured on its own.
+        let env_cli = bare_cli();
+        assert!(!env_cli.legacy_ui);
+        assert!(legacy_ui_requested_for(&env_cli, true));
+    }
+
+    #[test]
+    fn legacy_ui_flag_opts_out() {
+        let cli = <Cli as clap::Parser>::try_parse_from(["aish", "--legacy-ui"])
+            .expect("--legacy-ui parses");
+        assert!(legacy_ui_requested_for(&cli, false));
+    }
+
+    #[test]
+    fn subcommand_keeps_the_legacy_launch() {
+        let cli = <Cli as clap::Parser>::try_parse_from(["aish", "info"]).expect("info parses");
+        assert!(legacy_ui_requested_for(&cli, false));
+    }
+
+    #[test]
+    fn hidden_entry_points_keep_the_legacy_launch() {
+        // A daemon inherits the environment from the shell that spawned it, so
+        // its entry point must never be diverted onto the REPL.
+        for args in [
+            vec!["aish", "--pty-daemon"],
+            vec!["aish", "--sandbox-daemon"],
+            vec!["aish", "--remote-sessions"],
+            vec!["aish", "--continue"],
+        ] {
+            let cli = <Cli as clap::Parser>::try_parse_from(&args)
+                .unwrap_or_else(|err| panic!("{args:?} must parse: {err}"));
+            assert!(
+                legacy_ui_requested_for(&cli, false),
+                "{args:?} must use the legacy path"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_state_renders_the_legacy_prompt() {
+        // The v2 prompt is the legacy renderer's output, not a fixed string:
+        // the working directory and the exit-code arrow must both show through.
+        let state = PromptState {
+            cwd: "/tmp".to_string(),
+            model: "model-b".to_string(),
+            last_exit_code: 1,
+            mode: "aish",
+            recording: false,
+            prompt_style: None,
+        };
+        let prompt = state.render();
+        assert!(prompt.contains("/tmp"), "cwd missing: {prompt:?}");
+        assert!(prompt.contains("➜➜"), "error arrow missing: {prompt:?}");
+
+        let ok = PromptState {
+            last_exit_code: 0,
+            ..state
+        };
+        assert!(ok.render().contains("➜"), "success arrow missing");
+    }
 
     #[test]
     fn daemon_config_and_overrides_are_forwarded_without_putting_key_in_args() {

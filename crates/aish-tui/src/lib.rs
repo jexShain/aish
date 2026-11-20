@@ -46,7 +46,7 @@ pub use render::{
     prepare_line, prepare_lines, strip_escapes, visible_width, PreparedLine, TAB_WIDTH,
 };
 pub use renderer::{Renderer, TerminalCaps};
-pub use repl::{Repl, ReplAction, ReplConfig};
+pub use repl::{PromptSource, Repl, ReplAction, ReplConfig};
 pub use shell_repl::run_shell_repl;
 
 use std::sync::Arc;

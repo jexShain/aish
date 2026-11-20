@@ -3502,6 +3502,17 @@ impl AishShell {
         Ok(())
     }
 
+    /// Whether a terminal session recording is active.
+    ///
+    /// The prompt paints a recording badge from this, so the dual-channel
+    /// front end needs the same answer the legacy loop reads directly.
+    pub fn is_recording(&self) -> bool {
+        self.shared_recorder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     /// Process one submitted line. Returns `true` when the shell should exit.
     ///
     /// `run` calls this for every line its rustyline reader accepts; the

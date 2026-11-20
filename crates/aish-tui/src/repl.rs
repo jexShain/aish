@@ -96,11 +96,26 @@ impl fmt::Debug for PanelHandle {
     }
 }
 
+/// Prompt provider: called once per frame to supply the prompt string.
+///
+/// A product whose prompt carries live state (working directory, git branch,
+/// exit code, background-task badge) supplies one of these instead of a
+/// [`ReplConfig::prompt`] constant, so the prompt is re-rendered on every
+/// paint without the REPL knowing anything about that state.
+pub type PromptSource = Arc<dyn Fn() -> String + Send + Sync>;
+
 /// How the REPL is configured.
 #[derive(Clone)]
 pub struct ReplConfig {
     /// Prompt drawn before the first editor row.
+    ///
+    /// Ignored while [`ReplConfig::prompt_provider`] is configured.
     pub prompt: String,
+    /// Dynamic prompt, taking precedence over [`ReplConfig::prompt`].
+    ///
+    /// `None` (the default) keeps the prompt a constant, so the REPL paints
+    /// exactly what it painted before dynamic prompts existed.
+    pub prompt_provider: Option<PromptSource>,
     /// Where accepted lines are appended, if anywhere.
     pub history_path: Option<PathBuf>,
     /// Compute a ghost completion from the sources while typing.
@@ -130,6 +145,7 @@ impl ReplConfig {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
+            prompt_provider: None,
             history_path: None,
             auto_suggest: true,
             sink: None,
@@ -151,6 +167,10 @@ impl fmt::Debug for ReplConfig {
         // configuration worth reading back.
         f.debug_struct("ReplConfig")
             .field("prompt", &self.prompt)
+            .field(
+                "prompt_provider",
+                &self.prompt_provider.as_ref().map(|_| "<provider>"),
+            )
             .field("history_path", &self.history_path)
             .field("auto_suggest", &self.auto_suggest)
             .field("sink", &self.sink.as_ref().map(|_| "<sink>"))
@@ -209,6 +229,8 @@ pub struct Repl<W: Write, R: Read> {
     panel: SupervisorPanel,
     /// Whether the panel currently owns the screen.
     panel_open: bool,
+    /// Whether [`Repl::finish`] already wrote the terminal restore sequence.
+    restored: bool,
 }
 
 impl<W: Write, R: Read> Repl<W, R> {
@@ -251,6 +273,7 @@ impl<W: Write, R: Read> Repl<W, R> {
             hud: HudState::new(),
             panel: SupervisorPanel::new(),
             panel_open: false,
+            restored: false,
         }
     }
 
@@ -376,9 +399,25 @@ impl<W: Write, R: Read> Repl<W, R> {
         self.finish()
     }
 
+    /// Re-read the prompt from the configured provider, if any.
+    ///
+    /// Called once at the top of every paint: the prompt reflects live shell
+    /// state (working directory, exit code, background tasks), so it must be
+    /// re-rendered before the frame that shows it. A constant prompt is left
+    /// untouched.
+    fn refresh_prompt(&mut self) {
+        // Disjoint field borrows: the provider is `Fn + Send + Sync`, so it
+        // needs no clone to be called while the editor is mutably borrowed.
+        let Self { config, editor, .. } = self;
+        if let Some(provider) = config.prompt_provider.as_ref() {
+            editor.set_prompt(provider());
+        }
+    }
+
     /// Paint one frame: sink output, pending history rows, the editor and menu.
     fn draw(&mut self) -> io::Result<()> {
         self.sync_geometry();
+        self.refresh_prompt();
         // Product output lands in the history channel *before* the viewport is
         // placed, so a row produced between two frames can never be written in
         // the middle of one.
@@ -449,6 +488,7 @@ impl<W: Write, R: Read> Repl<W, R> {
     /// Paint the panel as the whole viewport (history still commits above it).
     fn draw_panel(&mut self) -> io::Result<()> {
         self.sync_geometry();
+        self.refresh_prompt();
         self.drain_sink();
         // The panel is the only view while it is open, so it re-reads the
         // supervisor every frame: a task that finishes while the panel is up
@@ -496,6 +536,12 @@ impl<W: Write, R: Read> Repl<W, R> {
 
     /// Final paint: flush any rows still queued, then clear the live band so no
     /// half-edited prompt is left behind.
+    ///
+    /// The trailing restore sequence (default rendition, autowrap, cursor, and
+    /// the newline that puts the parent prompt at column 1) is written here,
+    /// once, through the frame sink. [`TerminalGuard`] then only has to undo
+    /// raw mode: writing the sequence in both places emitted it twice, which
+    /// shows up as duplicate `^[[0m^[[?7h^[[?25h` runs before the shell exits.
     fn finish(&mut self) -> io::Result<()> {
         self.drain_sink();
         let width = self.renderer.caps().width;
@@ -503,7 +549,22 @@ impl<W: Write, R: Read> Repl<W, R> {
         self.renderer.draw(Frame {
             history,
             viewport: Vec::new(),
-        })
+        })?;
+        // `\r\n` (not `\n`): the tty is still raw, so a bare newline would
+        // leave the cursor in the middle of a line.
+        self.renderer
+            .write_trailing(format!("{RESTORE_SEQUENCE}\r\n").as_bytes())?;
+        self.restored = true;
+        Ok(())
+    }
+
+    /// Whether [`Repl::finish`] already wrote the terminal restore sequence.
+    ///
+    /// The entry points hand this to their [`TerminalGuard`] so it does not
+    /// repeat the sequence on a normal exit; a panic (which unwinds past
+    /// `finish`) leaves it `false` and the guard emits it exactly once.
+    pub fn restored(&self) -> bool {
+        self.restored
     }
 
     /// Handle one input unit; `Ok(true)` means the REPL should exit.
@@ -600,11 +661,16 @@ impl<W: Write, R: Read> Repl<W, R> {
     }
 
     /// Queue the submitted text as history rows, prompt included.
+    ///
+    /// The prompt comes from the editor, not the config: with a dynamic
+    /// provider the config string is a placeholder, and the row must repeat the
+    /// prompt that was actually on screen.
     fn commit_line(&mut self, line: &str) {
-        let indent = " ".repeat(visible_width(&self.config.prompt) as usize);
+        let prompt = self.editor.prompt().to_string();
+        let indent = " ".repeat(visible_width(&prompt) as usize);
         for (index, logical) in line.split('\n').enumerate() {
             let prefix = if index == 0 {
-                self.config.prompt.as_str()
+                prompt.as_str()
             } else {
                 indent.as_str()
             };
@@ -811,37 +877,54 @@ pub fn default_history_path() -> Option<PathBuf> {
     Some(base.join("aish-tui").join("history.txt"))
 }
 
+/// Reset rendition, re-enable autowrap and show the cursor.
+const RESTORE_SEQUENCE: &str = "\x1b[0m\x1b[?7h\x1b[?25h";
+
 /// Owns raw mode for the duration of a standalone REPL.
 ///
-/// Every terminal mode the REPL changes is restored here, including on a panic
-/// (which unwinds through this guard) — a REPL that leaves the tty in raw mode
-/// makes the parent shell unusable.
-pub(crate) struct TerminalGuard;
+/// The restore sequence is written by [`Repl::finish`] through the frame sink,
+/// so it shares that sink's flush order and reaches the terminal exactly once.
+/// The guard writes it only when the REPL never got that far — a panic unwinds
+/// past `finish` — and always puts the tty back into cooked mode.
+pub(crate) struct TerminalGuard {
+    /// Whether [`Repl::finish`] already wrote [`RESTORE_SEQUENCE`].
+    restored: bool,
+}
 
 impl TerminalGuard {
     pub(crate) fn enter() -> io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        Ok(Self)
+        Ok(Self { restored: false })
+    }
+
+    /// Hand the terminal back after [`Repl::run`] returned.
+    ///
+    /// A completed run already restored it from [`Repl::finish`]; repeating the
+    /// sequence here is what put duplicate `^[[0m^[[?7h^[[?25h` runs in the
+    /// user's scrollback before the shell exited.
+    pub(crate) fn release(mut self, repl_restored: bool) {
+        self.restored = repl_restored;
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let mut out = io::stdout();
-        // Reset rendition, re-enable autowrap, show the cursor, then end the
-        // line so the parent prompt starts at column 1.
-        let _ = out.write_all(b"\x1b[0m\x1b[?7h\x1b[?25h\r\n");
-        let _ = out.flush();
+        if !self.restored {
+            let mut out = io::stdout();
+            // End the line so the parent prompt starts at column 1.
+            let _ = out.write_all(format!("{RESTORE_SEQUENCE}\r\n").as_bytes());
+            let _ = out.flush();
+        }
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
 /// Run the demo REPL on the real terminal until `/exit`, Ctrl+D or EOF.
 ///
-/// This is the single implementation behind both the `aish-tui-repl` binary and
-/// `AISH_UI=v2` in `aish-cli`: PATH executables plus `/help`, `/exit` and
-/// `/clear` complete; every other line runs under `bash -c` and its output is
-/// committed as history rows.
+/// This is the demo behind the `aish-tui-repl` binary: PATH executables plus
+/// `/help`, `/exit` and `/clear` complete; every other line runs under
+/// `bash -c` and its output is committed as history rows. The product entry
+/// point is [`crate::run_shell_repl`], which drives a real shell instead.
 pub fn run_standalone(prompt: &str, history_path: Option<PathBuf>) -> io::Result<()> {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         return Err(io::Error::other(
@@ -851,6 +934,7 @@ pub fn run_standalone(prompt: &str, history_path: Option<PathBuf>) -> io::Result
     let guard = TerminalGuard::enter()?;
     let config = ReplConfig {
         prompt: prompt.to_string(),
+        prompt_provider: None,
         history_path,
         auto_suggest: true,
         sink: None,
@@ -865,8 +949,9 @@ pub fn run_standalone(prompt: &str, history_path: Option<PathBuf>) -> io::Result
         sources,
     );
     let result = repl.run(demo_submit);
+    let restored = repl.restored();
     drop(repl);
-    drop(guard);
+    guard.release(restored);
     match result {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         other => other,
@@ -1026,6 +1111,7 @@ mod tests {
             Cursor::new(input.to_vec()),
             ReplConfig {
                 prompt: "> ".to_string(),
+                prompt_provider: None,
                 history_path: None,
                 auto_suggest: false,
                 sink: None,
@@ -1194,6 +1280,7 @@ mod tests {
             Cursor::new(b"gi\x1b[C".to_vec()),
             ReplConfig {
                 prompt: "> ".to_string(),
+                prompt_provider: None,
                 history_path: None,
                 auto_suggest: true,
                 sink: None,
@@ -1221,6 +1308,7 @@ mod tests {
             Cursor::new(b"fresh\r\x1b[A".to_vec()),
             ReplConfig {
                 prompt: "> ".to_string(),
+                prompt_provider: None,
                 history_path: Some(path.clone()),
                 auto_suggest: false,
                 sink: None,
@@ -1269,6 +1357,7 @@ mod tests {
             Cursor::new(input.to_vec()),
             ReplConfig {
                 prompt: "> ".to_string(),
+                prompt_provider: None,
                 history_path: None,
                 auto_suggest: false,
                 sink: Some(Arc::clone(sink) as Arc<dyn OutputSink>),
@@ -1346,6 +1435,7 @@ mod tests {
             Cursor::new(input.to_vec()),
             ReplConfig {
                 prompt: "> ".to_string(),
+                prompt_provider: None,
                 history_path: None,
                 auto_suggest: false,
                 sink: None,
@@ -1527,5 +1617,172 @@ mod tests {
         let mut repl = repl_with_supervision(b"ab\x13\r", None, None);
         let submitted = run(&mut repl, |_| ReplAction::Continue);
         assert_eq!(submitted, ["ab"], "Ctrl+S disturbed the editor");
+    }
+
+    #[test]
+    fn prompt_provider_supplies_the_painted_prompt() {
+        // The provider wins over the constant field on every frame.
+        let mut repl = Repl::with_caps(
+            Vec::new(),
+            Cursor::new(b"ab\r".to_vec()),
+            ReplConfig {
+                prompt: "ignored> ".to_string(),
+                prompt_provider: Some(Arc::new(|| "◆ aish /tmp➜ ".to_string())),
+                history_path: None,
+                auto_suggest: false,
+                sink: None,
+                hud: None,
+                panel: None,
+            },
+            Vec::new(),
+            CAPS,
+        );
+        run(&mut repl, |_| ReplAction::Continue);
+
+        let bytes = output(repl);
+        assert!(
+            bytes.contains("◆ aish /tmp➜ ab"),
+            "dynamic prompt never painted: {bytes:?}"
+        );
+        assert!(
+            !bytes.contains("ignored> "),
+            "constant prompt leaked: {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn commit_line_repeats_the_prompt_actually_painted() {
+        // The committed row must carry the prompt that was on screen, not the
+        // (placeholder) config constant, so a submitted line never re-prefixes
+        // itself with a stale prompt.
+        let mut repl = Repl::with_caps(
+            Vec::new(),
+            Cursor::new(b"echo x\r".to_vec()),
+            ReplConfig {
+                prompt: "placeholder> ".to_string(),
+                prompt_provider: Some(Arc::new(|| "◆ aish /tmp➜ ".to_string())),
+                history_path: None,
+                auto_suggest: false,
+                sink: None,
+                hud: None,
+                panel: None,
+            },
+            Vec::new(),
+            CAPS,
+        );
+        run(&mut repl, |_| ReplAction::Continue);
+        let bytes = output(repl);
+
+        assert!(
+            bytes.contains("◆ aish /tmp➜ echo x"),
+            "committed row lost the prompt: {bytes:?}"
+        );
+        assert!(
+            !bytes.contains("placeholder> "),
+            "placeholder prompt reached the terminal: {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_provider_is_rerendered_for_every_frame() {
+        // A prompt whose content changes between frames must show the new value
+        // without a keystroke: that is what `cd` and exit-code changes rely on.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let mut repl = Repl::with_caps(
+            Vec::new(),
+            Cursor::new(b"a\r".to_vec()),
+            ReplConfig {
+                prompt: String::new(),
+                prompt_provider: Some(Arc::new(move || {
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    format!("[{n}] ")
+                })),
+                history_path: None,
+                auto_suggest: false,
+                sink: None,
+                hud: None,
+                panel: None,
+            },
+            Vec::new(),
+            CAPS,
+        );
+        run(&mut repl, |_| ReplAction::Continue);
+        let bytes = output(repl);
+
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "provider was not called per frame"
+        );
+        assert!(bytes.contains("[1] "), "first frame missing: {bytes:?}");
+    }
+
+    #[test]
+    fn submitted_line_is_painted_once() {
+        // The editor's first row *is* the committed row, so the renderer must
+        // not rewrite it: doing so printed every submitted line twice, which
+        // under a pty (or a reflowing terminal) scrolls a duplicate into
+        // scrollback.
+        let mut repl = repl(b"echo A\recho B\r", Vec::new());
+        run(&mut repl, |_| ReplAction::Continue);
+        let bytes = output(repl);
+
+        for line in ["> echo A", "> echo B"] {
+            assert_eq!(
+                bytes.matches(line).count(),
+                1,
+                "submitted row was painted more than once: {line:?} in {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn submitted_line_is_painted_once_after_scrolling() {
+        // A viewport taller than the screen forces the block to scroll, which
+        // is where the duplicate used to land in scrollback.
+        let mut repl = Repl::with_caps(
+            Vec::new(),
+            Cursor::new(b"one\rtwo\rthree\r".to_vec()),
+            ReplConfig {
+                prompt: "> ".to_string(),
+                prompt_provider: None,
+                history_path: None,
+                auto_suggest: false,
+                sink: None,
+                hud: None,
+                panel: None,
+            },
+            Vec::new(),
+            TerminalCaps {
+                synchronized_output: false,
+                width: 20,
+                height: 2,
+            },
+        );
+        run(&mut repl, |_| ReplAction::Continue);
+        let bytes = output(repl);
+
+        for line in ["> one", "> two", "> three"] {
+            assert_eq!(
+                bytes.matches(line).count(),
+                1,
+                "scrolled commit duplicated {line:?} in {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exit_emits_single_restore_sequence() {
+        // `finish` writes the restore through the frame sink and the guard
+        // skips its own copy, so the sequence must appear exactly once.
+        const RESTORE: &str = "\x1b[0m\x1b[?7h\x1b[?25h";
+        let mut repl = repl(b"x\r", Vec::new());
+        run(&mut repl, |_| ReplAction::Continue);
+        let bytes = output(repl);
+        assert_eq!(
+            bytes.matches(RESTORE).count(),
+            1,
+            "restore sequence emitted more than once: {bytes:?}"
+        );
     }
 }

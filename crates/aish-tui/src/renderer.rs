@@ -49,7 +49,7 @@
 use std::io::{self, Write};
 
 use crate::frame::{Frame, HistoryBatch};
-use crate::render::{visible_width, PreparedLine};
+use crate::render::{strip_escapes, visible_width, PreparedLine};
 
 /// Hide the cursor while rows are being moved.
 const HIDE_CURSOR: &str = "\x1b[?25l";
@@ -143,6 +143,16 @@ impl<W: Write> Renderer<W> {
     /// Recover the sink, e.g. to assert on the captured bytes in tests.
     pub fn into_inner(self) -> W {
         self.out
+    }
+
+    /// Write `bytes` straight to the sink, outside any paint transaction.
+    ///
+    /// Only for sequences that are not part of a frame — the REPL's final
+    /// restore is written here so it shares the sink's flush semantics instead
+    /// of racing `io::stdout()` against a buffered writer.
+    pub fn write_trailing(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.out.write_all(bytes)?;
+        self.out.flush()
     }
 
     /// Forget the frame memo so the next paint rewrites every row.
@@ -255,6 +265,41 @@ impl<W: Write> Renderer<W> {
             .min(height as usize)
     }
 
+    /// How many leading history rows the previous frame already painted, in
+    /// place and verbatim.
+    ///
+    /// The product commits the row it was just editing, and that row is
+    /// normally still on screen: the editor's first viewport row *is* the
+    /// prompt plus the typed line. Rewriting it would emit every submitted line
+    /// twice, and a terminal that reflows (tmux, a pty that echoes) would push
+    /// the duplicate into scrollback. Those rows are left untouched and the
+    /// block continues below them.
+    ///
+    /// Comparison is on the *visible* text: the viewport row carries a
+    /// zero-width cursor cell (`\x1b[7m\x1b[27m`) and committed rows never do,
+    /// so a byte comparison would never match the one row it must.
+    ///
+    /// A row only counts as painted when the previous frame painted it at or
+    /// above the bottom row (anything below has scrolled away) and with the
+    /// same column budget — a resized row must be rewritten.
+    fn already_painted_rows(&self, batch: &HistoryBatch) -> usize {
+        let Some(top) = self.last_top else {
+            return 0;
+        };
+        let height = self.caps.height.max(1) as usize;
+        let mut painted = 0;
+        for (offset, (old, new)) in self.last_viewport.iter().zip(batch.rows.iter()).enumerate() {
+            if top + offset > height {
+                break;
+            }
+            if old.width != new.width || strip_escapes(&old.text) != strip_escapes(&new.text) {
+                break;
+            }
+            painted += 1;
+        }
+        painted
+    }
+
     /// Commit history and paint the viewport directly below it, as one
     /// contiguous block that the terminal can scroll.
     ///
@@ -272,13 +317,19 @@ impl<W: Write> Renderer<W> {
         let count = batch.rows.len();
         let rows = viewport.len();
 
+        // Rows the previous frame already put on screen are not rewritten.
+        let skip = self.already_painted_rows(batch);
+        let fresh = &batch.rows[skip..];
+
         // Erase the live band before anything scrolls: rows pushed off the top
         // by the history write must be finished history or blanks, never a
         // stale in-progress frame. Erasure is per line (`EL`) from column 1, so
         // no line is ever deleted and committed rows above are untouched. The
         // band always ends at or above the bottom row, so no scroll is needed.
+        // Rows that simply become history keep their cells: erasing and
+        // rewriting them is what painted a submitted line twice.
         if let Some(top) = self.last_top {
-            for offset in 0..self.last_viewport.len().min(height) {
+            for offset in skip..self.last_viewport.len().min(height) {
                 goto(buf, (top + offset) as u16);
                 buf.extend_from_slice(ERASE_TO_EOL.as_bytes());
             }
@@ -293,15 +344,20 @@ impl<W: Write> Renderer<W> {
         // flush with the bottom: that means "scroll first, then write", and
         // everything already painted shifts up by the same amount — which is
         // fine, because the live band was just erased.
-        let start = self.last_top.unwrap_or(height).max(1);
+        let start = self.last_top.unwrap_or(height).max(1) + skip;
         let scrolled = goto_scrolling(buf, start, height);
-        for (index, row) in batch.rows.iter().enumerate() {
+        for (index, row) in fresh.iter().enumerate() {
             if index > 0 {
                 buf.extend_from_slice(CRLF);
             }
             write_row(buf, row, width);
         }
-        buf.extend_from_slice(CRLF);
+        // The viewport starts on the next row after the last committed row.
+        // When every row was already on screen the cursor is *on* that row
+        // after the initial move, so no newline is owed.
+        if !fresh.is_empty() {
+            buf.extend_from_slice(CRLF);
+        }
         for (index, line) in viewport.iter().enumerate() {
             if index > 0 {
                 buf.extend_from_slice(CRLF);
@@ -310,10 +366,14 @@ impl<W: Write> Renderer<W> {
         }
 
         // Physical row of the viewport's first line after the terminal applied
-        // any scroll: the block needed `count + rows` rows from `start`, and
-        // everything past the bottom shifts the whole block up by the overflow.
-        let overflow = (start + count + rows).saturating_sub(1 + height);
-        let top_after = (start + count).saturating_sub(scrolled + overflow);
+        // any scroll. The block starts on the row `goto_scrolling` settled on
+        // (`start` shifted up by the rows it scrolled), the fresh history rows
+        // occupy the next `count - skip` rows, and the viewport follows them;
+        // rows past the bottom shift the whole block up by the overflow. The
+        // skipped rows were already on screen above the block.
+        let block = (count - skip) + rows;
+        let overflow = (start - scrolled + block).saturating_sub(1 + height);
+        let top_after = (start - scrolled + (count - skip)).saturating_sub(overflow);
         // With an empty viewport the anchor must still advance: dropping it
         // would make the next frame bottom-anchor its band and paint over the
         // rows committed here (invariant 4). `height + 1` is the legal "one

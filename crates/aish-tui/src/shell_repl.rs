@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::completion::{CompletionSource, WordListSource};
 use crate::output::{OutputSink, QueueSink};
 use crate::repl::{
-    demo_words, HudSource, PanelHandle, Repl, ReplAction, ReplConfig, TerminalGuard,
+    demo_words, HudSource, PanelHandle, PromptSource, Repl, ReplAction, ReplConfig, TerminalGuard,
 };
 
 /// Run the interactive shell REPL, calling `on_submit` for every accepted line.
@@ -32,6 +32,10 @@ use crate::repl::{
 /// `on_submit` returns the [`ReplAction`] the REPL should take: `Exit` leaves
 /// the loop, `Continue` waits for the next line, `AppendHistory` commits extra
 /// rows to the history channel.
+///
+/// `prompt` supplies the prompt string once per frame, so the product's live
+/// state (working directory, exit code, background tasks) is visible without
+/// the REPL knowing anything about it.
 ///
 /// `hud` and `panel` are the supervision integrations: `None` for either means
 /// the REPL paints and reads exactly what it did before the feature existed.
@@ -42,7 +46,7 @@ use crate::repl::{
 /// write fails. A closed pipe (the user piping the session into `head`) is
 /// reported as success by the caller, not here.
 pub fn run_shell_repl<F>(
-    prompt: &str,
+    prompt: PromptSource,
     history_path: Option<PathBuf>,
     hud: Option<HudSource>,
     panel: Option<Arc<PanelHandle>>,
@@ -62,7 +66,10 @@ where
     install_sink(Arc::clone(&sink));
 
     let config = ReplConfig {
-        prompt: prompt.to_string(),
+        // The provider is the only prompt source; the constant field is kept
+        // empty so the two can never disagree.
+        prompt: String::new(),
+        prompt_provider: Some(prompt),
         history_path,
         auto_suggest: true,
         sink: Some(Arc::clone(&sink) as Arc<dyn OutputSink>),
@@ -78,13 +85,14 @@ where
     );
 
     let result = repl.run(on_submit);
+    let restored = repl.restored();
     drop(repl);
 
     // Restore the legacy sink before the terminal guard runs: the guard writes
     // its reset sequence straight to stdout, and any row the shell flushes
     // afterwards must reach the terminal, not a queue nobody drains.
     restore_sink();
-    drop(guard);
+    guard.release(restored);
 
     match result {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
@@ -137,6 +145,7 @@ mod tests {
             io::Cursor::new(b"echo one\necho two\n".to_vec()),
             ReplConfig {
                 prompt: "❯ ".to_string(),
+                prompt_provider: None,
                 history_path: None,
                 auto_suggest: false,
                 sink: None,
@@ -171,6 +180,7 @@ mod tests {
             io::Cursor::new(b"first\nsecond\n".to_vec()),
             ReplConfig {
                 prompt: "❯ ".to_string(),
+                prompt_provider: None,
                 history_path: None,
                 auto_suggest: false,
                 sink: None,

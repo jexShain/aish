@@ -10,8 +10,9 @@
 //! * after exit the terminal is intact (autowrap on, cursor visible, raw mode
 //!   off) because the guard restores every mode even on a panic.
 //!
-//! The REPL itself is [`aish_tui::repl::run_standalone`], shared verbatim with
-//! `AISH_UI=v2` in `aish-cli`; this binary only supplies the demo wording.
+//! The REPL itself is [`aish_tui::repl::run_standalone`]; `aish-cli` uses
+//! [`aish_tui::run_shell_repl`] instead, which drives a real shell behind the
+//! same editor. This binary only supplies the demo wording.
 
 use std::io;
 
