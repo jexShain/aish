@@ -10,6 +10,16 @@
 //! * the prompt, the completion menu and the ghost suggestion are the
 //!   **viewport** — re-supplied in full every frame and diffed by the renderer.
 //!
+//! # Product output
+//!
+//! Anything the product prints while the REPL owns the screen (command output,
+//! log records, an LLM token stream) must not reach the terminal directly: it
+//! would land inside a frame and desync the renderer's row memo. Producers
+//! write to a [`crate::output::OutputSink`] instead, and
+//! [`ReplConfig::sink`] names the one this REPL drains — a
+//! [`QueueSink`] whose rows are committed as history immediately before every
+//! paint.
+//!
 //! # Testability
 //!
 //! [`Repl`] is generic over `Read`/`Write`, so a unit test drives it with
@@ -17,9 +27,11 @@
 //! that reached the sink. Nothing here reads `std::io::stdin` directly except
 //! [`run_standalone`], which is the only entry point that also owns raw mode.
 
+use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use crate::caps::detect_caps;
 use crate::completion::{
@@ -30,6 +42,7 @@ use crate::editor::Editor;
 use crate::frame::{Frame, HistoryBatch};
 use crate::highlight::{DIM, RESET};
 use crate::input::{InputEvent, InputParser, Key};
+use crate::output::{OutputSink, QueueSink};
 use crate::render::{prepare_line, visible_width};
 use crate::renderer::{Renderer, TerminalCaps};
 
@@ -41,7 +54,7 @@ pub const MENU_ROWS: usize = 8;
 const MAX_OUTPUT_ROWS: usize = 200;
 
 /// How the REPL is configured.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReplConfig {
     /// Prompt drawn before the first editor row.
     pub prompt: String,
@@ -49,15 +62,24 @@ pub struct ReplConfig {
     pub history_path: Option<PathBuf>,
     /// Compute a ghost completion from the sources while typing.
     pub auto_suggest: bool,
+    /// Sink whose queued output is committed as history before each paint.
+    ///
+    /// `None` (the default) keeps the REPL a pure input component: it prints
+    /// nothing the product did not submit and drains nothing. A
+    /// [`QueueSink`] is drained; any other sink writes on its own, so the REPL
+    /// leaves it alone.
+    pub sink: Option<Arc<dyn OutputSink>>,
 }
 
 impl ReplConfig {
-    /// Single-line prompt with auto-suggestion on and no persisted history.
+    /// Single-line prompt with auto-suggestion on, no persisted history and no
+    /// product output.
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
             history_path: None,
             auto_suggest: true,
+            sink: None,
         }
     }
 }
@@ -65,6 +87,19 @@ impl ReplConfig {
 impl Default for ReplConfig {
     fn default() -> Self {
         Self::new("❯ ")
+    }
+}
+
+impl fmt::Debug for ReplConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `Arc<dyn OutputSink>` has no `Debug`, and a sink is a transport, not
+        // configuration worth reading back.
+        f.debug_struct("ReplConfig")
+            .field("prompt", &self.prompt)
+            .field("history_path", &self.history_path)
+            .field("auto_suggest", &self.auto_suggest)
+            .field("sink", &self.sink.as_ref().map(|_| "<sink>"))
+            .finish()
     }
 }
 
@@ -240,15 +275,37 @@ impl<W: Write, R: Read> Repl<W, R> {
         self.finish()
     }
 
-    /// Paint one frame: pending history rows plus the editor and menu.
+    /// Paint one frame: sink output, pending history rows, the editor and menu.
     fn draw(&mut self) -> io::Result<()> {
         self.sync_geometry();
+        // Product output lands in the history channel *before* the viewport is
+        // placed, so a row produced between two frames can never be written in
+        // the middle of one.
+        self.drain_sink();
         let width = self.renderer.caps().width;
         let mut rows = self.editor.render(width);
         rows.extend(self.menu_rows());
         let viewport = render_lines_to_viewport(rows, width);
         let history = self.take_history(width);
         self.renderer.draw(Frame { history, viewport })
+    }
+
+    /// Commit every row the configured sink queued since the last frame.
+    ///
+    /// Only a [`QueueSink`] queues: any other sink writes at the call site, so
+    /// there is nothing to move into history. Rows are committed in order and
+    /// verbatim — they are already finished and must not be re-prefixed with
+    /// the prompt the way a submitted line is.
+    fn drain_sink(&mut self) {
+        let Some(sink) = self.config.sink.as_deref() else {
+            return;
+        };
+        let Some(queue) = sink.as_any().downcast_ref::<QueueSink>() else {
+            return;
+        };
+        for row in queue.drain() {
+            self.commit_plain(&row);
+        }
     }
 
     /// Turn the queued raw rows into the next history batch, if any.
@@ -267,6 +324,7 @@ impl<W: Write, R: Read> Repl<W, R> {
     /// Final paint: flush any rows still queued, then clear the live band so no
     /// half-edited prompt is left behind.
     fn finish(&mut self) -> io::Result<()> {
+        self.drain_sink();
         let width = self.renderer.caps().width;
         let history = self.take_history(width);
         self.renderer.draw(Frame {
@@ -574,6 +632,7 @@ pub fn run_standalone(prompt: &str, history_path: Option<PathBuf>) -> io::Result
         prompt: prompt.to_string(),
         history_path,
         auto_suggest: true,
+        sink: None,
     };
     let sources: Vec<Box<dyn CompletionSource>> = vec![Box::new(WordListSource::new(demo_words()))];
     let mut repl = Repl::new(
@@ -745,6 +804,7 @@ mod tests {
                 prompt: "> ".to_string(),
                 history_path: None,
                 auto_suggest: false,
+                sink: None,
             },
             sources,
             CAPS,
@@ -910,6 +970,7 @@ mod tests {
                 prompt: "> ".to_string(),
                 history_path: None,
                 auto_suggest: true,
+                sink: None,
             },
             words(&["git-add", "git-log"]),
             CAPS,
@@ -934,6 +995,7 @@ mod tests {
                 prompt: "> ".to_string(),
                 history_path: Some(path.clone()),
                 auto_suggest: false,
+                sink: None,
             },
             Vec::new(),
             CAPS,
@@ -968,5 +1030,55 @@ mod tests {
         let rows = repl.menu_rows();
         assert_eq!(rows.len(), MENU_ROWS + 1, "overflow hint missing");
         assert!(rows.last().unwrap().contains('…'));
+    }
+
+    /// REPL whose product output goes to a [`QueueSink`] the test keeps.
+    fn repl_with_sink(input: &[u8], sink: &Arc<QueueSink>) -> Repl<Vec<u8>, Cursor<Vec<u8>>> {
+        Repl::with_caps(
+            Vec::new(),
+            Cursor::new(input.to_vec()),
+            ReplConfig {
+                prompt: "> ".to_string(),
+                history_path: None,
+                auto_suggest: false,
+                sink: Some(Arc::clone(sink) as Arc<dyn OutputSink>),
+            },
+            Vec::new(),
+            CAPS,
+        )
+    }
+
+    #[test]
+    fn repl_commits_sink_lines_before_drawing() {
+        let sink = Arc::new(QueueSink::new());
+        // Produced by a "background" thread before the REPL reads a key: the
+        // rows must still be committed ahead of the first viewport paint.
+        sink.line("from-thread-1");
+        sink.line("from-thread-2");
+
+        let mut repl = repl_with_sink(b"", &sink);
+        run(&mut repl, |_| ReplAction::Continue);
+
+        // Two queued rows became two history rows, drained by the REPL.
+        assert_eq!(repl.renderer().history_rows(), 2);
+        assert!(sink.drain().is_empty(), "REPL left rows in the sink");
+        // Sink rows are product output: they must not be recalled as input.
+        assert!(
+            repl.editor().history().is_empty(),
+            "sink rows entered history"
+        );
+        let bytes = output(repl);
+        let first = bytes.find("from-thread-1").expect("first row missing");
+        let second = bytes.find("from-thread-2").expect("second row missing");
+        assert!(first < second, "sink rows out of order: {bytes:?}");
+    }
+
+    #[test]
+    fn repl_without_sink_commits_nothing() {
+        // The default path must stay byte-identical to the pre-sink REPL: no
+        // history rows unless the product submits one.
+        let mut repl = repl(b"", Vec::new());
+        run(&mut repl, |_| ReplAction::Continue);
+        assert_eq!(repl.renderer().history_rows(), 0);
     }
 }
