@@ -695,6 +695,54 @@ fn ui_v2_ready() -> bool {
     true
 }
 
+/// Whether tracing records will be rendered *inside* the dual-channel UI.
+///
+/// The subscriber is built before the REPL exists, so this repeats
+/// [`ui_v2_ready`]'s decision from state that is already known: the launch
+/// selected the dual-channel UI and both ends are terminals. Every other launch
+/// (legacy REPL, one-shot command, piped output) keeps the configured level
+/// untouched — there a log line scrolls by in ordinary scrollback and
+/// suppressing it would hide a real diagnostic.
+fn logging_into_dual_channel_ui() -> bool {
+    // Inlined rather than calling `ui_v2_ready`, which prints a hint to stderr
+    // about a missing terminal: that write would come before the subscriber
+    // exists and the same hint is emitted again when `main` reaches it.
+    UI_V2_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+}
+
+/// Target prefixes whose `WARN` records are noise inside the dual-channel UI.
+///
+/// Langfuse reports every failed ingestion as a warning whose payload is the
+/// server's JSON error body. A retired endpoint answers 410 to every span, so
+/// one prompt turns the viewport into a wall of `LANGFUSE_V3_API_REMOVED`
+/// documents — and the renderer repaints that history on every frame. Both
+/// spellings are needed because `EnvFilter` matches targets by prefix: the
+/// bare name covers the SDK's `langfuse_ergonomic::*` events, the qualified
+/// one covers this workspace's own wrapper around the ingestion call.
+const NOISY_TUI_LOG_TARGETS: [&str; 2] = ["langfuse", "aish_llm::langfuse"];
+
+/// The [`EnvFilter`] string to use when `RUST_LOG` is unset.
+///
+/// A user-supplied `RUST_LOG` always wins verbatim, and a launch that does not
+/// render into the dual-channel UI keeps the configured level: a warning there
+/// scrolls past in ordinary scrollback, so hiding it would only lose a real
+/// diagnostic. Only the TUI — which owns the screen and repaints its history —
+/// silences [`NOISY_TUI_LOG_TARGETS`].
+fn default_log_filter(log_level: &str, dual_channel_ui: bool) -> String {
+    if !dual_channel_ui {
+        return log_level.to_string();
+    }
+    let mut filter = log_level.to_string();
+    for target in NOISY_TUI_LOG_TARGETS {
+        filter.push(',');
+        filter.push_str(target);
+        filter.push_str("=off");
+    }
+    filter
+}
+
 /// Snapshot of the shell state the prompt is rendered from.
 ///
 /// [`run_ui_v2`]'s prompt provider runs between submitted lines, and every
@@ -891,10 +939,18 @@ fn main() {
     let log_level = aish_config::ConfigLoader::load(config_file)
         .map(|c| c.log_level)
         .unwrap_or_else(|_| "warn".to_string());
+    // The dual-channel UI owns the screen, so a stray `WARN` is a visible
+    // artifact, not a diagnostic. Langfuse emits one per ingestion failure
+    // (a dead endpoint answers 410 on every span) and the body is a JSON
+    // document: at `warn` that fills the viewport with a wall of text the
+    // user cannot act on. Silence its target unless the user asked for logs
+    // explicitly (RUST_LOG wins verbatim, and the legacy REPL keeps the
+    // configured level where the line just scrolls by harmlessly).
+    let default_log_level = default_log_filter(&log_level, logging_into_dual_channel_ui());
     tracing_subscriber::fmt()
         .with_writer(AnimationAwareMakeWriter)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
         )
         .init();
 
@@ -3427,6 +3483,25 @@ mod tests {
     /// Parse a bare `aish` command line (no arguments).
     fn bare_cli() -> Cli {
         <Cli as clap::Parser>::try_parse_from(["aish"]).expect("a bare invocation parses")
+    }
+
+    /// The TUI repaints its history, so a Langfuse warning would fill the
+    /// viewport with a JSON error body: its target must be silenced, while the
+    /// configured level for everything else is preserved.
+    #[test]
+    fn dual_channel_ui_silences_langfuse_logs() {
+        let filter = default_log_filter("warn", true);
+        assert_eq!(filter, "warn,langfuse=off,aish_llm::langfuse=off");
+        // Every target the ingestion path can use is covered.
+        assert!(filter.ends_with("langfuse=off"));
+    }
+
+    /// The legacy REPL writes into ordinary scrollback, where the warning is
+    /// harmless: suppressing it there would hide a real diagnostic.
+    #[test]
+    fn legacy_launch_keeps_the_configured_level() {
+        assert_eq!(default_log_filter("warn", false), "warn");
+        assert_eq!(default_log_filter("debug", false), "debug");
     }
 
     #[test]

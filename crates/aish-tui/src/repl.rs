@@ -648,6 +648,27 @@ impl<W: Write, R: Read> Repl<W, R> {
             .is_some_and(|queue| queue.has_pending())
     }
 
+    /// Commit the unterminated tail the configured sink is still holding.
+    ///
+    /// A producer that ends without a trailing newline (a command whose last
+    /// bytes are `printf 'x'`, a tool result, the end of a stream) leaves its
+    /// text in the sink's partial buffer. Only a turn boundary may commit it:
+    /// flushing per frame would split one logical line into two rows, which is
+    /// exactly why [`QueueSink::raw`] buffers it in the first place.
+    ///
+    /// Call this from every place the *turn* ends — after the submit callback
+    /// returns, before [`Repl::finish`] takes its last history batch, and
+    /// before [`Repl::unpark`] puts the queue back in the process-wide slot.
+    fn flush_sink_tail(&self) {
+        let Some(sink) = self.config.sink.as_deref() else {
+            return;
+        };
+        let Some(queue) = sink.as_any().downcast_ref::<QueueSink>() else {
+            return;
+        };
+        queue.flush_raw();
+    }
+
     /// Commit every row the configured sink queued since the last frame.
     ///
     /// Only a [`QueueSink`] queues: any other sink writes at the call site, so
@@ -688,6 +709,10 @@ impl<W: Write, R: Read> Repl<W, R> {
     /// raw mode: writing the sequence in both places emitted it twice, which
     /// shows up as duplicate `^[[0m^[[?7h^[[?25h` runs before the shell exits.
     fn finish(&mut self) -> io::Result<()> {
+        // The turn ends here: a producer that finished without a trailing
+        // newline has left its row in the sink's partial buffer, and nothing
+        // after this point would ever commit it.
+        self.flush_sink_tail();
         self.drain_sink();
         let width = self.renderer.caps().width;
         let history = self.take_history(width);
@@ -723,8 +748,9 @@ impl<W: Write, R: Read> Repl<W, R> {
     /// Parking removes both obstacles:
     ///
     /// * one frame with an **empty viewport** clears the live band (prompt,
-    ///   ghost text, menu, HUD) and leaves the cursor on a fresh row, the same
-    ///   state [`Repl::finish`] leaves the terminal in;
+    ///   ghost text, menu, HUD), and [`Repl::unpark`] then writes the newline
+    ///   that moves the cursor to a fresh row — the same state
+    ///   [`Repl::finish`] leaves the terminal in;
     /// * the configured [`QueueSink`] is swapped out of the process-wide slot
     ///   for a [`DirectSink`], so producers write straight to the terminal —
     ///   what the legacy shell does — and their output shows up as it is
@@ -736,6 +762,8 @@ impl<W: Write, R: Read> Repl<W, R> {
     /// A REPL with no sink — or one whose sink is not the installed global
     /// sink — parks nothing: there is no queue to drain and no screen state to
     /// release, so the callback runs exactly as it did before parking existed.
+    /// That path is a wiring bug rather than a configuration, so it warns once
+    /// instead of degrading silently.
     fn park(&mut self) -> io::Result<ParkGuard<'_, W, R>> {
         let restore = self
             .config
@@ -744,6 +772,21 @@ impl<W: Write, R: Read> Repl<W, R> {
             .filter(|sink| sink.owns_screen() && Arc::ptr_eq(&crate::output::global_sink(), sink))
             .cloned();
         let Some(restore) = restore else {
+            // Without a queue of our own there is nothing to swap, but the
+            // product callback still runs and its output still has to land
+            // somewhere sane. Say so once: a silent fallback here is
+            // indistinguishable from a working park until the screen is
+            // mangled, and the cause (a sink this REPL does not own, or none
+            // at all) is a wiring bug.
+            tracing::warn!(
+                configured_owns_screen = self
+                    .config
+                    .sink
+                    .as_deref()
+                    .is_some_and(OutputSink::owns_screen),
+                installed_owns_screen = crate::output::screen_owned(),
+                "REPL park skipped: the configured sink is not the installed global sink"
+            );
             return Ok(ParkGuard {
                 repl: self,
                 restore: None,
@@ -788,6 +831,12 @@ impl<W: Write, R: Read> Repl<W, R> {
     /// Called exactly once, from [`ParkGuard::drop`] — including on the unwind
     /// path, so a panicking callback still leaves the process consistent.
     fn unpark(&mut self, restore: Option<Arc<dyn OutputSink>>) {
+        // The callback may have written straight to the terminal even when the
+        // park did not swap a sink (a product that writes fd 1 itself, or a
+        // park that bailed out): every remembered row is stale either way, so
+        // the memo is dropped unconditionally. Skipping this left a guard
+        // failure silently rendering over rows it never accounted for.
+        self.renderer.invalidate();
         let Some(sink) = restore else {
             return;
         };
@@ -795,8 +844,12 @@ impl<W: Write, R: Read> Repl<W, R> {
         if let Some(saved) = self.park_tty.take() {
             restore_output_processing(saved);
         }
+        // A producer that ran during the park and ended without a newline left
+        // its row in the queue's partial buffer; the park is over, so commit it
+        // before the queue goes back into the process-wide slot.
+        self.flush_sink_tail();
         crate::output::install_global_sink(sink);
-        self.renderer.invalidate();
+        let _ = self.renderer.write_trailing(b"\r\n");
     }
 
     /// Handle one input unit; `Ok(true)` means the REPL should exit.
@@ -1590,6 +1643,80 @@ mod tests {
         assert_eq!(repl.renderer().history_rows(), 0);
     }
 
+    /// A producer that ends without a trailing newline must still reach the
+    /// screen.
+    ///
+    /// `printf 'out'` (and every `sys.stdout.write` without `\n`) leaves its
+    /// text in the sink's partial buffer. Nothing but an explicit `flush_raw`
+    /// at a turn boundary commits it, and the pre-fix REPL only called
+    /// `drain`, so the row was silently dropped — the next frame repainted
+    /// over the cursor position it never occupied.
+    #[test]
+    fn repl_flushes_unterminated_sink_tail_at_exit() {
+        let sink = Arc::new(QueueSink::new());
+        // No `\n`: this is the tail a command like `printf 'MARKX9'` produces.
+        sink.raw("MARKX9");
+        assert!(sink.drain().is_empty(), "the tail is not a row yet");
+
+        let mut repl = repl_with_sink(b"", &sink);
+        run(&mut repl, |_| ReplAction::Continue);
+
+        // `finish` ran: the tail became exactly one history row.
+        assert_eq!(
+            repl.renderer().history_rows(),
+            1,
+            "the unterminated tail never reached history"
+        );
+        let bytes = output(repl);
+        assert!(
+            bytes.contains("MARKX9"),
+            "the unterminated tail was not painted: {bytes:?}"
+        );
+    }
+
+    /// A single flush at exit keeps a fragment stream as one row.
+    ///
+    /// Committing per frame instead would split the stream at every keystroke
+    /// boundary, which is exactly what the sink buffers against.
+    #[test]
+    fn repl_does_not_split_a_streaming_row_across_frames() {
+        let sink = Arc::new(QueueSink::new());
+        sink.raw("stream");
+        sink.raw("ed ");
+        sink.raw("row");
+
+        let mut repl = repl_with_sink(b"", &sink);
+        run(&mut repl, |_| ReplAction::Continue);
+
+        assert_eq!(
+            repl.renderer().history_rows(),
+            1,
+            "the fragments were committed as separate rows"
+        );
+        let bytes = output(repl);
+        assert!(bytes.contains("streamed row"), "{bytes:?}");
+    }
+
+    /// `has_pending` reports finished rows only.
+    ///
+    /// Reporting the unterminated tail made the run loop repaint for every
+    /// keystroke while a producer was between rows — a frame per character that
+    /// could never show the fragment.
+    #[test]
+    fn queue_sink_has_pending_ignores_the_unterminated_tail() {
+        let sink = QueueSink::new();
+        assert!(!sink.has_pending(), "an empty sink reported work");
+
+        sink.raw("partial");
+        assert!(
+            !sink.has_pending(),
+            "the unterminated tail was reported as a finished row"
+        );
+
+        sink.raw("\n");
+        assert!(sink.has_pending(), "a completed row was not reported");
+    }
+
     // ── HUD / panel integration ────────────────────────────────────────────
 
     fn task_row(id: &str, state: TaskState) -> TaskRow {
@@ -2201,5 +2328,107 @@ mod tests {
         assert_eq!(owned_during, Some(false), "the screen was still parked");
         // And the queue is back once the REPL resumed.
         assert!(crate::screen_owned(), "the REPL never took the screen back");
+    }
+
+    /// The parked callback must not write onto the row the next frame claims.
+    ///
+    /// The empty-viewport frame clears the live band and leaves the cursor on
+    /// the band's *first* row — the same row the next frame starts its history
+    /// block on. Without a newline in between, the callback's row is overwritten
+    /// by the next paint (a command whose output has no trailing newline
+    /// disappeared the moment the next prompt was drawn).
+    #[test]
+    fn park_moves_the_cursor_off_the_next_frames_row() {
+        let _lock = crate::lock_global_sink();
+        let queue = Arc::new(QueueSink::new());
+        crate::output::install_global_sink(Arc::clone(&queue) as Arc<dyn OutputSink>);
+
+        let writer = SharedWriter::default();
+        let mut repl = Repl::with_caps(
+            writer.clone(),
+            // Two submits: the second one's frame is the paint that must not
+            // land on the first callback's row.
+            Cursor::new(b"one\rtwo\r".to_vec()),
+            ReplConfig {
+                prompt: "> ".to_string(),
+                prompt_provider: None,
+                history_path: None,
+                auto_suggest: false,
+                sink: Some(Arc::clone(&queue) as Arc<dyn OutputSink>),
+                hud: None,
+                panel: None,
+            },
+            Vec::new(),
+            CAPS,
+        );
+        repl.park_sink = Arc::new(RecordingSink::default());
+
+        let mut during_first = None;
+        let mut calls = 0;
+        repl.run(|_| {
+            calls += 1;
+            if calls == 1 {
+                during_first = Some(writer.text().len());
+            }
+            ReplAction::Continue
+        })
+        .expect("REPL run");
+        assert_eq!(calls, 2, "the second submit never ran");
+
+        let bytes = writer.text();
+        let after = &bytes[during_first.expect("first callback did not run")..];
+        assert!(
+            after.starts_with("\r\n"),
+            "unpark did not move the cursor off the callback's row: {after:?}"
+        );
+    }
+
+    /// A park that cannot swap the sink still invalidates the frame memo.
+    ///
+    /// The guard falls back to `restore: None` when the configured sink is not
+    /// the installed global one, and the pre-fix `unpark` returned before
+    /// invalidating. The renderer then diffed against a memo that described a
+    /// screen the callback had written over, so the next frame could skip rows
+    /// that were no longer what it thought.
+    #[test]
+    fn park_guard_failure_still_invalidates_the_memo() {
+        let _lock = crate::lock_global_sink();
+        // A *foreign* sink owns the process-wide slot: this REPL's own sink is
+        // not it, so `park` cannot swap and reports `restore: None`.
+        let foreign = Arc::new(QueueSink::new());
+        crate::output::install_global_sink(Arc::clone(&foreign) as Arc<dyn OutputSink>);
+
+        let local = Arc::new(QueueSink::new());
+        let writer = SharedWriter::default();
+        let mut repl = Repl::with_caps(
+            writer.clone(),
+            Cursor::new(Vec::new()),
+            ReplConfig {
+                prompt: "> ".to_string(),
+                prompt_provider: None,
+                history_path: None,
+                auto_suggest: false,
+                sink: Some(Arc::clone(&local) as Arc<dyn OutputSink>),
+                hud: None,
+                panel: None,
+            },
+            Vec::new(),
+            CAPS,
+        );
+
+        repl.draw().expect("first draw");
+        let first_len = writer.text().len();
+
+        // The guard falls back to `restore: None`; the screen is still ours to
+        // reclaim, because the callback may have written fd 1 itself.
+        repl.unpark(None);
+
+        repl.draw().expect("second draw");
+        let bytes = writer.text();
+        let second = &bytes[first_len..];
+        assert!(
+            second.contains("\x1b[24;1H"),
+            "an unchanged band was diffed away instead of repainted: {second:?}"
+        );
     }
 }

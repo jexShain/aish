@@ -130,6 +130,10 @@ pub struct InputParser {
     /// Set after a paste was dropped for exceeding the cap: swallow everything
     /// up to the next end marker without emitting.
     discard_paste_tail: bool,
+    /// When the tail of a dropped paste started being swallowed. A lost
+    /// terminator must not silence the keyboard forever, so the discard expires
+    /// after [`PASTE_INACTIVITY`] and ordinary input resumes.
+    discard_since: Option<Instant>,
 }
 
 impl Default for InputParser {
@@ -144,6 +148,7 @@ impl InputParser {
             buffer: Vec::new(),
             paste_touched: None,
             discard_paste_tail: false,
+            discard_since: None,
         }
     }
 
@@ -157,10 +162,46 @@ impl InputParser {
         self.paste_touched.is_some()
     }
 
+    /// Stop swallowing the tail of a dropped paste: the next bytes are ordinary
+    /// input again.
+    fn end_discard(&mut self) {
+        self.discard_paste_tail = false;
+        self.discard_since = None;
+    }
+
+    /// Expire a tail discard whose time budget is spent.
+    ///
+    /// A dropped paste whose end marker never arrives would otherwise swallow
+    /// the keyboard for the rest of the process's life: the discard expires
+    /// after [`PASTE_INACTIVITY`], after which the buffer is dropped and input
+    /// resumes.
+    fn expire_discard(&mut self, now: Instant) -> bool {
+        if !self.discard_paste_tail {
+            return false;
+        }
+        let Some(since) = self.discard_since else {
+            return false;
+        };
+        if now.duration_since(since) < PASTE_INACTIVITY {
+            return false;
+        }
+        self.buffer.clear();
+        self.end_discard();
+        true
+    }
+
     /// Feed one chunk and return every event it completed.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<InputEvent> {
         self.buffer.extend_from_slice(bytes);
-        self.parse(Instant::now())
+        let now = Instant::now();
+        if !bytes.is_empty() && self.discard_paste_tail {
+            // Inactivity, not a total budget: a payload that is still
+            // streaming must keep being discarded, or the tail of a huge paste
+            // would be replayed as keystrokes the moment the first window ran
+            // out. Only a tail that stops growing expires.
+            self.discard_since = Some(now);
+        }
+        self.parse(now)
     }
 
     /// Settle ambiguous trailing bytes as literal input.
@@ -168,8 +209,15 @@ impl InputParser {
     /// Callers run this on a key timeout, which is what makes a bare Escape key
     /// usable at all. An unterminated paste is discarded for the same reason
     /// [`flush_paste_deadline`](Self::flush_paste_deadline) drops it: truncated
-    /// paste data must never reach the editor as if it were typed.
+    /// paste data must never reach the editor as if it were typed. The tail of
+    /// an already-dropped paste is dropped too — a timeout means no more of it
+    /// is coming, so the parser must not stay deaf to the keyboard.
     pub fn flush(&mut self) -> Vec<InputEvent> {
+        if self.discard_paste_tail {
+            self.buffer.clear();
+            self.end_discard();
+            return Vec::new();
+        }
         let mut out = Vec::new();
         while !self.buffer.is_empty() {
             match self.step(true) {
@@ -201,6 +249,9 @@ impl InputParser {
     /// than delivered as if it were complete — half a pasted command silently
     /// executed is worse than a paste the user has to repeat.
     pub fn flush_paste_deadline(&mut self, now: Instant) -> bool {
+        if self.expire_discard(now) {
+            return true;
+        }
         let Some(touched) = self.paste_touched else {
             return false;
         };
@@ -213,6 +264,7 @@ impl InputParser {
     }
 
     fn parse(&mut self, now: Instant) -> Vec<InputEvent> {
+        self.expire_discard(now);
         let mut out = Vec::new();
         loop {
             match self.step(false) {
@@ -226,6 +278,7 @@ impl InputParser {
                         self.buffer.clear();
                         self.paste_touched = None;
                         self.discard_paste_tail = true;
+                        self.discard_since = Some(now);
                     } else {
                         self.paste_touched = Some(now);
                     }
@@ -266,13 +319,20 @@ impl InputParser {
             match find_subslice(&self.buffer, PASTE_END) {
                 Some(pos) => {
                     self.buffer.drain(..pos + PASTE_END.len());
-                    self.discard_paste_tail = false;
+                    self.end_discard();
                     // The bytes after the consumed tail are ordinary input;
                     // classify them in the same call.
                     return self.step(forced);
                 }
                 None => {
-                    self.buffer.clear();
+                    // Keep a split marker's tail pending so a terminator that
+                    // lands across two reads is still recognised; everything
+                    // before it is payload and is dropped. Without the time
+                    // bound this branch would swallow the keyboard until the
+                    // missing marker appeared, which it never does.
+                    let keep = partial_suffix(&self.buffer, PASTE_END);
+                    let dropped = self.buffer.len() - keep;
+                    self.buffer.drain(..dropped);
                     return Step::Incomplete;
                 }
             }
@@ -309,16 +369,20 @@ impl InputParser {
                 Step::Emit(InputEvent::Char(ch), ch.len_utf8())
             }
             Err(err) => {
-                if err.error_len().is_some() {
-                    Step::Junk(1)
-                } else if err.valid_up_to() == 0 {
-                    Step::Incomplete
-                } else {
+                // The valid prefix decodes first: `error_len` being set only
+                // says the *tail* is illegal, and dropping the whole chunk
+                // would silently swallow the characters typed before it.
+                if err.valid_up_to() > 0 {
                     let ch = std::str::from_utf8(&self.buffer[..err.valid_up_to()])
                         .ok()
                         .and_then(|t| t.chars().next())
                         .unwrap_or('\u{fffd}');
                     Step::Emit(InputEvent::Char(ch), ch.len_utf8())
+                } else if let Some(len) = err.error_len() {
+                    // A definitely illegal sequence: report exactly its bytes.
+                    Step::Junk(len)
+                } else {
+                    Step::Incomplete
                 }
             }
         }
@@ -540,6 +604,20 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// Length of the longest suffix of `buf` that is also a proper prefix of
+/// `marker`.
+///
+/// Used when no full marker is buffered: those trailing bytes may be the head
+/// of a marker split across reads, so they must stay buffered instead of being
+/// consumed as payload.
+fn partial_suffix(buf: &[u8], marker: &[u8]) -> usize {
+    let max = buf.len().min(marker.len().saturating_sub(1));
+    (1..=max)
+        .rev()
+        .find(|&len| buf[buf.len() - len..] == marker[..len])
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,5 +774,69 @@ mod tests {
         parser.feed(b"\x1b[200~half");
         assert!(parser.flush().is_empty());
         assert!(!parser.in_paste());
+    }
+
+    #[test]
+    fn dropped_paste_tail_expires_instead_of_eating_the_keyboard() {
+        // P1-1: an over-cap paste loses its 201~ terminator. The tail discard
+        // must be bounded — otherwise every later keystroke is swallowed for
+        // the rest of the session and the shell looks frozen.
+        let mut parser = InputParser::new();
+        parser.feed(b"\x1b[200~");
+        let chunk = vec![b'a'; 64 * 1024];
+        for _ in 0..32 {
+            assert!(parser.feed(&chunk).is_empty());
+        }
+
+        // Inside the inactivity window the tail is still discarded.
+        assert!(!parser.flush_paste_deadline(Instant::now()));
+
+        // Past it, the discard expires; the very next keypress reaches the
+        // editor.
+        let later = Instant::now() + PASTE_INACTIVITY + Duration::from_millis(1);
+        assert!(parser.flush_paste_deadline(later));
+        assert_eq!(parser.feed(b"k"), vec![InputEvent::Char('k')]);
+
+        // A key-timeout flush expires the discard as well: the timeout proves
+        // no more of the paste is coming.
+        let mut parser = InputParser::new();
+        parser.feed(b"\x1b[200~");
+        for _ in 0..32 {
+            parser.feed(&chunk);
+        }
+        assert!(parser.flush().is_empty());
+        assert_eq!(parser.feed(b"k"), vec![InputEvent::Char('k')]);
+    }
+
+    #[test]
+    fn invalid_utf8_tail_keeps_the_valid_prefix() {
+        // P1-2: `error_len` being set says the *tail* is illegal, not that the
+        // whole chunk is. Dropping the chunk silently ate the characters typed
+        // before the bad byte.
+        let mut parser = InputParser::new();
+
+        // "abc" then a lone continuation byte: the three letters must arrive.
+        assert_eq!(
+            parser.feed(b"abc\xff"),
+            vec![
+                InputEvent::Char('a'),
+                InputEvent::Char('b'),
+                InputEvent::Char('c'),
+                InputEvent::Unknown(vec![0xff]),
+            ]
+        );
+        assert!(parser.pending().is_empty());
+
+        // Same with a multi-byte character in the prefix.
+        assert_eq!(
+            parser.feed(b"\xe4\xb8\x96\xff"),
+            vec![InputEvent::Char('世'), InputEvent::Unknown(vec![0xff])]
+        );
+
+        // An incomplete scalar at the end is still held back, not junked.
+        assert!(parser.feed(b"\xe4").is_empty());
+        assert_eq!(parser.pending(), b"\xe4");
+        assert!(parser.feed(b"\xb8").is_empty());
+        assert_eq!(parser.feed(b"\x96"), vec![InputEvent::Char('世')]);
     }
 }

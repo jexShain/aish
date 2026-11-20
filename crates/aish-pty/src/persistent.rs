@@ -55,6 +55,106 @@ where
     true
 }
 
+/// Holds the bytes at the end of a child-output stream that cannot be written
+/// yet.
+///
+/// `read(2)` boundaries fall anywhere in the child's byte stream: inside a
+/// multi-byte UTF-8 sequence, and between the `\r` and the `\n` of a line
+/// ending. Decoding and normalizing each chunk on its own therefore corrupted
+/// both:
+///
+/// * a three-byte character (every CJK ideograph) split across two reads
+///   decoded to two U+FFFD, one per half;
+/// * a `\r\n` split across two reads left the `\r` at the end of one row, so
+///   the queue sink kept a stray carriage return inside the history row.
+///
+/// Neither [`crate::term_stream::normalize_crlf`] nor `from_utf8_lossy` can
+/// fix this on its own: the fix is state, and the state belongs to whoever owns
+/// the stream — this type.
+#[derive(Debug, Default)]
+struct RelayTail {
+    /// At most three bytes: an incomplete UTF-8 sequence, and/or a trailing
+    /// `\r` whose `\n` has not arrived yet.
+    pending: Vec<u8>,
+}
+
+impl RelayTail {
+    /// Absorb one `read` chunk and return the prefix that is safe to write.
+    ///
+    /// The returned bytes always end on a character boundary and never end with
+    /// a lone `\r`; everything after them is held until the next call.
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(chunk);
+        // A trailing `\r` may be the first half of a CRLF pair. Checked first
+        // because `\r` is ASCII and so cannot be part of an incomplete
+        // multi-byte sequence.
+        let trailing_cr = buf.last() == Some(&b'\r');
+        if trailing_cr {
+            buf.pop();
+        }
+        let split = incomplete_utf8_start(&buf);
+        self.pending.extend_from_slice(&buf[split..]);
+        buf.truncate(split);
+        if trailing_cr {
+            self.pending.push(b'\r');
+        }
+        buf
+    }
+
+    /// Release whatever is still held, at end of stream.
+    ///
+    /// A sequence that never completed is genuinely undecodable, so it is
+    /// written lossily rather than silently dropped; a trailing `\r` is left as
+    /// it is, exactly as [`crate::term_stream::normalize_crlf`] would.
+    fn flush(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            write_stdout_all(&pending);
+        }
+    }
+}
+
+/// Byte offset where a possibly-incomplete UTF-8 sequence starts.
+///
+/// Returns `data.len()` when the buffer ends on a character boundary, and
+/// otherwise the start of the sequence the next chunk completes. Invalid lead
+/// bytes report the end of the buffer: the decoder replaces them now instead of
+/// the relay holding them forever.
+fn incomplete_utf8_start(data: &[u8]) -> usize {
+    let len = data.len();
+    // A UTF-8 sequence is at most four bytes, so only the last four can hold an
+    // incomplete one.
+    for back in 1..=4.min(len) {
+        let index = len - back;
+        let byte = data[index];
+        if byte & 0b1100_0000 == 0b1000_0000 {
+            // Continuation byte: the lead is further back.
+            continue;
+        }
+        let expected = match byte {
+            0x00..=0x7f => 1,
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => return len,
+        };
+        return if back < expected { index } else { len };
+    }
+    len
+}
+
+/// Write one child-output chunk, holding back an undecodable tail.
+///
+/// The caller owns the [`RelayTail`] because the state is per stream, not per
+/// call.
+fn write_stdout_chunk(tail: &mut RelayTail, chunk: &[u8]) {
+    let complete = tail.feed(chunk);
+    if !complete.is_empty() {
+        write_stdout_all(&complete);
+    }
+}
+
 /// Write child output to the terminal, honouring the process-wide output sink.
 ///
 /// When no renderer owns the screen this writes fd 1 directly (plus the CRLF
@@ -1326,6 +1426,10 @@ impl PersistentPty {
         // Drops terminal reports that leak into stdin while the command is not a
         // full-screen program (see term_stream).
         let mut stream_filter = crate::term_stream::TerminalStreamFilter::new();
+        // Holds the undecodable tail of the child's stream between reads: the
+        // display path decodes each chunk independently, and a character or a
+        // CRLF split across two of them must not be.
+        let mut display_tail = RelayTail::default();
         // Select-based I/O loop.
         'select_loop: while std::time::Instant::now() < deadline {
             // Check external cancellation.
@@ -1458,7 +1562,7 @@ impl PersistentPty {
                     n if n > 0 && self.exec_mode.load(Ordering::SeqCst) => {
                         stream_filter.observe_child_output(&tmp[..n as usize]);
                         if display_output {
-                            write_stdout_all(&tmp[..n as usize]);
+                            write_stdout_chunk(&mut display_tail, &tmp[..n as usize]);
                         }
                         self.exec_buffer
                             .lock()
@@ -1612,6 +1716,13 @@ impl PersistentPty {
         self.exec_mode.store(false, Ordering::SeqCst);
         PTY_EXEC_ACTIVE.store(false, Ordering::Release);
 
+        // The command produced its last byte: nothing can complete a held-back
+        // UTF-8 sequence or CRLF pair now, so write it (lossily, as the
+        // decoder would) instead of dropping it on the floor.
+        if display_output {
+            display_tail.flush();
+        }
+
         // Flush stale input so escape sequences don't confuse the next prompt.
         unsafe {
             libc::tcflush(stdin_fd, libc::TCIFLUSH);
@@ -1679,6 +1790,10 @@ impl PersistentPty {
         } else {
             crate::term_stream::TerminalStreamFilter::new()
         };
+        // Holds the undecodable tail of the child's stream between reads: each
+        // chunk is decoded independently, and a character or a CRLF split
+        // across two of them must not be.
+        let mut display_tail = RelayTail::default();
         // Seeded empty so the first poll pushes the terminal's current size to
         // the PTY unconditionally: the pre-command sync in the shell races with a
         // resize, and callers that never pre-sync (the bash tool's
@@ -1905,12 +2020,19 @@ impl PersistentPty {
         let mut ai_cancelled: bool = false;
 
         // Helper: write to stdout and optionally record via on_output callback.
-        let show = |text: &str| {
-            write_stdout_all(text.as_bytes());
-            if let Some(ref cb) = on_output {
-                cb(text);
-            }
-        };
+        //
+        // A macro rather than a closure: the write path needs `&mut` on the
+        // per-stream tail, and a closure holding that borrow would conflict
+        // with the read handler that decodes the child's chunks.
+        macro_rules! show {
+            ($text:expr) => {{
+                let text: &str = $text;
+                write_stdout_chunk(&mut display_tail, text.as_bytes());
+                if let Some(cb) = &on_output {
+                    cb(text);
+                }
+            }};
+        }
 
         while !done {
             // Follow terminal resizes while the command runs. A TUI that keeps
@@ -2048,7 +2170,7 @@ impl PersistentPty {
                                             "\x1b[33m{}\x1b[0m\r\n",
                                             aish_i18n::t("shell.session.ai_cancelled"),
                                         );
-                                        show(&cancel_msg);
+                                        show!(&cancel_msg);
                                     }
                                 }
                             }
@@ -2265,7 +2387,7 @@ impl PersistentPty {
                             1 => {
                                 // Ctrl+C: hard abort — skip followup entirely
                                 if ans[0] == 0x03 {
-                                    show("^C\r\n");
+                                    show!("^C\r\n");
                                     drain_stdin_trailing(stdin_fd, master_fd);
                                     ai_cancelled = true;
                                     false
@@ -2279,7 +2401,7 @@ impl PersistentPty {
                                     } else {
                                         b"n\r\n"
                                     };
-                                    show(std::str::from_utf8(echo).unwrap_or("y\r\n"));
+                                    show!(std::str::from_utf8(echo).unwrap_or("y\r\n"));
                                     // Drain trailing newline/CR so it doesn't leak
                                     // into the next read cycle.
                                     drain_stdin_trailing(stdin_fd, master_fd);
@@ -2344,7 +2466,7 @@ impl PersistentPty {
                                 "\x1b[90m{}\x1b[0m\r\n",
                                 aish_i18n::t("shell.session.running")
                             );
-                            show(&running_msg);
+                            show!(&running_msg);
                             let safe_cmd = close_unclosed_heredoc(&cmd_restored);
                             skip_echo_cmd = Some(safe_cmd.clone());
                             let mut inject = safe_cmd.as_bytes().to_vec();
@@ -2386,7 +2508,7 @@ impl PersistentPty {
                                 "\x1b[33m{}\x1b[0m\r\n",
                                 aish_i18n::t("shell.command_cancelled")
                             );
-                            show(&cancel_msg);
+                            show!(&cancel_msg);
                             unsafe {
                                 libc::write(
                                     self.master_fd,
@@ -2405,7 +2527,7 @@ impl PersistentPty {
                                 "\x1b[33m{}\x1b[0m\r\n",
                                 aish_i18n::t("shell.command_cancelled")
                             );
-                            show(&cancel_msg);
+                            show!(&cancel_msg);
                             unsafe {
                                 libc::write(
                                     self.master_fd,
@@ -2429,7 +2551,7 @@ impl PersistentPty {
                         if !response.display_text.is_empty() {
                             let mut msg = response.display_text.clone();
                             msg.push_str("\r\n");
-                            show(&msg);
+                            show!(&msg);
                         }
                         unsafe {
                             libc::write(self.master_fd, b"\r".as_ptr() as *const libc::c_void, 1);
@@ -2519,7 +2641,7 @@ impl PersistentPty {
                                     // current line. Without this, the redrawn
                                     // `[root@... ~]# <cmd>` visually clashes
                                     // with the BLOCKED message below it.
-                                    show(&format!("\r\x1b[2K\r\n\x1b[31m{}\x1b[0m\r\n", reason));
+                                    show!(&format!("\r\x1b[2K\r\n\x1b[31m{}\x1b[0m\r\n", reason));
                                     skip_leading_newline = true;
                                     // N3: discard any remaining bytes in this
                                     // stdin batch. Typeahead like
@@ -2622,7 +2744,7 @@ impl PersistentPty {
                                         write_buf.extend_from_slice(&injected_line);
                                         write_buf.push(b'\r');
                                     } else {
-                                        show("\r\n\x1b[33mCancelled\x1b[0m\r\n");
+                                        show!("\r\n\x1b[33mCancelled\x1b[0m\r\n");
                                     }
                                     // Declined or confirmed, the shadow
                                     // line is fully consumed either way.
@@ -2669,7 +2791,7 @@ impl PersistentPty {
                                             "\r\n\x1b[33m{}\x1b[0m\r\n",
                                             aish_i18n::t("shell.command_cancelled"),
                                         );
-                                        show(&cancel_msg);
+                                        show!(&cancel_msg);
                                         skip_leading_newline = true;
                                     } else if followup_capturing && byte == 0x1b {
                                         // ESC during followup capturing —
@@ -2711,7 +2833,7 @@ impl PersistentPty {
                                                 "\r\n\x1b[33m{}\x1b[0m\r\n",
                                                 aish_i18n::t("shell.command_cancelled"),
                                             );
-                                            show(&cancel_msg);
+                                            show!(&cancel_msg);
                                             skip_leading_newline = true;
                                         } else {
                                             // Follow-up bytes exist (arrow/function
@@ -3097,7 +3219,7 @@ impl PersistentPty {
                                                 "\r\x1b[90m{}\x1b[0m\r\n",
                                                 aish_i18n::t("shell.session.probing"),
                                             );
-                                            show(&status);
+                                            show!(&status);
                                             unsafe {
                                                 libc::write(
                                                     self.master_fd,
@@ -3132,7 +3254,7 @@ impl PersistentPty {
                                             "\x1b[33m{}\x1b[0m\r\n",
                                             aish_i18n::t("shell.session.ai_cancelled")
                                         );
-                                        show(&cancel_msg);
+                                        show!(&cancel_msg);
                                         unsafe {
                                             libc::write(
                                                 self.master_fd,
@@ -3443,7 +3565,7 @@ impl PersistentPty {
                                                     "\x1b[33m{}\x1b[0m\r\n",
                                                     aish_i18n::t("shell.session.ai_cancelled"),
                                                 );
-                                                show(&cancel_msg);
+                                                show!(&cancel_msg);
                                             }
                                         }
                                     }
@@ -4026,7 +4148,7 @@ impl PersistentPty {
                                 && !was_probe_active
                                 && !data.is_empty()
                             {
-                                write_stdout_all(data);
+                                write_stdout_chunk(&mut display_tail, data);
                                 if let Some(ref cb) = on_output {
                                     let text = String::from_utf8_lossy(data);
                                     cb(&text);
@@ -4108,7 +4230,7 @@ impl PersistentPty {
                         "\x1b[33m{}\x1b[0m ",
                         aish_i18n::t("shell.session.confirm_execute")
                     );
-                    show(&confirm);
+                    show!(&confirm);
 
                     // Read one byte for confirmation (raw mode)
                     let mut ans = [0u8; 1];
@@ -4118,7 +4240,7 @@ impl PersistentPty {
                         1 => {
                             // Ctrl+C: hard abort — skip followup entirely
                             if ans[0] == 0x03 {
-                                show("^C\r\n");
+                                show!("^C\r\n");
                                 drain_stdin_trailing(stdin_fd, master_fd);
                                 ai_cancelled = true;
                                 false
@@ -4132,7 +4254,7 @@ impl PersistentPty {
                                 } else {
                                     "n\r\n"
                                 };
-                                show(echo);
+                                show!(echo);
                                 drain_stdin_trailing(stdin_fd, master_fd);
                                 ans[0] == b'y'
                                     || ans[0] == b'Y'
@@ -4170,7 +4292,7 @@ impl PersistentPty {
                             "\x1b[90m{}\x1b[0m\r\n",
                             aish_i18n::t("shell.session.running")
                         );
-                        show(&running_msg);
+                        show!(&running_msg);
                         // Restore secret placeholders before execution.
                         let mut cmd_restored = cmd.clone();
                         if let Some(ref vault) = secret_vault {
@@ -4183,7 +4305,7 @@ impl PersistentPty {
                                     &rargs,
                                 );
                                 let info = format!("\x1b[2m{}\x1b[0m\r\n", msg);
-                                show(&info);
+                                show!(&info);
                                 cmd_restored = restored;
                             }
                         }
@@ -4226,7 +4348,7 @@ impl PersistentPty {
                             "\x1b[33m{}\x1b[0m\r\n",
                             aish_i18n::t("shell.command_cancelled")
                         );
-                        show(&cancel_msg);
+                        show!(&cancel_msg);
                         unsafe {
                             libc::write(self.master_fd, b"\r".as_ptr() as *const libc::c_void, 1);
                         }
@@ -4241,7 +4363,7 @@ impl PersistentPty {
                             "\x1b[33m{}\x1b[0m\r\n",
                             aish_i18n::t("shell.command_cancelled")
                         );
-                        show(&cancel_msg);
+                        show!(&cancel_msg);
                         unsafe {
                             libc::write(self.master_fd, b"\r".as_ptr() as *const libc::c_void, 1);
                         }
@@ -4379,6 +4501,11 @@ impl PersistentPty {
         if !stream_filter.flush().is_empty() {
             debug!("discarded incomplete terminal report from stdin at command end");
         }
+
+        // The interactive session is over: a trailing half-character or bare
+        // `\r` can no longer be completed by another read, so it is written
+        // now instead of vanishing with the loop's state.
+        display_tail.flush();
 
         // Decode captured output, stripping ANSI escape sequences for a clean
         // text representation suitable for LLM context.
@@ -7899,6 +8026,122 @@ mod tests {
         write_stdout_all(b"\n");
 
         assert!(sink.bytes().is_empty(), "legacy path queued bytes");
+    }
+
+    /// Feed `chunks` through a fresh relay tail into a screen-owning sink.
+    ///
+    /// Returns the bytes the sink received, so a test can assert on the decoded
+    /// text rather than on the chunking.
+    fn relay_chunks(chunks: &[&[u8]]) -> Vec<u8> {
+        let (_guard, _sink_guard) = lock_sink();
+        let sink = Arc::new(RecordingSink {
+            owns_screen: true,
+            ..RecordingSink::default()
+        });
+        aish_core::output::install_global_sink(
+            Arc::clone(&sink) as Arc<dyn aish_core::output::OutputSink>
+        );
+
+        let mut tail = RelayTail::default();
+        for chunk in chunks {
+            write_stdout_chunk(&mut tail, chunk);
+        }
+        tail.flush();
+        sink.bytes()
+    }
+
+    /// A three-byte character split across two reads must decode to one
+    /// character, not two replacement characters.
+    ///
+    /// `read(2)` returns whatever the kernel has, which routinely lands inside
+    /// a CJK ideograph (every common Chinese character is three bytes). Decoding
+    /// each chunk on its own turned `中` into `\u{FFFD}\u{FFFD}`.
+    #[test]
+    fn relay_tail_joins_split_utf8_multibyte_char() {
+        // "中" is E4 B8 AD; the split leaves a one-byte and a two-byte half.
+        let bytes = relay_chunks(&[&[0xe4], &[0xb8, 0xad]]);
+
+        assert_eq!(bytes, "中".as_bytes(), "split character was decoded apart");
+        assert!(
+            !bytes.windows(3).any(|w| w == b"\xef\xbf\xbd"),
+            "replacement character leaked: {bytes:?}"
+        );
+    }
+
+    /// Every split point of a mixed-script line must reproduce it byte for
+    /// byte.
+    ///
+    /// Exhaustive rather than one case: the incomplete-sequence detector has to
+    /// agree with the decoder at every boundary, and an off-by-one at one of
+    /// them would only show up on the character that straddles it.
+    #[test]
+    fn relay_tail_reassembles_every_split_point() {
+        let text = "a中b𝄞c é\u{301}漢".as_bytes();
+        for split in 0..=text.len() {
+            let (head, tail) = text.split_at(split);
+            let bytes = relay_chunks(&[head, tail]);
+            assert_eq!(
+                bytes, text,
+                "chunk boundary at {split} corrupted the stream"
+            );
+        }
+    }
+
+    /// A CRLF split between the `\r` and the `\n` must normalize to one `\n`.
+    ///
+    /// Normalizing each half independently left the `\r` behind, so the queue
+    /// sink kept a stray carriage return at the end of the history row (and a
+    /// terminal that reflows rendered it as a second row).
+    #[test]
+    fn relay_tail_joins_split_crlf_pair() {
+        let bytes = relay_chunks(&[b"a\r", b"\nb"]);
+
+        assert_eq!(bytes, b"a\nb", "split CRLF was not normalized");
+        assert!(
+            !bytes.contains(&b'\r'),
+            "a bare carriage return survived: {bytes:?}"
+        );
+    }
+
+    /// A tail that never completes is written at end of stream rather than
+    /// swallowed.
+    ///
+    /// Dropping it would silently lose the child's last bytes; writing it
+    /// lossily is what the decoder would have done with a complete chunk.
+    #[test]
+    fn relay_tail_flushes_incomplete_sequence_at_end_of_stream() {
+        let bytes = relay_chunks(&[b"ok\xe4\xb8"]);
+
+        assert!(
+            bytes.starts_with(b"ok"),
+            "complete prefix was lost: {bytes:?}"
+        );
+        assert!(
+            bytes.ends_with(b"\xef\xbf\xbd"),
+            "incomplete sequence was not reported as a replacement: {bytes:?}"
+        );
+    }
+
+    /// A trailing `\r` at end of stream is written verbatim.
+    ///
+    /// It is not the first half of anything: there is no next chunk, so
+    /// holding it would lose a byte the child really wrote.
+    #[test]
+    fn relay_tail_flushes_lone_trailing_cr_at_end_of_stream() {
+        assert_eq!(relay_chunks(&[b"progress\r"]), b"progress\r");
+    }
+
+    /// A split inside a four-byte character decodes to one character.
+    ///
+    /// Four-byte sequences (emoji, musical symbols) are the only case where the
+    /// held tail is three bytes long.
+    #[test]
+    fn relay_tail_joins_split_four_byte_char() {
+        // "𝄞" is F0 9D 84 9E.
+        assert_eq!(
+            relay_chunks(&[&[0xf0, 0x9d], &[0x84, 0x9e]]),
+            "𝄞".as_bytes()
+        );
     }
 
     /// Start a PersistentPty for tests, retrying transient allocation

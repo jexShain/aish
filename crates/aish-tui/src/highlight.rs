@@ -17,6 +17,8 @@
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::render::{escape_end, TAB_WIDTH};
+
 /// Enter reverse video.
 pub const CURSOR_ON: &str = "\x1b[7m";
 /// Leave reverse video only (keeps foreground/background/dim).
@@ -71,23 +73,31 @@ struct CursorScan {
 
 /// Walk `line`, recording the glyph covering display column `col`, the last
 /// glyph that owns a cell, and the row's display width. Escape spans own no
-/// columns.
+/// columns and a tab advances to the next eight-column stop, exactly as
+/// [`prepare_line`](crate::render::prepare_line) expands it: both scanners must
+/// agree on the column a caret sits in.
 fn scan_line(line: &str, col: usize) -> CursorScan {
+    let bytes = line.as_bytes();
     let mut display = 0usize;
     let mut host = None;
     let mut last_glyph = None;
     let mut idx = 0usize;
-    while idx < line.len() {
-        let ch = line[idx..].chars().next().expect("idx is a boundary");
-        if ch == '\x1b' {
-            idx += escape_len(&line[idx..]);
+    while idx < bytes.len() {
+        if bytes[idx] == 0x1b {
+            // The renderer's scanner, not a second copy of it: a hand-rolled
+            // one that disagreed on where a malformed sequence ends sliced into
+            // the middle of a multi-byte scalar and panicked.
+            idx = escape_end(bytes, idx);
             continue;
         }
+        let ch = line[idx..].chars().next().expect("idx is a boundary");
         let end = idx + ch.len_utf8();
         // A zero-width character (combining mark, control byte) owns no cell, so
         // it can neither host the cursor nor advance the column — reversing it
         // would dim nothing and could strand a control byte inside the caret.
-        let width = if ch.is_control() {
+        let width = if ch == '\t' {
+            TAB_WIDTH - display % TAB_WIDTH
+        } else if ch.is_control() {
             0
         } else {
             ch.width().unwrap_or(0)
@@ -147,57 +157,12 @@ fn paint_line(line: &str, col: usize, max_cells: usize) -> String {
     out
 }
 
-/// Byte length of the escape span starting at `s` (which begins with ESC).
-fn escape_len(s: &str) -> usize {
-    let bytes = s.as_bytes();
-    if bytes.len() < 2 {
-        return bytes.len();
-    }
-    match bytes[1] {
-        b'[' => {
-            // CSI: parameter/intermediate bytes, then one final byte 0x40-0x7e.
-            for (i, &b) in bytes.iter().enumerate().skip(2) {
-                if (0x40..=0x7e).contains(&b) {
-                    return i + 1;
-                }
-            }
-            bytes.len()
-        }
-        b']' => {
-            // OSC: terminated by BEL or ESC \.
-            let mut i = 2;
-            while i < bytes.len() {
-                if bytes[i] == 0x07 {
-                    return i + 1;
-                }
-                if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
-                    return i + 2;
-                }
-                i += 1;
-            }
-            bytes.len()
-        }
-        _ => 2,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn strip_escapes(s: &str) -> String {
-        let mut out = String::new();
-        let mut i = 0;
-        while i < s.len() {
-            let ch = s[i..].chars().next().unwrap();
-            if ch == '\x1b' {
-                i += escape_len(&s[i..]);
-            } else {
-                out.push(ch);
-                i += ch.len_utf8();
-            }
-        }
-        out
+        crate::render::strip_escapes(s)
     }
 
     #[test]
@@ -255,5 +220,107 @@ mod tests {
         let rows = render_with_cursor(vec![String::new()], 0, 0, 1);
         assert_eq!(rows[0], "\x1b[7m \x1b[27m");
         assert_eq!(strip_escapes(&rows[0]).chars().count(), 1);
+    }
+
+    #[test]
+    fn malformed_escape_never_splits_a_scalar() {
+        // P0-1: a prompt with a lone ESC before a non-ASCII scalar is malformed
+        // input, and the old hand-rolled scanner consumed two bytes from it —
+        // landing in the middle of 漢 and panicking when it sliced there.
+        let line = "\x1b漢x";
+        assert_eq!(scan_line(line, 0).width, 3);
+        let rows = render_with_cursor(vec![line.to_string()], 0, 0, 80);
+        assert_eq!(strip_escapes(&rows[0]), "漢x");
+
+        // The same rows must measure the same whether or not the painter is
+        // involved: the caret cell never changes how many columns a row owns.
+        assert_eq!(
+            crate::render::visible_width(&rows[0]),
+            crate::render::visible_width(line)
+        );
+    }
+
+    #[test]
+    fn string_escapes_match_the_renderer() {
+        // P1-3: the painter's private scanner disagreed with
+        // `render::escape_end` on DCS/APC/PM/SOS (which only ST terminates),
+        // so a payload containing BEL was treated as visible text and shifted
+        // the caret. Both scanners must now agree byte for byte.
+        for raw in [
+            "\x1bP1;2qPAYLOAD\x07after",
+            "\x1b_apc\x07after",
+            "\x1b^pm\x07after",
+            "\x1bXsos\x07after",
+            "\x1bP1;2qPAYLOAD\x1b\\after",
+            "\x1b[31mred\x1b[0m",
+            "\x1b]8;;https://example.com\x07link\x1b]8;;\x07",
+            "\x1b]8;;https://example.com",
+            "\x1b[38;2;1;2;3m",
+        ] {
+            let scan = scan_line(raw, 0);
+            assert_eq!(
+                scan.width,
+                crate::render::visible_width(raw) as usize,
+                "scanners disagree on {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_advances_to_the_next_column_stop() {
+        // P1-4: the renderer expands a tab to the next eight-column stop, so a
+        // caret column measured by the painter must use the same stops. A tab
+        // counted as zero columns put the caret on the wrong glyph.
+        let line = "a\tb";
+        assert_eq!(scan_line(line, 0).width, 9);
+        assert_eq!(
+            scan_line(line, 0).width,
+            crate::render::visible_width(line) as usize
+        );
+
+        // The caret at column 8 (the first column of 'b') must reverse 'b'.
+        let scan = scan_line(line, 8);
+        assert_eq!(scan.host.map(|(start, end)| &line[start..end]), Some("b"));
+        let rows = render_with_cursor(vec![line.to_string()], 0, 8, 80);
+        assert_eq!(rows[0], "a\t\x1b[7mb\x1b[27m");
+
+        // And every caret column agrees with the row the renderer expands the
+        // tab into: the same cell is reversed, and the row measures the same.
+        let expanded = crate::render::prepare_line(line, 80).text;
+        for col in 0..crate::render::visible_width(&expanded) {
+            let painted = render_with_cursor(vec![line.to_string()], 0, col, 80);
+            let expected = render_with_cursor(vec![expanded.clone()], 0, col, 80);
+            let strip_both = |text: &str| -> String {
+                strip_escapes(text)
+                    .chars()
+                    .filter(|ch| *ch != '\t' && *ch != ' ')
+                    .collect()
+            };
+            assert_eq!(
+                strip_both(&painted[0]),
+                strip_both(&expanded),
+                "column {col} disagrees between tab painter and expanded row"
+            );
+            assert_eq!(
+                crate::render::visible_width(&painted[0]),
+                crate::render::visible_width(&expected[0]),
+                "column {col}: row width disagrees"
+            );
+            let reversed = |text: &str| -> Option<String> {
+                let start = text.find("\x1b[7m")? + "\x1b[7m".len();
+                let end = text[start..].find("\x1b[27m")? + start;
+                Some(text[start..end].to_string())
+            };
+            // Inside the tab the painter reverses the tab itself (one glyph
+            // owning seven cells) while the expanded row reverses a space;
+            // every other column must select the same glyph.
+            if !(1..8).contains(&col) {
+                assert_eq!(
+                    reversed(&painted[0]),
+                    reversed(&expected[0]),
+                    "column {col}: different glyph reversed"
+                );
+            }
+        }
     }
 }

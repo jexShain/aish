@@ -389,23 +389,27 @@ impl Editor {
         self.preferred_col = None;
     }
 
-    /// Up: previous logical line inside a multi-line buffer, otherwise the
-    /// previous history entry.
+    /// Up: previous history entry while history is showing, otherwise the
+    /// previous logical line inside a multi-line buffer.
+    ///
+    /// The branch is history *mode*, not the buffer's shape: a multi-line
+    /// history entry (Shift+Enter submits one) still walks history, so Down can
+    /// return to the draft instead of being trapped in the entry's lines.
     pub fn move_up(&mut self) {
-        if self.buffer.contains('\n') {
-            self.move_line_up();
-        } else {
+        if self.history_index.is_some() || !self.buffer.contains('\n') {
             self.history_prev();
+        } else {
+            self.move_line_up();
         }
     }
 
-    /// Down: next logical line inside a multi-line buffer, otherwise the next
-    /// history entry (restoring the draft at the bottom).
+    /// Down: next history entry (restoring the draft at the bottom) while
+    /// history is showing, otherwise the next logical line.
     pub fn move_down(&mut self) {
-        if self.buffer.contains('\n') {
-            self.move_line_down();
-        } else {
+        if self.history_index.is_some() {
             self.history_next();
+        } else {
+            self.move_line_down();
         }
     }
 
@@ -841,13 +845,15 @@ fn wrap_logical(
     for ch in text.chars() {
         let avail = if rows.len() == 1 { first } else { rest };
         let cw = char_width(ch);
-        // Only a glyph that genuinely does not fit wraps: a wide glyph that
-        // would be split across the terminal's edge, or any glyph reaching past
-        // the budget because the row already holds something. A narrow glyph
-        // that lands exactly on the last column stays on its row — the caret
-        // then rests in that last cell, which is what a terminal with a pending
-        // wrap shows, instead of a phantom empty row below the input.
-        if col > 0 && col + cw > avail {
+        // Wrap when the glyph no longer fits the row *and* the row already
+        // holds something, or when the glyph cannot fit the first row but a
+        // full row could host it (a 2-column glyph beside a 1-column prompt
+        // sliver). The second case must open the next row too: leaving the
+        // glyph on the full row would put it past the terminal's edge, where
+        // the screen renderer replaces it with a space and the character
+        // silently disappears. A glyph wider than the terminal itself fits
+        // nowhere, so it stays put instead of growing a phantom empty row.
+        if col + cw > avail && (col > 0 || cw <= rest) {
             rows.push(String::new());
             col = 0;
         }
@@ -1493,5 +1499,90 @@ mod tests {
                 "width {width}"
             );
         }
+    }
+
+    #[test]
+    fn wide_glyph_beside_a_one_column_prompt_wraps() {
+        // P0-2: the prompt leaves exactly one column, so a two-column glyph
+        // cannot sit beside it. It must open the next row — keeping it on the
+        // first row put the row at 3 columns in a 2-column terminal, and the
+        // screen renderer replaced the half glyph with a space, so the
+        // character the user typed vanished.
+        // A prompt row is returned verbatim (the frame renderer fits it), so
+        // only the buffer rows are the editor's budget to keep.
+        for prompt in ["> ", ">", ""] {
+            for width in 2u16..=4 {
+                let mut editor = Editor::new(prompt);
+                editor.insert_char('世');
+                let rows = editor.render(width);
+                for row in rows.iter().filter(|row| row.as_str() != prompt) {
+                    assert!(
+                        crate::render::visible_width(row) <= width,
+                        "prompt {prompt:?} width {width}: row {row:?} measures {}",
+                        crate::render::visible_width(row)
+                    );
+                }
+                let painted: String = rows.iter().map(|row| plain(row)).collect();
+                assert!(
+                    painted.contains('世'),
+                    "prompt {prompt:?} width {width}: glyph was dropped, rows {rows:?}"
+                );
+                // The row the glyph lands on is what the frame renderer fits:
+                // its prepared form must still contain the glyph, not a blank.
+                let buffer_row = rows
+                    .iter()
+                    .find(|row| plain(row).contains('世'))
+                    .expect("glyph row");
+                assert!(
+                    crate::render::prepare_line(buffer_row, width)
+                        .text
+                        .contains('世'),
+                    "prompt {prompt:?} width {width}: prepare_line dropped the glyph"
+                );
+            }
+        }
+
+        // The reported shape: a 29-column prompt in a 30-column terminal leaves
+        // one column, so the wide glyph wraps instead of overflowing.
+        let mut editor = Editor::new("x".repeat(29));
+        editor.insert_char('世');
+        let rows = editor.render(30);
+        assert_eq!(rows.len(), 2, "rows: {rows:?}");
+        for row in &rows {
+            assert!(crate::render::visible_width(row) <= 30, "row {row:?}");
+        }
+        assert_eq!(plain(&rows[1]).trim_end(), "世");
+    }
+
+    #[test]
+    fn multi_line_history_entry_still_walks_history() {
+        // P0-3: Shift+Enter submits a multi-line entry. Up must recall it and
+        // Down must return to the draft — branching on `buffer.contains('\n')`
+        // instead of history mode trapped the caret inside the entry with
+        // `history_index` stuck on Some(_), so the draft was unreachable.
+        let mut editor = Editor::new("> ");
+        editor.set_history(vec!["one\ntwo".into()]);
+        editor.insert_str("draft");
+        editor.move_up();
+        assert_eq!(editor.buffer(), "one\ntwo");
+
+        editor.move_down();
+        assert_eq!(editor.buffer(), "draft");
+        assert_eq!(editor.cursor(), "draft".len());
+        // And the round trip is repeatable: history mode was actually left.
+        editor.move_up();
+        assert_eq!(editor.buffer(), "one\ntwo");
+
+        // Inside a multi-line *draft* (no history showing) vertical motion is
+        // still line-wise, so the two behaviours do not collide.
+        let mut editor = Editor::new("> ");
+        editor.set_history(vec!["older".into()]);
+        editor.insert_str("a\nb");
+        editor.home();
+        editor.move_up();
+        assert_eq!(editor.buffer(), "a\nb", "line motion stayed in the draft");
+        assert_eq!(editor.cursor(), 0);
+        editor.move_down();
+        assert_eq!(editor.cursor(), 2);
     }
 }

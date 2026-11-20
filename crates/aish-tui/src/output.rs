@@ -85,14 +85,21 @@ impl QueueSink {
         state.lines.drain(..).collect()
     }
 
-    /// Whether rows (or a completed fragment) are waiting to be committed.
+    /// Whether finished rows are waiting to be committed.
     ///
     /// A [`Repl`](crate::repl::Repl) checks this after every keystroke: a
     /// submitted command runs inline and may queue output, which must reach the
     /// screen before the next prompt is painted.
+    ///
+    /// The unterminated tail is deliberately *not* reported. A producer that is
+    /// mid-row (an LLM token stream, a child process whose `read` split a line)
+    /// has not finished the row yet: no frame could show it, and committing it
+    /// here would split one logical line into two history rows. Only an
+    /// explicit [`flush_raw`](OutputSink::flush_raw) at a turn boundary commits
+    /// it. Reporting the tail made the REPL repaint once per keystroke for a
+    /// fragment that was never going to appear.
     pub fn has_pending(&self) -> bool {
-        let state = self.state.lock();
-        !state.lines.is_empty() || !state.partial.is_empty()
+        !self.state.lock().lines.is_empty()
     }
 }
 

@@ -113,7 +113,11 @@ where
 
 /// Byte index just past the escape sequence starting at `start` (which must
 /// point at ESC). Malformed input degrades to consuming the lone ESC byte.
-fn escape_end(bytes: &[u8], start: usize) -> usize {
+///
+/// Every consumer that has to agree with [`prepare_line`] on where the visible
+/// text resumes must call this scanner — a second, hand-rolled copy is exactly
+/// how the cursor painter ended up slicing a UTF-8 scalar in half.
+pub(crate) fn escape_end(bytes: &[u8], start: usize) -> usize {
     debug_assert_eq!(bytes[start], 0x1b);
     let Some(&kind) = bytes.get(start + 1) else {
         return start + 1;

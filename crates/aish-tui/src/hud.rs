@@ -101,47 +101,49 @@ impl HudState {
         let bar = self.ctx_bar();
         // The spinner and the bar are one inseparable tail: truncating between
         // them would leave a spinner with nothing to spin about.
-        let tail = if self.summary.is_empty() {
-            bar
-        } else {
-            format!("{} {}", self.spinner_frame(), bar)
-        };
+        let tail = fit(
+            &if self.summary.is_empty() {
+                bar
+            } else {
+                format!("{} {}", self.spinner_frame(), bar)
+            },
+            width,
+        );
+        let tail_w = visible_width(&tail);
 
         let left = self.left.as_str();
         let summary = self.summary.as_str();
-        let left_w = visible_width(left);
-        let summary_w = visible_width(summary);
-        let tail_w = visible_width(&tail);
+        // Every segment is measured *after* fitting, never by adding up raw
+        // widths: `fit` expands tabs from the segment's own origin, so the
+        // fitted pieces are additively measurable while the raw text is not (a
+        // tab costs one column at column 0 but up to eight further right, which
+        // is how a row could previously end up wider than its budget).
+        let left_w = visible_width(left).min(width);
 
-        let row = if left_w as u32 + summary_w as u32 + tail_w as u32 <= width as u32 {
-            // Everything fits: spend the surplus on the middle gap.
-            let gap =
-                u32::from(width) - u32::from(left_w) - u32::from(summary_w) - u32::from(tail_w);
-            format!(
-                "{left}{}{summary}{tail}",
-                " ".repeat(gap.min(u32::from(width)) as usize)
-            )
-        } else {
-            // The gap is already gone; the summary gives way first, and only
-            // then the left segment.
-            let summary_budget = width.saturating_sub(left_w.saturating_add(tail_w));
-            let summary_fit = fit(summary, summary_budget);
-            let left_budget =
-                width.saturating_sub(visible_width(&summary_fit).saturating_add(tail_w));
-            let left_fit = fit(left, left_budget);
-            let mut row = format!("{left_fit}{summary_fit}{tail}");
-            if visible_width(&row) > width {
-                // Even the tail alone is wider than the row: truncate it last,
-                // because a partial bar still reads as "the HUD is there".
-                row = fit(&row, width);
-            }
-            row
-        };
+        // The summary gives way first, and only then the left segment.
+        let summary_budget = width.saturating_sub(left_w.saturating_add(tail_w));
+        let summary_fit = fit(summary, summary_budget);
+        let left_budget = width.saturating_sub(visible_width(&summary_fit).saturating_add(tail_w));
+        let left_fit = fit(left, left_budget);
 
-        debug_assert!(
-            visible_width(&row) <= width,
-            "hud row exceeded its budget: {row:?}"
-        );
+        // Whatever the three segments left over is the middle gap, so it can
+        // only ever shrink the row and never grow it.
+        let used = visible_width(&left_fit)
+            .saturating_add(visible_width(&summary_fit))
+            .saturating_add(tail_w);
+        let gap = width.saturating_sub(used) as usize;
+
+        let mut row = String::with_capacity(left_fit.len() + gap + summary_fit.len() + tail.len());
+        row.push_str(&left_fit);
+        row.extend(std::iter::repeat_n(' ', gap));
+        row.push_str(&summary_fit);
+        row.push_str(&tail);
+        if visible_width(&row) > width {
+            // Belt and braces for release builds: a row that wraps corrupts
+            // every row painted after it, so the budget is enforced, not
+            // merely asserted.
+            row = prepare_line(&row, width).text;
+        }
         format!("{DIM}{row}{RESET}")
     }
 
@@ -164,17 +166,17 @@ impl HudState {
     }
 }
 
-/// `text` cut to at most `budget` columns.
+/// `text` normalized into at most `budget` columns.
 ///
-/// [`prepare_line`] is reused rather than a byte slice so a wide glyph that
-/// does not fit is replaced by its half-cell instead of being cut in two.
+/// [`prepare_line`] is always used, never a byte slice: besides cutting a wide
+/// glyph into its half-cell instead of in two, it is the only place that
+/// materializes tabs and drops control characters, and the fitted pieces are
+/// what the layout adds up. Returning `text` unchanged whenever it *measured*
+/// short was the bug: a tab's width depends on the absolute column it starts
+/// at, so it measures narrower at the row origin than it paints once the left
+/// segment and the gap have shifted it right, and the sum under-counted the
+/// row.
 fn fit(text: &str, budget: u16) -> String {
-    if budget == 0 {
-        return String::new();
-    }
-    if visible_width(text) <= budget {
-        return text.to_string();
-    }
     prepare_line(text, budget).text
 }
 
@@ -408,5 +410,77 @@ mod tests {
         let cut = strip_escapes(&hud.render(5));
         assert_eq!(visible_width(&cut), 5);
         assert_eq!(cut.chars().count(), 5);
+    }
+
+    #[test]
+    fn tab_in_summary_cannot_overflow() {
+        // A tab measures four columns at the row origin but expands to the next
+        // eight-column stop once the left segment and the gap shift it right.
+        // Adding up raw segment widths therefore under-counted the row: it
+        // painted 35 columns for a budget of 33.
+        let mut hud = HudState::new();
+        hud.set_left("");
+        hud.summary = "with\t tab".to_string();
+        hud.set_ctx_percent(0);
+
+        let row = hud.render(33);
+        assert_eq!(visible_width(&strip_escapes(&row)), 33, "row: {row:?}");
+        assert!(
+            !row.contains('\t'),
+            "tab reached the terminal unexpanded: {row:?}"
+        );
+    }
+
+    #[test]
+    fn tab_fuzz_never_exceeds_width() {
+        let mut hud = HudState::new();
+        hud.set_ctx_percent(64);
+
+        for (left, summary) in [
+            ("", "with\t tab"),
+            ("\tleft", "1\tagent"),
+            ("a\tb\tc", "漢\t字"),
+            ("\t\t", "\t"),
+            ("model-x", "2 agents\t·\t1 task"),
+        ] {
+            hud.set_left(left);
+            hud.summary = summary.to_string();
+            for width in 1..=200u16 {
+                let row = hud.render(width);
+                let plain = strip_escapes(&row);
+                assert!(
+                    visible_width(&plain) <= width,
+                    "{left:?}/{summary:?} width {width}: {plain:?} painted {}",
+                    visible_width(&plain)
+                );
+                assert!(!plain.contains('\t'), "width {width}: tab leaked {plain:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn control_bytes_in_segments_are_dropped() {
+        // Left and summary are product data too. A carriage return would repaint
+        // the row from column 0 and a newline would paint a second row, both
+        // outside the one-row contract, so neither may reach the terminal.
+        let mut hud = HudState::new();
+        hud.set_left("mod\rel\nx");
+        hud.summary = "1\r\nagent".to_string();
+        hud.set_ctx_percent(10);
+
+        for width in 1..=80u16 {
+            let row = hud.render(width);
+            let plain = strip_escapes(&row);
+            assert!(
+                !plain.chars().any(|ch| ch.is_control() && ch != '\x1b'),
+                "width {width}: control byte leaked {plain:?}"
+            );
+            assert!(visible_width(&plain) <= width, "width {width}: {plain:?}");
+        }
+
+        // Only the row framing escapes survive; the text itself is intact.
+        let plain = strip_escapes(&hud.render(40));
+        assert!(plain.starts_with("modelx"), "{plain:?}");
+        assert!(plain.contains("1agent"), "{plain:?}");
     }
 }

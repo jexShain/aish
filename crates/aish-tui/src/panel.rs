@@ -10,9 +10,11 @@
 //! [`SupervisorPanel::render`] takes `(width, height)` and reads no terminal
 //! size of its own. That is what makes the panel testable byte-for-byte and
 //! what lets a caller put it beside the prompt instead of over it. The panel
-//! also never mutates visible state from `render`: the only write is the
-//! remembered page height, which exists so selection movement can keep the
-//! selected row on screen without being told the height again.
+//! also never mutates *selection* state from `render`: the only writes are the
+//! remembered page height and the scroll offset, which exist so selection
+//! movement can keep the selected row on screen — and so a resize can scroll a
+//! stranded selection back into view — without being told the height again.
+//! Both are atomics, which is what lets `render` stay `&self`.
 //!
 //! # Actions, not effects
 //!
@@ -152,7 +154,14 @@ pub enum PanelAction {
 pub struct SupervisorPanel {
     tab: PanelTab,
     selected: usize,
-    scroll: usize,
+    /// First painted list row.
+    ///
+    /// An atomic for the same reason as [`SupervisorPanel::page`]: `render`
+    /// takes `&self`, and it is the only place that learns the window height,
+    /// so it is also the only place that can notice a resize pushed the
+    /// selection off screen. Leaving the correction in a local made `Enter`
+    /// act on a row the user could not see.
+    scroll: AtomicUsize,
     entries: [Vec<PanelEntry>; 3],
     /// List rows the last render was given.
     ///
@@ -178,6 +187,10 @@ impl SupervisorPanel {
         self.entries[PanelTab::Sessions.index()] =
             snap.sessions.iter().map(session_entry).collect();
         self.clamp_selection();
+        // A list that shrank under the window still has to show its selection;
+        // `ensure_visible` cannot scroll down past the new length because it
+        // only ever moves the window towards the selected row.
+        self.ensure_visible();
     }
 
     /// Tab currently shown.
@@ -192,7 +205,7 @@ impl SupervisorPanel {
         }
         self.tab = tab;
         self.selected = 0;
-        self.scroll = 0;
+        self.scroll.store(0, Ordering::Relaxed);
         self.clamp_selection();
     }
 
@@ -208,7 +221,7 @@ impl SupervisorPanel {
 
     /// First visible row.
     pub fn scroll_offset(&self) -> usize {
-        self.scroll
+        self.scroll.load(Ordering::Relaxed)
     }
 
     /// Collect the latched action, if any.
@@ -232,13 +245,23 @@ impl SupervisorPanel {
         self.page.store(list_height, Ordering::Relaxed);
 
         if entries.is_empty() {
+            self.scroll.store(0, Ordering::Relaxed);
             rows.push(fit(
                 &format!("{DIM}{}{RESET}", self.tab.empty_message()),
                 width,
             ));
         } else {
+            // The window never starts below the last row, and the selection is
+            // never left outside it: `selected` is a plain field and the height
+            // is only known here, so a resize (or a shorter list) can strand the
+            // selection off screen. Both corrections are written back because
+            // the caller acts on `selected_index()`: Enter must not stop a task
+            // the user cannot see.
             let max_scroll = entries.len().saturating_sub(list_height);
-            let scroll = self.scroll.min(max_scroll);
+            let scroll = self.scroll.load(Ordering::Relaxed).min(max_scroll);
+            self.scroll.store(scroll, Ordering::Relaxed);
+            self.ensure_visible();
+            let scroll = self.scroll.load(Ordering::Relaxed);
             for (index, entry) in entries.iter().enumerate().skip(scroll).take(list_height) {
                 rows.push(self.render_entry(index, entry, width));
             }
@@ -268,23 +291,37 @@ impl SupervisorPanel {
 
     /// One list row: marker, label, padding, right-aligned detail.
     fn render_entry(&self, index: usize, entry: &PanelEntry, width: u16) -> String {
-        let marker = if index == self.selected {
-            MARKER
-        } else {
-            MARKER_BLANK
+        // The marker is a trusted constant, so it is not fitted: `prepare_line`
+        // trims trailing spaces and the marker *is* a glyph plus padding. Both
+        // forms are two columns wide so labels stay aligned down the column; on
+        // a single-column row only the glyph itself fits.
+        let (marker, marker_w) = match width {
+            0 => ("", 0),
+            1 => (if index == self.selected { "▸" } else { " " }, 1),
+            _ => (
+                if index == self.selected {
+                    MARKER
+                } else {
+                    MARKER_BLANK
+                },
+                2,
+            ),
         };
-        let marker = fit(marker, width);
-        let avail = width - visible_width(&marker);
+        let avail = width - marker_w;
 
         // The detail is the row's state ("running", "exit 2"), so it keeps its
         // columns; the label, which is often a whole command line, is what
         // gives way. Capping the detail at half the row keeps the two from
         // starving each other on a narrow terminal.
-        let detail_budget = visible_width(&entry.detail).min(avail / 2);
-        let detail = fit(&entry.detail, detail_budget);
+        let detail_text = sanitize(&entry.detail);
+        let detail_budget = visible_width(&detail_text).min(avail / 2);
+        let detail = fit(&detail_text, detail_budget);
         let detail_w = visible_width(&detail);
         let reserve = u16::from(detail_w > 0);
-        let label = fit(&entry.label, avail.saturating_sub(detail_w + reserve));
+        let label = fit(
+            &sanitize(&entry.label),
+            avail.saturating_sub(detail_w + reserve),
+        );
         let label_w = visible_width(&label);
         let gap = avail.saturating_sub(label_w + detail_w);
 
@@ -293,7 +330,7 @@ impl SupervisorPanel {
         let mut row = String::with_capacity(
             marker.len() + label.len() + gap as usize + detail.len() + start.len() + end.len(),
         );
-        row.push_str(&marker);
+        row.push_str(marker);
         row.push_str(start);
         row.push_str(&label);
         row.extend(std::iter::repeat_n(' ', gap as usize));
@@ -306,7 +343,10 @@ impl SupervisorPanel {
     fn clamp_selection(&mut self) {
         let len = self.entries[self.tab.index()].len();
         self.selected = self.selected.min(len.saturating_sub(1));
-        self.scroll = self.scroll.min(self.selected);
+        // A window never starts below the selected row: `ensure_visible` relies
+        // on it to know which direction to scroll.
+        let scroll = self.scroll.load(Ordering::Relaxed).min(self.selected);
+        self.scroll.store(scroll, Ordering::Relaxed);
     }
 
     /// Move the selection by `delta`, clamping at both ends.
@@ -314,7 +354,7 @@ impl SupervisorPanel {
         let len = self.entries[self.tab.index()].len();
         if len == 0 {
             self.selected = 0;
-            self.scroll = 0;
+            self.scroll.store(0, Ordering::Relaxed);
             return;
         }
         let last = len - 1;
@@ -327,13 +367,21 @@ impl SupervisorPanel {
     }
 
     /// Scroll the minimum amount that puts the selected row on screen.
-    fn ensure_visible(&mut self) {
+    ///
+    /// Takes `&self` because `render` — the only caller that knows the window
+    /// height — has no `&mut` to work with; the offset lives in an atomic for
+    /// exactly this reason.
+    fn ensure_visible(&self) {
         let page = self.page.load(Ordering::Relaxed).max(1);
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + page {
-            self.scroll = self.selected + 1 - page;
-        }
+        let scroll = self.scroll.load(Ordering::Relaxed);
+        let next = if self.selected < scroll {
+            self.selected
+        } else if self.selected >= scroll + page {
+            self.selected + 1 - page
+        } else {
+            scroll
+        };
+        self.scroll.store(next, Ordering::Relaxed);
     }
 
     /// Action the current selection would trigger.
@@ -410,15 +458,33 @@ impl Interactive for SupervisorPanel {
     }
 }
 
-/// `text` cut to at most `budget` columns.
+/// `text` normalized into at most `budget` columns.
+///
+/// [`prepare_line`] is always used, never a byte slice and never a short
+/// circuit: it is the only place that expands tabs, drops the control
+/// characters that would move the cursor and keeps escape sequences from being
+/// cut in half. A row's text is product data — a task's command line is raw
+/// user or model input — so returning it unchanged whenever it *measured* short
+/// let `\x1b[31m`, `\x1b]8;;...` and embedded newlines reach the terminal
+/// verbatim.
 fn fit(text: &str, budget: u16) -> String {
-    if budget == 0 {
-        return String::new();
-    }
-    if visible_width(text) <= budget {
-        return text.to_string();
-    }
     prepare_line(text, budget).text
+}
+
+/// Reduce `text` to the printable, single-line content a row may paint.
+///
+/// Row text is product data — a task's command line is raw user or model
+/// input — and [`prepare_line`] deliberately keeps escape sequences verbatim
+/// because the renderer *builds* styled rows out of them. Passing that text
+/// through unchanged would let `\x1b[31m` override the row's tone,
+/// `\x1b]8;;url` open a hyperlink `RESET` cannot close (so every following row
+/// stays clickable) and `\n` add rows the viewport budget never accounted for.
+/// Tabs survive: [`fit`] materializes them as spaces, so the painted row is
+/// exactly as wide as the sum of its fitted pieces.
+fn sanitize(text: &str) -> String {
+    text.chars()
+        .filter(|ch| *ch == '\t' || !ch.is_control())
+        .collect()
 }
 
 fn agent_entry(run: &aish_supervisor::AgentRun) -> PanelEntry {
@@ -855,5 +921,189 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Panel whose task commands are the given raw strings.
+    fn panel_with_commands(commands: &[&str]) -> SupervisorPanel {
+        let mut panel = SupervisorPanel::new();
+        panel.set_snapshot(&SupervisorSnapshot {
+            agents: Vec::new(),
+            tasks: commands
+                .iter()
+                .enumerate()
+                .map(|(i, command)| TaskRow {
+                    command: (*command).to_string(),
+                    ..task(&format!("t{i}"), TaskState::Running)
+                })
+                .collect(),
+            sessions: Vec::new(),
+        });
+        panel.set_tab(PanelTab::Tasks);
+        panel
+    }
+
+    /// Every escape sequence in `row` must be one the panel itself emitted.
+    fn assert_no_injected_escape(row: &str, allowed: &[&str]) {
+        let mut rest = row;
+        while let Some(start) = rest.find('\x1b') {
+            let tail = &rest[start..];
+            let known = allowed.iter().find(|seq| tail.starts_with(**seq));
+            let seq = known.unwrap_or_else(|| panic!("injected escape in {row:?}"));
+            rest = &tail[seq.len()..];
+        }
+    }
+
+    #[test]
+    fn command_text_cannot_inject_escape_sequences() {
+        // A task's command line is raw user or model input. Rendering it
+        // verbatim let it override the row's tone (SGR) and, worse, open an
+        // OSC 8 hyperlink that `RESET` does not close, so every following row
+        // stayed clickable to the attacker's URL.
+        let panel = panel_with_commands(&[
+            "echo '\x1b[31mRED'",
+            "echo '\x1b]8;;https://evil.example\x07click\x1b]8;;\x07'",
+        ]);
+        let rows = panel.render(80, 4);
+        assert_eq!(rows.len(), 4);
+
+        let allowed = [DIM, RESET, GREEN, RED, CURSOR_ON, CURSOR_OFF];
+        for row in &rows[1..3] {
+            assert_no_injected_escape(row, &allowed);
+            assert!(!row.contains('\x07'), "BEL leaked: {row:?}");
+        }
+        // The text itself survives; only the escapes are gone.
+        assert!(
+            strip_escapes(&rows[1]).contains("echo '[31mRED'"),
+            "{:?}",
+            strip_escapes(&rows[1])
+        );
+        assert!(
+            strip_escapes(&rows[2]).contains("click"),
+            "{:?}",
+            strip_escapes(&rows[2])
+        );
+    }
+
+    #[test]
+    fn command_text_cannot_inject_newlines() {
+        // A newline in a command would add rows the viewport budget never
+        // accounted for, corrupting every row painted below the panel.
+        let panel = panel_with_commands(&["echo a\nb\r\nc"]);
+        let rows = panel.render(40, 3);
+        assert_eq!(rows.len(), 3, "panel painted extra rows: {rows:?}");
+        for row in &rows {
+            assert!(
+                !row.contains('\n') && !row.contains('\r'),
+                "line break leaked: {row:?}"
+            );
+        }
+        assert!(
+            strip_escapes(&rows[1]).contains("echo ab c")
+                || strip_escapes(&rows[1]).contains("echo abc"),
+            "{:?}",
+            strip_escapes(&rows[1])
+        );
+    }
+
+    #[test]
+    fn control_bytes_never_reach_the_terminal() {
+        // A fuzz over the control range: every row must still be exactly one
+        // line and stay inside its column budget.
+        let raw: String = (0u8..0x20).map(|b| b as char).collect();
+        let panel = panel_with_commands(&[&format!("a{raw}b")]);
+        for width in 1..=40u16 {
+            let rows = panel.render(width, 4);
+            assert_eq!(rows.len(), 4, "width {width}");
+            for row in &rows {
+                assert!(
+                    !row.chars().any(|ch| ch.is_control() && ch != '\x1b'),
+                    "control byte leaked at width {width}: {row:?}"
+                );
+                assert!(
+                    visible_width(row) <= width,
+                    "width {width}: {row:?} painted {}",
+                    visible_width(row)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resize_keeps_selection_visible() {
+        // Twenty rows, tall window, selection at the bottom: the window never
+        // scrolled, so the selection was visible. Shrinking the terminal to
+        // four rows must scroll it back into view — otherwise Enter stops a
+        // task that is not on screen.
+        let mut panel = panel_with_agents(20);
+        for _ in 0..19 {
+            panel.handle_input(key(KeyCode::Down));
+        }
+        assert_eq!(panel.selected_index(), 19);
+        panel.render(40, 21);
+        assert_eq!(panel.scroll_offset(), 0, "tall window should not scroll");
+
+        let rows = panel.render(40, 4);
+        assert_eq!(rows.len(), 4);
+        assert!(
+            panel.scroll_offset() > 0,
+            "resize did not scroll: offset {}",
+            panel.scroll_offset()
+        );
+        let plain: Vec<String> = rows.iter().map(|r| strip_escapes(r)).collect();
+        assert!(
+            plain.iter().any(|r| r.contains("description spawn-19")),
+            "selection scrolled out of view: {plain:?}"
+        );
+        // And the marker is really painted, not just inside the window.
+        assert!(
+            plain.iter().any(|r| r.starts_with(MARKER)),
+            "no selection marker painted: {plain:?}"
+        );
+
+        // Growing the window back re-clamps the offset so the list is not
+        // scrolled past its end.
+        panel.render(40, 25);
+        assert_eq!(panel.scroll_offset(), 0, "offset not clamped on grow");
+    }
+
+    #[test]
+    fn shrinking_list_keeps_selection_in_bounds() {
+        let mut panel = panel_with_agents(20);
+        for _ in 0..19 {
+            panel.handle_input(key(KeyCode::Down));
+        }
+        panel.render(40, 5);
+        assert!(panel.scroll_offset() > 0);
+
+        // A snapshot that shrinks under the window must leave the offset inside
+        // the new list, or the panel would paint blank rows above an empty
+        // region; the selected row has to stay painted as well.
+        panel.set_snapshot(&SupervisorSnapshot {
+            agents: (0..3)
+                .map(|i| agent(&format!("spawn-{i:02}"), AgentState::Running))
+                .collect(),
+            tasks: Vec::new(),
+            sessions: Vec::new(),
+        });
+        assert_eq!(panel.selected_index(), 2);
+        assert!(
+            panel.scroll_offset() <= 2,
+            "offset {} is past the shortened list",
+            panel.scroll_offset()
+        );
+        let plain: Vec<String> = panel
+            .render(40, 5)
+            .iter()
+            .map(|r| strip_escapes(r))
+            .collect();
+        assert!(
+            plain.iter().any(|r| r.contains("description spawn-02")),
+            "selection lost after the list shrank: {plain:?}"
+        );
+        assert_eq!(
+            panel.scroll_offset(),
+            0,
+            "offset did not collapse to the top of the short list"
+        );
     }
 }
