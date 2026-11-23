@@ -320,21 +320,13 @@ fn apply_key<H: AppHooks>(key: Key, workspace: &mut Workspace, hooks: &mut H) ->
                 workspace.open_composer(Composer::Say, "");
             }
         }
-        Key::Retry => {
-            let retryable = workspace
-                .selected_agent()
-                .is_some_and(|agent| agent.retryable);
-            if retryable {
-                hooks.on_key(Key::Retry, workspace);
-            }
-        }
-        Key::Stop => {
-            if workspace.selected_agent().is_some() {
-                hooks.on_key(Key::Stop, workspace);
-            }
-        }
-        Key::Submit | Key::Cancel | Key::Ignore => {}
+        // Retry and Stop are gated inside the hook, which knows whether they
+        // apply; the app only routes the key.
+        Key::Retry | Key::Stop | Key::Submit | Key::Cancel | Key::Ignore => {}
     }
+    // Exactly one dispatch per key: a hook that mutates state is not
+    // idempotent, so calling it here *and* in a match arm would run it twice
+    // (the second stop was being refused as already-ended).
     hooks.on_key(key, workspace);
     false
 }
@@ -382,6 +374,7 @@ fn write_diff(out: &mut impl Write, diff: &Diff) -> io::Result<()> {
 mod tests {
     use super::*;
     use crossterm::event::KeyEventState;
+    use std::sync::Arc;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
@@ -477,6 +470,47 @@ mod tests {
             Key::from_key_event(key(KeyCode::Esc, KeyModifiers::NONE)),
             Key::Cancel
         );
+    }
+
+    #[test]
+    fn each_key_reaches_the_hook_exactly_once() {
+        // Regression: Retry and Stop also called the hook inside their match
+        // arm, so a single press stopped a ticket and then reported the second
+        // attempt as "already ended".
+        use crate::workspace::{AgentLine, AgentState, Workspace};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(Arc<AtomicUsize>);
+        impl AppHooks for Counting {
+            fn snapshot(&self) -> Workspace {
+                Workspace {
+                    agents: vec![AgentLine {
+                        id: "tk-1".to_string(),
+                        retryable: true,
+                        name: "row".to_string(),
+                        state: AgentState::Waits,
+                        activity: String::new(),
+                        elapsed: String::new(),
+                    }],
+                    ..Workspace::default()
+                }
+            }
+            fn on_key(&mut self, _: Key, _: &mut Workspace) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for key in [Key::Stop, Key::Retry, Key::Down, Key::NextTab] {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let mut hooks = Counting(Arc::clone(&counter));
+            let mut workspace = hooks.snapshot();
+            apply_key(key, &mut workspace, &mut hooks);
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "{key:?} dispatched more than once"
+            );
+        }
     }
 
     #[test]
