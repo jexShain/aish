@@ -343,8 +343,12 @@ name = "aish-supervisor"
 version = "1.1.0"
 dependencies = [
  "aish-core",
+ "dirs 5.0.1",
  "parking_lot",
+ "rusqlite",
  "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
