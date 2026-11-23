@@ -474,7 +474,38 @@ impl AiHandler {
     /// The supervisor's workers are not part of the interactive turn, so they
     /// need their own entry point: this clones a sub-session (own context, own
     /// cancellation token) and runs the tool loop on it, returning the text.
-    pub async fn run_worker_turn(&self, prompt: &str, max_turns: u32) -> Result<String, String> {
+    /// Prepare a self-contained session for a detached worker.
+    ///
+    /// The returned session owns its tools and cancellation token, so it can be
+    /// moved to another thread and driven without the shell's handler. That is
+    /// what lets a model call run while the panel keeps painting.
+    pub fn worker_session(&self, work_dir: Option<&std::path::Path>) -> aish_llm::LlmSession {
+        let mut sub = self.llm_session.create_subsession();
+        // Tools are shared by `Arc`, so a worker gets the same abilities as the
+        // interactive session without duplicating them.
+        let names: Vec<String> = self
+            .llm_session
+            .tool_specs()
+            .into_iter()
+            .map(|spec| spec.function.name)
+            .collect();
+        for tool in self
+            .llm_session
+            .shared_tools_by_names(names.iter().map(String::as_str))
+        {
+            let registered = tool.for_sub_session(&sub).unwrap_or(tool);
+            sub.register_shared_tool(registered);
+        }
+        let _ = work_dir;
+        sub
+    }
+
+    pub async fn run_worker_turn(
+        &self,
+        prompt: &str,
+        max_turns: u32,
+        work_dir: Option<&std::path::Path>,
+    ) -> Result<String, String> {
         use aish_llm::{ChatMessage, PromptContext, ToolLoopConfig};
 
         // A sub-session has its own context and cancellation token, which is
@@ -486,7 +517,16 @@ impl AiHandler {
             prompt_context: PromptContext::MainChat,
             ..ToolLoopConfig::default()
         };
-        let message = ChatMessage::user(prompt);
+        // The directory is stated in the prompt rather than set on the session:
+        // a session has no notion of a working directory (the shell tool does),
+        // so the agent must be told where it is expected to work.
+        let message = match work_dir {
+            Some(dir) => ChatMessage::user(format!(
+                "Work in this directory only: {}\n\n{prompt}",
+                dir.display()
+            )),
+            None => ChatMessage::user(prompt),
+        };
         let outcome = aish_llm::run_tool_loop_until_done(&sub, &message, &[], &config).await;
         match outcome.text {
             text if text.is_empty() => Err(format!("worker ended with {:?}", outcome.status)),

@@ -203,6 +203,11 @@ impl EffectQueue {
         }
     }
 
+    /// Iterate the queued effects without removing them.
+    pub fn iter(&self) -> impl Iterator<Item = &QueuedEffect> {
+        self.pending.iter()
+    }
+
     /// How many effects are waiting.
     pub fn len(&self) -> usize {
         self.pending.len()

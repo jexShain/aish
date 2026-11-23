@@ -12,6 +12,7 @@ pub mod domain;
 pub mod engine;
 pub mod runtime;
 pub mod stage;
+pub mod store;
 
 use parking_lot::Mutex;
 
@@ -114,6 +115,7 @@ pub enum Refusal {
 
 /// Maximum concurrent workers; one extra slot is reserved for the person.
 pub use runtime::{Executor, PassOutcome, Runtime};
+pub use store::{Location, Persisted, Store};
 
 pub const MAX_WORKERS: usize = 3;
 
@@ -439,6 +441,21 @@ impl Supervisor {
         }
     }
 
+    /// Where a ticket's worker should run.
+    ///
+    /// Each ticket gets its own directory under the work root, so two workers
+    /// cannot overwrite each other's files. The directory is created lazily:
+    /// a ticket that never runs leaves nothing behind.
+    pub fn ticket_dir(
+        &self,
+        ticket_id: &str,
+        work_root: &std::path::Path,
+    ) -> std::io::Result<std::path::PathBuf> {
+        let dir = work_root.join(sanitize_for_path(ticket_id));
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
     /// Unread inputs for a ticket, in order.
     ///
     /// The runtime turns these into the worker's prompt; the supervisor itself
@@ -462,6 +479,51 @@ impl Supervisor {
         texts
     }
 
+    /// Snapshot the whole state for persistence.
+    pub fn export(&self) -> Persisted {
+        let state = self.state.lock();
+        Persisted {
+            tickets: state.tickets.clone(),
+            effects: state
+                .queue
+                .iter()
+                .map(|queued| {
+                    let (kind, ticket_id) = match &queued.effect {
+                        crate::engine::Effect::Launch { ticket_id } => ("launch", ticket_id),
+                        crate::engine::Effect::Deliver { ticket_id } => ("deliver", ticket_id),
+                        crate::engine::Effect::Cancel { ticket_id } => ("cancel", ticket_id),
+                    };
+                    (kind.to_string(), ticket_id.clone())
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuild a supervisor from persisted state.
+    ///
+    /// Queued effects are re-enqueued in their original order, so a launch that
+    /// never ran is attempted again rather than forgotten.
+    pub fn from_persisted(persisted: Persisted) -> Self {
+        let supervisor = Self::new();
+        let mut state = supervisor.state.lock();
+        state.tickets = persisted.tickets;
+        for (kind, ticket_id) in persisted.effects {
+            let effect = match kind.as_str() {
+                "deliver" => crate::engine::Effect::Deliver { ticket_id },
+                "cancel" => crate::engine::Effect::Cancel { ticket_id },
+                _ => crate::engine::Effect::Launch { ticket_id },
+            };
+            state.queue.enqueue(effect);
+        }
+        drop(state);
+        supervisor
+    }
+
+    /// Persist the current state, if a store is configured.
+    pub fn save(&self, store: &Store) -> Result<(), String> {
+        store.save(&self.export())
+    }
+
     /// Number of live worker slots.
     pub fn running_count(&self) -> usize {
         self.state.lock().running.len()
@@ -475,6 +537,29 @@ impl Supervisor {
             Stage::Person(action) => Some(action),
             _ => None,
         }
+    }
+}
+
+/// Make an id safe to use as a single path component.
+///
+/// Ticket ids come from trigger ids, which come from user text; a `/` or `..`
+/// in one would otherwise escape the work root.
+fn sanitize_for_path(id: &str) -> String {
+    let cleaned: String = id
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-').to_string();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "ticket".to_string()
+    } else {
+        trimmed
     }
 }
 
@@ -827,6 +912,42 @@ mod tests {
         let supervisor = Supervisor::new();
         supervisor.receive(&ask("fix it", "th-abc"));
         assert_eq!(supervisor.view().rows()[0].thread, "th-abc");
+    }
+
+    #[test]
+    fn each_ticket_gets_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = Supervisor::new();
+        supervisor.receive(&ask("a", "th1"));
+        supervisor.receive(&ask("b", "th2"));
+        let ids: Vec<String> = supervisor
+            .view()
+            .rows()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+
+        let first = supervisor.ticket_dir(&ids[0], dir.path()).unwrap();
+        let second = supervisor.ticket_dir(&ids[1], dir.path()).unwrap();
+        assert_ne!(first, second, "two tickets must not share a directory");
+        assert!(first.exists() && second.exists());
+    }
+
+    #[test]
+    fn a_hostile_id_cannot_escape_the_work_root() {
+        // Ticket ids derive from user text; one containing a path separator or
+        // a parent reference must not write outside the root.
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = Supervisor::new();
+        let evil = supervisor
+            .ticket_dir("../../etc/passwd", dir.path())
+            .unwrap();
+        assert!(
+            evil.starts_with(dir.path()),
+            "escaped the work root: {}",
+            evil.display()
+        );
+        assert!(!evil.to_string_lossy().contains(".."));
     }
 
     #[test]

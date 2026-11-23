@@ -24,8 +24,8 @@ use crate::Supervisor;
 /// How the runtime runs one assignment.
 ///
 /// Implemented by the shell (which owns the LLM session) and by tests. It is
-/// synchronous because the executor already runs inside a worker thread; an
-/// implementation may block.
+/// synchronous: an implementation blocks for the whole turn, and the caller is
+/// responsible for running it somewhere that can afford to block.
 pub trait Executor: Send + Sync {
     /// Run `prompt` for a ticket and return its report.
     ///
@@ -130,9 +130,6 @@ impl Runtime {
                 Dispatch::Done { took_slot: true }
             }
             Effect::Deliver { ticket_id } => {
-                // Inputs for a ticket whose worker already ended are picked up
-                // by the next launch; delivering to nobody is a no-op rather
-                // than a failure.
                 let live = self
                     .workers
                     .lock()
@@ -140,8 +137,19 @@ impl Runtime {
                     .is_some_and(|w| w.running);
                 if live {
                     self.spawn_worker(ticket_id, executor);
+                    return Dispatch::Done { took_slot: false };
                 }
-                Dispatch::Done { took_slot: false }
+                // Nobody is running, so the message would sit unread forever.
+                // A person's message is a wake-up: start a turn for it, exactly
+                // as a launch would, and take the extra person slot.
+                if used_this_pass >= crate::MAX_WORKERS {
+                    return Dispatch::Deferred(effect);
+                }
+                if !self.supervisor.assignment_started(ticket_id, true) {
+                    return Dispatch::Deferred(effect);
+                }
+                self.spawn_worker(ticket_id, executor);
+                Dispatch::Done { took_slot: true }
             }
             Effect::Cancel { ticket_id } => {
                 // The supervisor already ended the ticket; the runtime only
@@ -200,6 +208,88 @@ impl Runtime {
         if let Err(refusal) = self.supervisor.report(ticket_id, report) {
             tracing::warn!(%ticket_id, ?refusal, "worker report rejected");
         }
+    }
+
+    /// Start the runnable effects on background threads.
+    ///
+    /// Unlike [`Runtime::pass`], this returns immediately: each worker turn
+    /// runs on its own thread and reports back through the supervisor when it
+    /// finishes. The panel calls this, because it must keep painting while a
+    /// model call is in flight.
+    ///
+    /// `executor` must be shareable; the shell builds one that owns a
+    /// sub-session per call rather than borrowing a handler.
+    pub fn pass_detached(&self, executor: Arc<dyn Executor>) -> PassOutcome {
+        let mut outcome = PassOutcome::default();
+        let mut used = 0usize;
+        let budget = self.supervisor.view().pending_effects().max(1) + 1;
+        for _ in 0..budget {
+            let Some(effect) = self.supervisor.next_effect() else {
+                break;
+            };
+            let ticket_id = match &effect.effect {
+                Effect::Launch { ticket_id } | Effect::Deliver { ticket_id } => ticket_id.clone(),
+                Effect::Cancel { ticket_id } => {
+                    self.workers.lock().remove(ticket_id);
+                    continue;
+                }
+            };
+            if used >= crate::MAX_WORKERS {
+                self.supervisor.settle_effect(effect, Outcome::Later);
+                outcome.deferred += 1;
+                continue;
+            }
+            if !self.supervisor.assignment_started(&ticket_id, false) {
+                self.supervisor.settle_effect(effect, Outcome::Later);
+                outcome.deferred += 1;
+                continue;
+            }
+            let prompt = self.supervisor.take_inputs(&ticket_id).join("\n");
+            if prompt.trim().is_empty() {
+                let _ = self.supervisor.report(
+                    &ticket_id,
+                    Report {
+                        state: ReportState::Waiting,
+                        summary: "no input to run".to_string(),
+                        question: None,
+                    },
+                );
+                continue;
+            }
+
+            self.workers
+                .lock()
+                .insert(ticket_id.clone(), WorkerSlot { running: true });
+            used += 1;
+            outcome.dispatched += 1;
+
+            let supervisor = Arc::clone(&self.supervisor);
+            let workers = Arc::clone(&self.workers);
+            let executor = Arc::clone(&executor);
+            let ticket = ticket_id.clone();
+            std::thread::spawn(move || {
+                let report = match executor.run(&ticket, &prompt) {
+                    Ok(report) => report,
+                    Err(error) => Report {
+                        state: ReportState::Failed,
+                        summary: error,
+                        question: None,
+                    },
+                };
+                if let Some(slot) = workers.lock().get_mut(&ticket) {
+                    slot.running = false;
+                }
+                if let Err(refusal) = supervisor.report(&ticket, report) {
+                    tracing::warn!(%ticket, ?refusal, "detached worker report rejected");
+                }
+            });
+        }
+        outcome
+    }
+
+    /// Whether any worker thread is still running.
+    pub fn any_running(&self) -> bool {
+        self.workers.lock().values().any(|slot| slot.running)
     }
 
     /// Whether a worker is currently running for a ticket.
@@ -372,6 +462,107 @@ mod tests {
             "Waiting for a trigger"
         );
         assert_eq!(executor.launched(), 0, "nothing to run");
+    }
+
+    #[test]
+    fn a_message_to_an_idle_ticket_wakes_a_worker() {
+        // The ticket's turn ended, then a person posted a message. Without a
+        // wake-up the message would sit unread forever.
+        let supervisor = Arc::new(Supervisor::new());
+        let executor = RecordingExecutor::new(ready());
+        let runtime = Runtime::new(Arc::clone(&supervisor));
+
+        supervisor.receive(&ask("fix", "th1"));
+        runtime.pass(&executor);
+        let id = supervisor.view().rows()[0].id.clone();
+        supervisor.say(&id, "one more thing").unwrap();
+
+        let outcome = runtime.pass(&executor);
+        assert_eq!(
+            outcome.dispatched, 1,
+            "the message must start a turn: {outcome:?}"
+        );
+        let prompts = executor.prompts.lock();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(
+            prompts[1].1, "one more thing",
+            "the worker sees the message"
+        );
+    }
+
+    #[test]
+    fn a_detached_pass_returns_before_the_worker_finishes() {
+        // The panel must stay responsive: pass_detached answers immediately,
+        // the turn lands later.
+        struct Slow {
+            done: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Executor for Slow {
+            fn run(&self, _: &str, _: &str) -> Result<Report, String> {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(ready())
+            }
+        }
+        let supervisor = Arc::new(Supervisor::new());
+        let runtime = Runtime::new(Arc::clone(&supervisor));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor: Arc<dyn Executor> = Arc::new(Slow {
+            done: Arc::clone(&done),
+        });
+
+        supervisor.receive(&ask("fix", "th1"));
+        let outcome = runtime.pass_detached(executor);
+        assert_eq!(outcome.dispatched, 1);
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "pass_detached must not block on the turn"
+        );
+        assert!(runtime.any_running());
+
+        // The report lands on its own.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !done.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let after = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while supervisor.view().rows()[0].stage.label() != "Awaiting review"
+            && std::time::Instant::now() < after
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(supervisor.view().rows()[0].stage.label(), "Awaiting review");
+        assert!(!runtime.any_running(), "the slot is released");
+    }
+
+    #[test]
+    fn a_detached_pass_respects_the_slot_limit() {
+        struct Blocking {
+            release: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Executor for Blocking {
+            fn run(&self, _: &str, _: &str) -> Result<Report, String> {
+                while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(ready())
+            }
+        }
+        let supervisor = Arc::new(Supervisor::new());
+        let runtime = Runtime::new(Arc::clone(&supervisor));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor: Arc<dyn Executor> = Arc::new(Blocking {
+            release: Arc::clone(&release),
+        });
+        for i in 0..(crate::MAX_WORKERS + 2) {
+            supervisor.receive(&ask(&format!("t{i}"), &format!("th{i}")));
+        }
+        let outcome = runtime.pass_detached(executor);
+        assert_eq!(outcome.dispatched, crate::MAX_WORKERS);
+        assert!(outcome.deferred >= 2, "the rest must stay queued");
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[test]

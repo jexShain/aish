@@ -35,6 +35,125 @@ use crate::security_panel::{build_security_panel, security_panel_rows, security_
 use crate::theme;
 use crate::types::ShellState;
 
+/// Runs detached workers: each call gets its own session, on its own thread.
+///
+/// Built once per panel session. It owns nothing borrowed, so it can be shared
+/// across the threads `Runtime::pass_detached` spawns; each turn creates a
+/// fresh sub-session instead of sharing one.
+struct DetachedExecutor {
+    base: Arc<aish_llm::LlmSession>,
+    runtime: tokio::runtime::Handle,
+    work_root: Option<std::path::PathBuf>,
+}
+
+impl aish_supervisor::Executor for DetachedExecutor {
+    fn run(
+        &self,
+        ticket_id: &str,
+        prompt: &str,
+    ) -> Result<aish_supervisor::domain::Report, String> {
+        use aish_llm::{ChatMessage, PromptContext, ToolLoopConfig};
+
+        let mut sub = self.base.create_subsession();
+        let names: Vec<String> = self
+            .base
+            .tool_specs()
+            .into_iter()
+            .map(|spec| spec.function.name)
+            .collect();
+        for tool in self
+            .base
+            .shared_tools_by_names(names.iter().map(String::as_str))
+        {
+            let registered = tool.for_sub_session(&sub).unwrap_or(tool);
+            sub.register_shared_tool(registered);
+        }
+
+        // State the directory in the prompt: a session has no working
+        // directory of its own, the shell tool does.
+        let dir = self.work_root.as_ref().and_then(|root| {
+            std::fs::create_dir_all(root.join(sanitize_ticket(ticket_id)))
+                .ok()
+                .map(|()| root.join(sanitize_ticket(ticket_id)))
+        });
+        let message = match &dir {
+            Some(dir) => ChatMessage::user(format!(
+                "Work in this directory only: {}\n\n{prompt}",
+                dir.display()
+            )),
+            None => ChatMessage::user(prompt),
+        };
+
+        let config = ToolLoopConfig {
+            max_turns: 20,
+            system_message: None,
+            prompt_context: PromptContext::MainChat,
+            ..ToolLoopConfig::default()
+        };
+        let outcome = self.runtime.block_on(async {
+            aish_llm::run_tool_loop_until_done(&sub, &message, &[], &config).await
+        });
+        if outcome.text.trim().is_empty() {
+            return Err(format!("worker ended with {:?}", outcome.status));
+        }
+        Ok(aish_supervisor::domain::Report {
+            state: aish_supervisor::domain::ReportState::Ready,
+            summary: outcome.text,
+            question: None,
+        })
+    }
+}
+
+/// Make a ticket id safe as a single path component.
+fn sanitize_ticket(id: &str) -> String {
+    let cleaned: String = id
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-').to_string();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "ticket".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Build the trigger a `/delegate` invocation stands for.
+///
+/// Extracted from the command handler so the argument parsing and the identity
+/// it produces are testable without a shell. `None` means "nothing to do":
+/// `/delegate` with no task must not create an empty ticket, or the panel
+/// would show a piece of work nobody asked for.
+fn delegate_trigger(
+    parts: &[&str],
+    session_uuid: &str,
+    history_len: usize,
+) -> Option<aish_supervisor::domain::Trigger> {
+    let task = parts
+        .get(1..)
+        .map(|rest| rest.join(" "))
+        .unwrap_or_default();
+    if task.trim().is_empty() {
+        return None;
+    }
+    Some(aish_supervisor::domain::Trigger {
+        // The counter keeps two identical delegations distinct; the trigger id
+        // is what the supervisor content-addresses on.
+        id: format!("delegate-{history_len}"),
+        kind: aish_supervisor::domain::TriggerKind::UserAsk,
+        actor: aish_supervisor::domain::Actor::User,
+        text: task,
+        thread: aish_supervisor::domain::ThreadKey(format!("delegate-{session_uuid}")),
+        at: 0,
+    })
+}
+
 /// Format prompt + command as displayed after Enter (without trailing newline).
 fn format_user_submitted_line(prompt: &str, command: &str) -> String {
     format!("{prompt}{command}")
@@ -1069,6 +1188,12 @@ pub struct AishShell {
     /// The resident pass loop. `None` until `run()` creates it, because the
     /// executor needs the shell's tokio runtime.
     supervisor_runtime: Option<Arc<aish_supervisor::Runtime>>,
+    /// The shell's tokio runtime handle, kept so the fullscreen UI can run a
+    /// worker turn on the same reactor the interactive path uses.
+    tokio_runtime_for_ui: Option<tokio::runtime::Handle>,
+    /// Durable supervisor state. `None` means the supervisor is a scratch pad
+    /// (a test, a one-shot run, a read-only filesystem).
+    supervisor_store: Option<aish_supervisor::Store>,
     /// Retarget handle for the append-only AI transcript (issue #530):
     /// updated on `/resume` and `/fork` so later appends follow the active
     /// session.
@@ -1146,24 +1271,47 @@ impl AishShell {
     /// This is the only way to start persistent work: the interactive AI path
     /// stays a single foreground turn, so nothing is ever run twice.
     fn handle_delegate_command(&mut self, parts: &[&str]) {
-        let task = parts[1..].join(" ");
-        if task.trim().is_empty() {
+        let Some(trigger) =
+            delegate_trigger(parts, self.session_uuid.as_str(), self.state.history.len())
+        else {
             println!("{}", t("shell.delegate.usage"));
             return;
-        }
-        let trigger = aish_supervisor::domain::Trigger {
-            id: format!("delegate-{}", self.state.history.len()),
-            kind: aish_supervisor::domain::TriggerKind::UserAsk,
-            actor: aish_supervisor::domain::Actor::User,
-            text: task.clone(),
-            thread: aish_supervisor::domain::ThreadKey(format!("delegate-{}", self.session_uuid)),
-            at: 0,
         };
         self.supervisor.receive(&trigger);
-        let id = format!("tk-{}", trigger.id);
+        // Persist before telling the user: a ticket accepted in memory but not
+        // on disk would vanish on a crash right after "started".
+        self.persist_supervisor();
         let mut args = std::collections::HashMap::new();
-        args.insert("id".to_string(), id);
+        args.insert("id".to_string(), format!("tk-{}", trigger.id));
         println!("{}", t_with_args("shell.delegate.started", &args));
+    }
+
+    /// The directory workers run in, when isolation is available.
+    ///
+    /// `AISH_SUPERVISOR_WORK_ROOT` overrides it; the default sits next to the
+    /// session data so a worker's scratch files are found where the user
+    /// already looks for shell state.
+    fn supervisor_work_root(&self) -> Option<std::path::PathBuf> {
+        if let Ok(configured) = std::env::var("AISH_SUPERVISOR_WORK_ROOT") {
+            let path = std::path::PathBuf::from(configured);
+            return std::fs::create_dir_all(&path).ok().map(|()| path);
+        }
+        let base = dirs::data_local_dir()?.join("aish").join("work");
+        std::fs::create_dir_all(&base).ok()?;
+        Some(base)
+    }
+
+    /// Write the supervisor's state to disk, if a store is configured.
+    ///
+    /// Failure is logged, never fatal: a read-only or full disk must not stop
+    /// the shell from working, it only loses durability.
+    fn persist_supervisor(&self) {
+        let Some(store) = self.supervisor_store.as_ref() else {
+            return;
+        };
+        if let Err(err) = self.supervisor.save(store) {
+            tracing::warn!(%err, "failed to persist supervisor state");
+        }
     }
 
     /// Run the fullscreen supervisor UI until the user leaves it.
@@ -1172,11 +1320,51 @@ impl AishShell {
     /// user's scrollback comes back untouched. This is a pure view: it reads
     /// the supervisor's projection and never mutates shell state.
     fn run_fullscreen_mode(&mut self) {
-        struct Hooks {
+        /// Bridges the panel to the supervisor and the AI handler.
+        ///
+        /// It borrows both rather than cloning: a worker turn needs the real
+        /// handler (a clone would carry a separate conversation), and the pass
+        /// needs the same supervisor the shell's loop uses.
+        struct Hooks<'a> {
             supervisor: std::sync::Arc<aish_supervisor::Supervisor>,
+            runtime: &'a aish_supervisor::Runtime,
+            /// Workers run detached, so the panel never blocks on a model call.
+            executor: &'a Arc<dyn aish_supervisor::Executor>,
+            notices: Vec<String>,
+            /// Set when a key did something the panel should show at once.
+            acted: bool,
+            /// Durable state; panel actions must reach disk too, not just the
+            /// ones taken at the prompt.
+            store: Option<aish_supervisor::Store>,
         }
 
-        impl aish_tui::AppHooks for Hooks {
+        impl Hooks<'_> {
+            fn note(&mut self, text: impl Into<String>) {
+                self.notices.push(text.into());
+                self.acted = true;
+            }
+
+            /// Write state to disk after a mutating action.
+            fn persist(&self) {
+                let Some(store) = self.store.as_ref() else {
+                    return;
+                };
+                if let Err(err) = self.supervisor.save(store) {
+                    tracing::warn!(%err, "failed to persist supervisor state");
+                }
+            }
+
+            /// Advance the supervisor without blocking the panel.
+            ///
+            /// `pass_detached` returns as soon as the turns are started; each
+            /// one runs on its own thread and reports back through the
+            /// supervisor, which the next tick picks up.
+            fn run_pass(&self) {
+                self.runtime.pass_detached(Arc::clone(self.executor));
+            }
+        }
+
+        impl aish_tui::AppHooks for Hooks<'_> {
             fn snapshot(&self) -> aish_tui::Workspace {
                 use aish_supervisor::stage::Stage;
                 let view = self.supervisor.view();
@@ -1184,6 +1372,8 @@ impl AishShell {
                     .rows()
                     .iter()
                     .map(|row| aish_tui::AgentLine {
+                        id: row.id.clone(),
+                        retryable: row.retryable,
                         name: row.title.clone(),
                         state: match row.stage {
                             Stage::Person(_) => aish_tui::AgentState::Waits,
@@ -1192,7 +1382,10 @@ impl AishShell {
                             Stage::Idle => aish_tui::AgentState::Running,
                             Stage::Ended => aish_tui::AgentState::Done,
                         },
-                        activity: row.stage.label().to_string(),
+                        activity: match row.question.as_deref() {
+                            Some(question) => question.to_string(),
+                            None => row.stage.label().to_string(),
+                        },
                         elapsed: row.detail.clone(),
                     })
                     .collect();
@@ -1202,21 +1395,114 @@ impl AishShell {
                     agents,
                     stages: Vec::new(),
                     tasks: Vec::new(),
-                    log: Vec::new(),
+                    log: self
+                        .notices
+                        .iter()
+                        .rev()
+                        .take(6)
+                        .enumerate()
+                        .map(|(index, text)| aish_tui::LogLine {
+                            at: format!("{}", index + 1),
+                            text: text.clone(),
+                        })
+                        .collect(),
                     clock: String::new(),
                     context_percent: 0,
                     selected: 0,
                     tab: aish_tui::Tab::Mission,
+                    draft: None,
+                    draft_cursor: 0,
+                    composer: aish_tui::Composer::Closed,
                 }
             }
 
-            fn should_close(&self) -> bool {
-                false
+            fn on_idle(&mut self) -> bool {
+                // The panel is the only thing running while it owns the screen,
+                // so this is where persistent work advances. `acted` makes the
+                // frame repaint when a key changed something the snapshot
+                // alone would not show.
+                let before = self.supervisor.view();
+                self.run_pass();
+                let after = self.supervisor.view();
+                let changed = before != after || self.acted;
+                self.acted = false;
+                changed
+            }
+
+            fn on_key(&mut self, key: aish_tui::Key, workspace: &mut aish_tui::Workspace) {
+                let Some(agent) = workspace.selected_agent().cloned() else {
+                    return;
+                };
+                match key {
+                    aish_tui::Key::Retry => match self.supervisor.retry(&agent.id) {
+                        Ok(()) => {
+                            self.note(format!("retry {}", agent.id));
+                            self.run_pass();
+                        }
+                        Err(refusal) => self.note(format!("retry refused: {refusal:?}")),
+                    },
+                    aish_tui::Key::Stop => match self.supervisor.stop(&agent.id) {
+                        Ok(()) => {
+                            self.note(format!("stopped {}", agent.id));
+                            self.run_pass();
+                        }
+                        Err(refusal) => self.note(format!("stop refused: {refusal:?}")),
+                    },
+                    _ => {}
+                }
+            }
+
+            fn on_composer(&mut self, ticket: &str, purpose: aish_tui::Composer, text: &str) {
+                let result = match purpose {
+                    aish_tui::Composer::Answer => self.supervisor.answer(ticket, text),
+                    aish_tui::Composer::Say => self.supervisor.say(ticket, text),
+                    aish_tui::Composer::Closed => return,
+                };
+                match result {
+                    Ok(()) => {
+                        self.note(format!("{} {}", ticket, text));
+                        self.persist();
+                        // Deliver immediately: waiting for the next tick would
+                        // make the answer look ignored for half a second.
+                        self.run_pass();
+                    }
+                    Err(refusal) => self.note(format!("refused: {refusal:?}")),
+                }
             }
         }
 
+        // The AI handler cannot be borrowed mutably alongside the shell's other
+        // fields for the whole call, so it is borrowed immutably here: a worker
+        // turn only needs `&self`.
+        let runtime = match self.supervisor_runtime.clone() {
+            Some(runtime) => runtime,
+            None => {
+                tracing::warn!("fullscreen UI needs the supervisor runtime; none was built");
+                return;
+            }
+        };
+        let handle = match self.tokio_runtime_for_ui.clone() {
+            Some(handle) => handle,
+            None => {
+                tracing::warn!("fullscreen UI needs the tokio runtime; none was built");
+                return;
+            }
+        };
+        // A detached executor owns its session, so the panel can start turns
+        // without borrowing the shell's handler.
+        let executor: Arc<dyn aish_supervisor::Executor> = Arc::new(DetachedExecutor {
+            base: Arc::new(self.ai_handler.worker_session(None)),
+            runtime: handle.clone(),
+            work_root: self.supervisor_work_root(),
+        });
+        let _ = &self.ai_handler;
         let hooks = Hooks {
             supervisor: std::sync::Arc::clone(&self.supervisor),
+            runtime: &runtime,
+            executor: &executor,
+            notices: Vec::new(),
+            acted: false,
+            store: self.supervisor_store.clone(),
         };
         if let Err(err) = aish_tui::run(hooks) {
             tracing::warn!(%err, "fullscreen supervisor UI failed");
@@ -2986,6 +3272,8 @@ impl AishShell {
             session_uuid,
             supervisor,
             supervisor_runtime: None,
+            tokio_runtime_for_ui: None,
+            supervisor_store: None,
             transcript_session: transcript_session.clone(),
             resumed_snapshot_for_seed: None,
             streamed_content,
@@ -3151,6 +3439,32 @@ impl AishShell {
         self.supervisor_runtime = Some(Arc::new(aish_supervisor::Runtime::new(Arc::clone(
             &self.supervisor,
         ))));
+        self.tokio_runtime_for_ui = Some(runtime.handle().clone());
+
+        // Restore queued work before the first pass runs, so a launch that was
+        // decided before the last exit is attempted now rather than forgotten.
+        if let Ok(store) = aish_supervisor::Location::default_file().open() {
+            let restored = store.load();
+            if !restored.tickets.is_empty() {
+                let persisted = self.supervisor.export();
+                let merged = aish_supervisor::Persisted {
+                    tickets: restored.tickets,
+                    // Effects already queued in this process win; the stored
+                    // ones are appended so nothing decided earlier is dropped.
+                    effects: restored
+                        .effects
+                        .into_iter()
+                        .chain(persisted.effects)
+                        .collect(),
+                };
+                self.supervisor =
+                    std::sync::Arc::new(aish_supervisor::Supervisor::from_persisted(merged));
+                self.supervisor_runtime = Some(Arc::new(aish_supervisor::Runtime::new(
+                    std::sync::Arc::clone(&self.supervisor),
+                )));
+            }
+            self.supervisor_store = Some(store);
+        }
 
         let inline_ai: Option<Arc<crate::inline_completion::InlineCompleter>> = {
             let cfg = &self.config.inline_completion;
@@ -3263,16 +3577,27 @@ impl AishShell {
                 struct HandlerExecutor<'a> {
                     handler: &'a AiHandler,
                     runtime: &'a tokio::runtime::Runtime,
+                    supervisor: std::sync::Arc<aish_supervisor::Supervisor>,
+                    work_root: Option<std::path::PathBuf>,
                 }
                 impl aish_supervisor::Executor for HandlerExecutor<'_> {
                     fn run(
                         &self,
-                        _ticket_id: &str,
+                        ticket_id: &str,
                         prompt: &str,
                     ) -> Result<aish_supervisor::domain::Report, String> {
-                        let text = self
-                            .runtime
-                            .block_on(async { self.handler.run_worker_turn(prompt, 20).await })?;
+                        // Each ticket works in its own directory so two workers
+                        // cannot overwrite each other's files.
+                        let work_dir = self
+                            .work_root
+                            .as_ref()
+                            .and_then(|root| self.supervisor.ticket_dir(ticket_id, root).ok());
+                        let handler = self.handler;
+                        let text = self.runtime.block_on(async move {
+                            handler
+                                .run_worker_turn(prompt, 20, work_dir.as_deref())
+                                .await
+                        })?;
                         Ok(aish_supervisor::domain::Report {
                             state: aish_supervisor::domain::ReportState::Ready,
                             summary: text,
@@ -3283,9 +3608,12 @@ impl AishShell {
                 let executor = HandlerExecutor {
                     handler: &self.ai_handler,
                     runtime: &runtime,
+                    supervisor: std::sync::Arc::clone(&self.supervisor),
+                    work_root: self.supervisor_work_root(),
                 };
                 supervisor_runtime.pass(&executor);
             }
+            self.persist_supervisor();
 
             // Render prompt and read input via rustyline
             let mode = match self.ai_handler.plan_phase() {
@@ -16196,6 +16524,58 @@ mod audit_args_tests {
         }
         // The summary must contain the count placeholder.
         assert!(mgr.t("shell.audit.summary").contains("{count}"));
+    }
+}
+
+#[cfg(test)]
+mod delegate_tests {
+    use super::delegate_trigger;
+    use aish_supervisor::domain::{Actor, TriggerKind};
+
+    #[test]
+    fn a_delegation_becomes_a_user_ask_on_the_session_thread() {
+        let trigger = delegate_trigger(&["/delegate", "fix", "the", "parser"], "sess-1", 3)
+            .expect("a task was given");
+        assert_eq!(trigger.kind, TriggerKind::UserAsk);
+        assert_eq!(trigger.actor, Actor::User);
+        assert_eq!(trigger.text, "fix the parser");
+        assert_eq!(trigger.thread.0, "delegate-sess-1");
+        assert_eq!(trigger.id, "delegate-3");
+    }
+
+    #[test]
+    fn an_empty_delegation_creates_nothing() {
+        // A bare `/delegate` must not put an empty ticket in the panel.
+        assert!(delegate_trigger(&["/delegate"], "s", 0).is_none());
+        assert!(delegate_trigger(&["/delegate", "   "], "s", 0).is_none());
+    }
+
+    #[test]
+    fn two_delegations_on_the_same_thread_stay_distinct() {
+        let first = delegate_trigger(&["/delegate", "same"], "s", 1).unwrap();
+        let second = delegate_trigger(&["/delegate", "same"], "s", 2).unwrap();
+        assert_ne!(first.id, second.id, "ids must not collide");
+    }
+
+    #[test]
+    fn the_score_of_a_delegation_reaches_the_supervisor() {
+        // End-to-end through the domain: the trigger creates a ticket whose
+        // first input is the request itself.
+        let supervisor = aish_supervisor::Supervisor::new();
+        let trigger = delegate_trigger(&["/delegate", "echo hi"], "s", 0).unwrap();
+        let decision = supervisor.receive(&trigger);
+        assert!(matches!(
+            decision,
+            Some(aish_supervisor::domain::Decision::Accept(_))
+        ));
+        let view = supervisor.view();
+        assert_eq!(view.rows().len(), 1);
+        assert_eq!(view.rows()[0].title, "echo hi");
+        assert_eq!(
+            supervisor.take_inputs(&view.rows()[0].id),
+            vec!["echo hi".to_string()],
+            "the worker receives the request, not just its title"
+        );
     }
 }
 

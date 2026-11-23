@@ -59,7 +59,9 @@ fn each_builtin_command_enter_executes() {
 
 #[test]
 fn slash_commands_table_has_expected_count() {
-    assert_eq!(SLASH_COMMANDS.len(), 28);
+    // Guards against a command silently disappearing from the popup. Bump this
+    // when adding one, together with the i18n key it needs.
+    assert_eq!(SLASH_COMMANDS.len(), 29);
 }
 
 #[test]

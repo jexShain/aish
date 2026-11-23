@@ -22,10 +22,10 @@ pub mod render;
 pub mod screen;
 pub mod workspace;
 
-pub use app::{run, AppHooks, Key};
+pub use app::{run, AppHooks, Key, TICK};
 pub use render::{prepare_line, prepare_lines, strip_escapes, visible_width, TAB_WIDTH};
 pub use screen::{Cell, CellStyle, Diff, Screen};
 pub use workspace::{
-    draw, AgentLine, AgentState, Drawn, LogLine, Palette, StageLine, Tab, TaskLine, Workspace,
-    LEFT_COLUMN, MIN_HEIGHT, MIN_WIDTH,
+    draw, AgentLine, AgentState, Composer, Drawn, LogLine, Palette, StageLine, Tab, TaskLine,
+    Workspace, LEFT_COLUMN, MIN_HEIGHT, MIN_WIDTH,
 };

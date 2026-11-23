@@ -110,6 +110,11 @@ impl Tab {
 /// One agent row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentLine {
+    /// Stable id of the ticket this row shows, so a key press can address it.
+    ///
+    /// Without it the panel could only paint; every action would have to guess
+    /// which ticket the selection pointed at.
+    pub id: String,
     /// Display name.
     pub name: String,
     /// Lifecycle state, driving the glyph and the tone.
@@ -118,6 +123,8 @@ pub struct AgentLine {
     pub activity: String,
     /// Elapsed time, already formatted.
     pub elapsed: String,
+    /// Whether a retry applies to this row.
+    pub retryable: bool,
 }
 
 /// Agent lifecycle, in the order the reference panel resolves them.
@@ -228,6 +235,104 @@ pub struct Workspace {
     pub selected: usize,
     /// Active tab.
     pub tab: Tab,
+    /// Text being typed into the composer, if it is open.
+    pub draft: Option<String>,
+    /// Cursor position within `draft`, in chars.
+    pub draft_cursor: usize,
+    /// What the composer will do when submitted.
+    pub composer: Composer,
+}
+
+/// What the open composer is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Composer {
+    /// Nothing open; keys navigate.
+    #[default]
+    Closed,
+    /// Answer the selected ticket's question.
+    Answer,
+    /// Send a message to the selected ticket without a question.
+    Say,
+}
+
+impl Workspace {
+    /// The selected agent row, if the list is not empty.
+    pub fn selected_agent(&self) -> Option<&AgentLine> {
+        self.agents.get(self.selected)
+    }
+
+    /// Open the composer for the given purpose.
+    ///
+    /// Refuses to open while one is already open: typing must never be
+    /// silently redirected to a different target mid-sentence.
+    pub fn open_composer(&mut self, purpose: Composer, seed: impl Into<String>) -> bool {
+        if self.composer != Composer::Closed {
+            return false;
+        }
+        let seed = seed.into();
+        self.draft_cursor = seed.chars().count();
+        self.draft = Some(seed);
+        self.composer = purpose;
+        true
+    }
+
+    /// Close the composer and drop what was typed.
+    pub fn close_composer(&mut self) {
+        self.composer = Composer::Closed;
+        self.draft = None;
+        self.draft_cursor = 0;
+    }
+
+    /// Append one character at the cursor.
+    pub fn insert_char(&mut self, ch: char) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        let byte = char_to_byte(draft, self.draft_cursor);
+        draft.insert(byte, ch);
+        self.draft_cursor += 1;
+    }
+
+    /// Delete the character before the cursor.
+    pub fn backspace(&mut self) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        if self.draft_cursor == 0 {
+            return;
+        }
+        let byte = char_to_byte(draft, self.draft_cursor - 1);
+        draft.remove(byte);
+        self.draft_cursor -= 1;
+    }
+
+    /// Take the composed text, closing the composer.
+    pub fn take_draft(&mut self) -> (Composer, String) {
+        let purpose = self.composer;
+        let text = self.draft.take().unwrap_or_default();
+        self.composer = Composer::Closed;
+        self.draft_cursor = 0;
+        (purpose, text)
+    }
+
+    /// Move the selection by `delta`, clamped to the rows.
+    pub fn step_selection(&mut self, delta: isize) {
+        if self.agents.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let last = self.agents.len() - 1;
+        let next = (self.selected as isize + delta).clamp(0, last as isize);
+        self.selected = next as usize;
+    }
+}
+
+/// Byte offset of the `chars`-th character in `text`.
+fn char_to_byte(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
 }
 
 /// Minimum usable geometry; below it the screen is a single message.
@@ -664,8 +769,21 @@ fn draw_log(
 }
 
 fn draw_input(workspace: &Workspace, palette: &Palette, screen: &mut Screen, row: u16) {
-    let _ = workspace;
-    screen.put(0, row, "❯", &palette.style(palette.accent));
+    let (prompt, style) = match workspace.composer {
+        Composer::Closed => ("❯", palette.style(palette.accent)),
+        Composer::Answer => ("answer❯", palette.style(palette.warn)),
+        Composer::Say => ("say❯", palette.style(palette.accent)),
+    };
+    screen.put(0, row, prompt, &style);
+    if let Some(draft) = &workspace.draft {
+        let start = visible_width(prompt) + 1;
+        screen.put(
+            start,
+            row,
+            &truncate(draft, screen.width().saturating_sub(start + 12)),
+            &palette.style(palette.bright),
+        );
+    }
     let ctx = format!("ctx {}%", workspace.context_percent);
     screen.put_right(
         screen.width().saturating_sub(1),
@@ -676,11 +794,15 @@ fn draw_input(workspace: &Workspace, palette: &Palette, screen: &mut Screen, row
 }
 
 fn draw_hints(workspace: &Workspace, palette: &Palette, screen: &mut Screen, width: u16, row: u16) {
-    let hints = match workspace.tab {
-        Tab::Mission => {
-            "↑↓ role   ⏎ detail   Tab tabs   1-4 tab   o open   s send   r stop   ? help   q close"
+    let hints = if workspace.composer != Composer::Closed {
+        "type a message   ⏎ send   Esc cancel"
+    } else {
+        match workspace.tab {
+            Tab::Mission => {
+                "↑↓ select   a answer   s say   r retry   x stop   Tab tabs   1-4 tab   q close"
+            }
+            _ => "↑↓ select   a answer   s say   r retry   x stop   Tab tabs   1-4 tab   q close",
         }
-        _ => "Tab tabs   1-4 tab   ↑↓ select   r stop   ? help   q close",
     };
     screen.put(
         1,
@@ -738,18 +860,24 @@ mod tests {
             goal: "Rotate tokens on every use".to_string(),
             agents: vec![
                 AgentLine {
+                    id: "tk-1".to_string(),
+                    retryable: false,
                     name: "orchestrator".to_string(),
                     state: AgentState::Running,
                     activity: "planning".to_string(),
                     elapsed: "0:42".to_string(),
                 },
                 AgentLine {
+                    id: "tk-2".to_string(),
+                    retryable: true,
                     name: "build".to_string(),
                     state: AgentState::Waits,
                     activity: "Trust this folder?".to_string(),
                     elapsed: "1:03".to_string(),
                 },
                 AgentLine {
+                    id: "tk-3".to_string(),
+                    retryable: false,
                     name: "review".to_string(),
                     state: AgentState::Planned,
                     activity: String::new(),
@@ -784,6 +912,9 @@ mod tests {
             context_percent: 4,
             selected: 1,
             tab: Tab::Mission,
+            draft: None,
+            draft_cursor: 0,
+            composer: Composer::Closed,
         }
     }
 
@@ -988,6 +1119,96 @@ mod tests {
         for y in 4..28 {
             assert_eq!(screen.cell(LEFT_COLUMN, y).unwrap().ch, "│", "row {y}");
         }
+    }
+
+    #[test]
+    fn the_selected_row_identifies_the_ticket_it_addresses() {
+        let workspace = sample();
+        assert_eq!(workspace.selected_agent().unwrap().id, "tk-2");
+        let mut moved = workspace.clone();
+        moved.step_selection(1);
+        assert_eq!(moved.selected_agent().unwrap().id, "tk-3");
+    }
+
+    #[test]
+    fn selection_clamps_at_both_ends() {
+        let mut workspace = sample();
+        workspace.step_selection(-10);
+        assert_eq!(workspace.selected, 0);
+        workspace.step_selection(999);
+        assert_eq!(workspace.selected, workspace.agents.len() - 1);
+    }
+
+    #[test]
+    fn the_composer_refuses_to_open_twice() {
+        let mut workspace = sample();
+        assert!(workspace.open_composer(Composer::Say, ""));
+        assert!(
+            !workspace.open_composer(Composer::Answer, "x"),
+            "a second open would redirect text mid-sentence"
+        );
+        assert_eq!(workspace.composer, Composer::Say);
+        assert_eq!(workspace.draft.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn typing_and_backspace_edit_the_draft_at_the_cursor() {
+        let mut workspace = sample();
+        workspace.open_composer(Composer::Say, "");
+        for ch in "abc".chars() {
+            workspace.insert_char(ch);
+        }
+        assert_eq!(workspace.draft.as_deref(), Some("abc"));
+        workspace.backspace();
+        assert_eq!(workspace.draft.as_deref(), Some("ab"));
+        workspace.backspace();
+        workspace.backspace();
+        workspace.backspace();
+        assert_eq!(workspace.draft.as_deref(), Some(""), "no underflow");
+    }
+
+    #[test]
+    fn multibyte_characters_survive_editing() {
+        let mut workspace = sample();
+        workspace.open_composer(Composer::Answer, "");
+        for ch in "中文🚀x".chars() {
+            workspace.insert_char(ch);
+        }
+        assert_eq!(workspace.draft.as_deref(), Some("中文🚀x"));
+        workspace.backspace();
+        assert_eq!(workspace.draft.as_deref(), Some("中文🚀"));
+        workspace.backspace();
+        assert_eq!(workspace.draft.as_deref(), Some("中文"));
+    }
+
+    #[test]
+    fn taking_the_draft_closes_the_composer() {
+        let mut workspace = sample();
+        workspace.open_composer(Composer::Answer, "seed");
+        let (purpose, text) = workspace.take_draft();
+        assert_eq!(purpose, Composer::Answer);
+        assert_eq!(text, "seed");
+        assert_eq!(workspace.composer, Composer::Closed);
+        assert!(workspace.draft.is_none());
+    }
+
+    #[test]
+    fn the_composer_input_row_shows_what_is_typed() {
+        let mut workspace = sample();
+        workspace.open_composer(Composer::Say, "hello");
+        let mut screen = Screen::new(100, 30);
+        draw(&workspace, &palette(), &mut screen);
+        let row = row_text(&screen, 28, 100);
+        assert!(row.contains("say"), "prompt missing: {row:?}");
+        assert!(row.contains("hello"), "draft missing: {row:?}");
+    }
+
+    #[test]
+    fn typing_without_a_composer_does_nothing() {
+        let mut workspace = sample();
+        workspace.insert_char('x');
+        workspace.backspace();
+        assert!(workspace.draft.is_none());
     }
 
     #[test]
