@@ -795,19 +795,34 @@ fn draw_input(workspace: &Workspace, palette: &Palette, screen: &mut Screen, row
 
 fn draw_hints(workspace: &Workspace, palette: &Palette, screen: &mut Screen, width: u16, row: u16) {
     let hints = if workspace.composer != Composer::Closed {
-        "type a message   ⏎ send   Esc cancel"
+        "type a message   ⏎ send   Esc cancel".to_string()
     } else {
-        match workspace.tab {
-            Tab::Mission => {
-                "↑↓ select   a answer   s say   r retry   x stop   Tab tabs   1-4 tab   q close"
-            }
-            _ => "↑↓ select   a answer   s say   r retry   x stop   Tab tabs   1-4 tab   q close",
+        // Only offer the keys that apply to the selected row: showing "a
+        // answer" on a row with no question teaches the user that keys
+        // silently do nothing.
+        let selected = workspace.selected_agent();
+        let mut parts = vec!["↑↓ select".to_string()];
+        if selected.is_some_and(|a| a.state == AgentState::Waits) {
+            parts.push("a answer".to_string());
         }
+        if selected.is_some() {
+            parts.push("s say".to_string());
+        }
+        if selected.is_some_and(|a| a.retryable) {
+            parts.push("r retry".to_string());
+        }
+        if selected.is_some() && !matches!(selected.map(|a| a.state), Some(AgentState::Done)) {
+            parts.push("x stop".to_string());
+        }
+        parts.push("Tab tabs".to_string());
+        parts.push("1-4 tab".to_string());
+        parts.push("q close".to_string());
+        parts.join("   ")
     };
     screen.put(
         1,
         row,
-        &truncate(hints, width.saturating_sub(2)),
+        &truncate(&hints, width.saturating_sub(2)),
         &palette.style(palette.chrome),
     );
 }
@@ -1209,6 +1224,29 @@ mod tests {
         workspace.insert_char('x');
         workspace.backspace();
         assert!(workspace.draft.is_none());
+    }
+
+    #[test]
+    fn hints_offer_only_the_keys_that_apply() {
+        // sample() selects "build", which waits on a person and is retryable.
+        let mut workspace = sample();
+        let mut screen = Screen::new(120, 30);
+        draw(&workspace, &palette(), &mut screen);
+        let waiting = row_text(&screen, 29, 120);
+        assert!(waiting.contains("a answer"), "{waiting:?}");
+        assert!(waiting.contains("r retry"), "{waiting:?}");
+
+        // A row with no question and no retry offers neither: pressing them
+        // would silently do nothing.
+        workspace.selected = 2; // review, Planned
+        draw(&workspace, &palette(), &mut screen);
+        let planned = row_text(&screen, 29, 120);
+        assert!(!planned.contains("a answer"), "{planned:?}");
+        assert!(!planned.contains("r retry"), "{planned:?}");
+        assert!(
+            planned.contains("s say"),
+            "saying still applies: {planned:?}"
+        );
     }
 
     #[test]
