@@ -474,29 +474,35 @@ impl AiHandler {
     /// The supervisor's workers are not part of the interactive turn, so they
     /// need their own entry point: this clones a sub-session (own context, own
     /// cancellation token) and runs the tool loop on it, returning the text.
-    /// Prepare a self-contained session for a detached worker.
+    /// A snapshot of the main session's tool set, for detached workers.
     ///
-    /// The returned session owns its tools and cancellation token, so it can be
-    /// moved to another thread and driven without the shell's handler. That is
-    /// what lets a model call run while the panel keeps painting.
-    pub fn worker_session(&self, work_dir: Option<&std::path::Path>) -> aish_llm::LlmSession {
-        let mut sub = self.llm_session.create_subsession();
-        // Tools are shared by `Arc`, so a worker gets the same abilities as the
-        // interactive session without duplicating them.
+    /// `create_subsession` starts with an empty tool registry, so a worker that
+    /// only cloned one would have no abilities at all. The tools are `Arc`s, so
+    /// handing them to another thread costs nothing and shares the same
+    /// implementations the interactive session uses.
+    pub fn worker_tools(&self) -> Vec<Arc<dyn Tool>> {
         let names: Vec<String> = self
             .llm_session
             .tool_specs()
             .into_iter()
             .map(|spec| spec.function.name)
             .collect();
-        for tool in self
-            .llm_session
+        self.llm_session
             .shared_tools_by_names(names.iter().map(String::as_str))
-        {
+    }
+
+    /// The main session's tools, for a caller that builds its own sub-session.
+    pub fn worker_tools_for_ui(&self) -> Vec<Arc<dyn Tool>> {
+        self.worker_tools()
+    }
+
+    /// A sub-session seeded with [`Self::worker_tools`].
+    pub fn worker_session(&self) -> aish_llm::LlmSession {
+        let mut sub = self.llm_session.create_subsession();
+        for tool in self.worker_tools() {
             let registered = tool.for_sub_session(&sub).unwrap_or(tool);
             sub.register_shared_tool(registered);
         }
-        let _ = work_dir;
         sub
     }
 

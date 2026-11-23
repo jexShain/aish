@@ -37,11 +37,13 @@ use crate::types::ShellState;
 
 /// Runs detached workers: each call gets its own session, on its own thread.
 ///
-/// Built once per panel session. It owns nothing borrowed, so it can be shared
-/// across the threads `Runtime::pass_detached` spawns; each turn creates a
-/// fresh sub-session instead of sharing one.
+/// Built once per panel session. `tools` is the main session's tool set
+/// captured up front, because `create_subsession` yields an empty registry; a
+/// worker without tools can only talk, which is not what a delegated task
+/// means.
 struct DetachedExecutor {
     base: Arc<aish_llm::LlmSession>,
+    tools: Arc<Vec<Arc<dyn aish_llm::Tool>>>,
     runtime: tokio::runtime::Handle,
     work_root: Option<std::path::PathBuf>,
 }
@@ -52,46 +54,44 @@ impl aish_supervisor::Executor for DetachedExecutor {
         ticket_id: &str,
         prompt: &str,
     ) -> Result<aish_supervisor::domain::Report, String> {
-        use aish_llm::{ChatMessage, PromptContext, ToolLoopConfig};
-
-        let mut sub = self.base.create_subsession();
-        let names: Vec<String> = self
-            .base
-            .tool_specs()
-            .into_iter()
-            .map(|spec| spec.function.name)
-            .collect();
-        for tool in self
-            .base
-            .shared_tools_by_names(names.iter().map(String::as_str))
-        {
-            let registered = tool.for_sub_session(&sub).unwrap_or(tool);
-            sub.register_shared_tool(registered);
-        }
+        use aish_llm::PromptContext;
 
         // State the directory in the prompt: a session has no working
         // directory of its own, the shell tool does.
-        let dir = self.work_root.as_ref().and_then(|root| {
-            std::fs::create_dir_all(root.join(sanitize_ticket(ticket_id)))
-                .ok()
-                .map(|()| root.join(sanitize_ticket(ticket_id)))
-        });
-        let message = match &dir {
-            Some(dir) => ChatMessage::user(format!(
-                "Work in this directory only: {}\n\n{prompt}",
-                dir.display()
-            )),
-            None => ChatMessage::user(prompt),
+        let dir = self
+            .work_root
+            .as_ref()
+            .map(|root| root.join(sanitize_ticket(ticket_id)));
+        if let Some(dir) = &dir {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let full_prompt = match &dir {
+            Some(dir) => format!("Work in this directory only: {}\n\n{prompt}", dir.display()),
+            None => prompt.to_string(),
         };
 
-        let config = ToolLoopConfig {
+        // `spawn` is the supported path: it builds the sub-session, installs
+        // the tool set the parent allows, wires the cancellation cascade and
+        // the event proxy. Driving `run_tool_loop_until_done` directly skipped
+        // that setup, and the model answered with raw tool-call text instead of
+        // executing anything.
+        let config = aish_llm::SpawnConfig {
             max_turns: 20,
             system_message: None,
             prompt_context: PromptContext::MainChat,
-            ..ToolLoopConfig::default()
+            context_messages: Vec::new(),
         };
+        let tools = Arc::clone(&self.tools);
         let outcome = self.runtime.block_on(async {
-            aish_llm::run_tool_loop_until_done(&sub, &message, &[], &config).await
+            aish_llm::spawn(&self.base, &full_prompt, config, |sub| {
+                for tool in tools.iter() {
+                    let registered = tool
+                        .for_sub_session(sub)
+                        .unwrap_or_else(|| Arc::clone(tool));
+                    sub.register_shared_tool(registered);
+                }
+            })
+            .await
         });
         if outcome.text.trim().is_empty() {
             return Err(format!("worker ended with {:?}", outcome.status));
@@ -1491,7 +1491,10 @@ impl AishShell {
         // A detached executor owns its session, so the panel can start turns
         // without borrowing the shell's handler.
         let executor: Arc<dyn aish_supervisor::Executor> = Arc::new(DetachedExecutor {
-            base: Arc::new(self.ai_handler.worker_session(None)),
+            // The base carries the conversation config; tools are captured
+            // separately because a subsession starts empty.
+            base: Arc::new(self.ai_handler.worker_session()),
+            tools: Arc::new(self.ai_handler.worker_tools_for_ui()),
             runtime: handle.clone(),
             work_root: self.supervisor_work_root(),
         });
