@@ -1,0 +1,16 @@
+[package]
+name = "aish-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Fullscreen (alternate-screen) cell-grid UI for aish"
+
+[dependencies]
+crossterm.workspace = true
+unicode-width.workspace = true
+tracing.workspace = true
+
+[[bin]]
+name = "workspace-demo"
+path = "src/bin/workspace-demo.rs"

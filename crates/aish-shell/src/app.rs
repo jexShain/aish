@@ -1061,6 +1061,11 @@ pub struct AishShell {
     pty: Arc<Mutex<aish_pty::PersistentPty>>,
     /// UUID for the current session, used to associate history entries.
     session_uuid: String,
+    /// Live agent/task state shared with the fullscreen front end.
+    ///
+    /// Every LLM event is forwarded here by the event callback, so the panel
+    /// reads one aggregated snapshot instead of re-deriving state per frame.
+    supervisor: Arc<aish_supervisor::Supervisor>,
     /// Retarget handle for the append-only AI transcript (issue #530):
     /// updated on `/resume` and `/fork` so later appends follow the active
     /// session.
@@ -1133,6 +1138,63 @@ pub struct AishShell {
 
 impl AishShell {
     /// Show expand panel for browsing collapsed output history.
+    /// Run the fullscreen supervisor UI until the user leaves it.
+    ///
+    /// The alternate screen is entered and left inside `aish_tui::run`, so the
+    /// user's scrollback comes back untouched. This is a pure view: it reads
+    /// the supervisor's projection and never mutates shell state.
+    fn run_fullscreen_mode(&mut self) {
+        struct Hooks {
+            supervisor: std::sync::Arc<aish_supervisor::Supervisor>,
+        }
+
+        impl aish_tui::AppHooks for Hooks {
+            fn snapshot(&self) -> aish_tui::Workspace {
+                use aish_supervisor::stage::Stage;
+                let view = self.supervisor.view();
+                let agents = view
+                    .rows()
+                    .iter()
+                    .map(|row| aish_tui::AgentLine {
+                        name: row.title.clone(),
+                        state: match row.stage {
+                            Stage::Person(_) => aish_tui::AgentState::Waits,
+                            Stage::Working { queued: true } => aish_tui::AgentState::Planned,
+                            Stage::Working { queued: false } => aish_tui::AgentState::Running,
+                            Stage::Idle => aish_tui::AgentState::Running,
+                            Stage::Ended => aish_tui::AgentState::Done,
+                        },
+                        activity: row.stage.label().to_string(),
+                        elapsed: row.detail.clone(),
+                    })
+                    .collect();
+                aish_tui::Workspace {
+                    title: view.summary(),
+                    goal: String::new(),
+                    agents,
+                    stages: Vec::new(),
+                    tasks: Vec::new(),
+                    log: Vec::new(),
+                    clock: String::new(),
+                    context_percent: 0,
+                    selected: 0,
+                    tab: aish_tui::Tab::Mission,
+                }
+            }
+
+            fn should_close(&self) -> bool {
+                false
+            }
+        }
+
+        let hooks = Hooks {
+            supervisor: std::sync::Arc::clone(&self.supervisor),
+        };
+        if let Err(err) = aish_tui::run(hooks) {
+            tracing::warn!(%err, "fullscreen supervisor UI failed");
+        }
+    }
+
     fn show_expand_panel(&self) {
         // Clone data out of the mutex before running the blocking TUI panel,
         // so the EscWatcher thread can still acquire the lock.
@@ -1974,6 +2036,10 @@ impl AishShell {
         }
 
         let shared_recorder_cb = shared_recorder.clone();
+        // Live ticket state for the fullscreen front end. It is filled by the
+        // supervisor's own commands (a ticket per accepted request), not by
+        // scraping LLM events: a raw event stream has no ticket to attach to.
+        let supervisor = Arc::new(aish_supervisor::Supervisor::new());
         // Capture the cancellation token so the event callback can check
         // is_cancelled() before starting animations — late LLM events
         // arriving after Ctrl+C would otherwise restart the animation
@@ -2890,6 +2956,7 @@ impl AishShell {
             operation_in_progress: false,
             pty,
             session_uuid,
+            supervisor,
             transcript_session: transcript_session.clone(),
             resumed_snapshot_for_seed: None,
             streamed_content,
@@ -3188,7 +3255,19 @@ impl AishShell {
                 }
                 Ok(None) => break, // EOF (Ctrl-D)
                 Err(e) => {
-                    // Check if Shift+Tab or F2 triggered the interrupt (mode toggle)
+                    // Shift+Tab switches the front end. It is checked first
+                    // because both keys report through `Interrupted`: plan
+                    // mode must never be toggled by the layout chord.
+                    if matches!(e, rustyline::error::ReadlineError::Interrupted)
+                        && rl.was_ui_mode_toggle_requested()
+                    {
+                        self.run_fullscreen_mode();
+                        // The alternate screen restored the pre-switch screen,
+                        // so the prompt has to be repainted rather than
+                        // assumed intact.
+                        continue;
+                    }
+                    // Check if F2 triggered the interrupt (plan-mode toggle)
                     if matches!(e, rustyline::error::ReadlineError::Interrupted)
                         && rl.was_mode_toggle_requested()
                     {

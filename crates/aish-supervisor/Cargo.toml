@@ -1,0 +1,12 @@
+[package]
+name = "aish-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Live agent and background-task state shared by every aish front end"
+
+[dependencies]
+aish-core.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true

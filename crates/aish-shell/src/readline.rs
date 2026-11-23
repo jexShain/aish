@@ -295,6 +295,11 @@ pub const SLASH_COMMANDS: &[SlashCommandMeta] = &[
 /// Flag set by `ModeToggleHandler` when Shift+Tab or F2 is pressed.
 static MODE_TOGGLE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Set by [`UiModeToggleHandler`] when Shift+Tab asks for the fullscreen front
+/// end. Kept apart from [`MODE_TOGGLE_REQUESTED`] so plan mode and the layout
+/// can never be toggled by the same chord.
+static UI_MODE_TOGGLE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Flag set by `CtrlOHandler` when Ctrl+O is pressed.
 static CTRL_O_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -482,7 +487,23 @@ impl ConditionalEventHandler for TabCompletionHandler {
     }
 }
 
-/// Event handler that sets a flag when Shift+Tab or F2 is pressed,
+/// Event handler that sets a flag when Shift+Tab asks for the fullscreen UI.
+struct UiModeToggleHandler;
+
+impl ConditionalEventHandler for UiModeToggleHandler {
+    fn handle(
+        &self,
+        _evt: &Event,
+        _n_repeat: RepeatCount,
+        _positive: bool,
+        _ctx: &EventContext<'_>,
+    ) -> Option<Cmd> {
+        UI_MODE_TOGGLE_REQUESTED.store(true, Ordering::SeqCst);
+        Some(Cmd::Interrupt)
+    }
+}
+
+/// Event handler that sets a flag when F2 is pressed,
 /// then returns `Cmd::Interrupt` to break out of `read_line`.
 struct ModeToggleHandler;
 
@@ -825,14 +846,17 @@ impl ShellReadline {
             })),
         );
 
-        // Bind Shift+Tab (BackTab) and F2 for mode toggle
-        editor.bind_sequence(
-            KeyEvent(KeyCode::BackTab, Modifiers::NONE),
-            EventHandler::Conditional(Box::new(ModeToggleHandler)),
-        );
+        // F2 toggles plan mode. Shift+Tab used to share this binding; it now
+        // switches the front end (scrolling <-> fullscreen), so the two are
+        // deliberately separate: a chord that changes the layout must not also
+        // change what the model is allowed to do.
         editor.bind_sequence(
             KeyEvent(KeyCode::F(2), Modifiers::NONE),
             EventHandler::Conditional(Box::new(ModeToggleHandler)),
+        );
+        editor.bind_sequence(
+            KeyEvent(KeyCode::BackTab, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(UiModeToggleHandler)),
         );
 
         // Bind Ctrl+O for expand/collapsed output browsing
@@ -905,8 +929,14 @@ impl ShellReadline {
         })
     }
 
-    /// Check whether a mode toggle key (Shift+Tab or F2) triggered the
-    /// last `Interrupted` error. The flag is consumed on read.
+    /// Check whether Shift+Tab asked to switch to the fullscreen front end.
+    /// The flag is consumed on read.
+    pub fn was_ui_mode_toggle_requested(&self) -> bool {
+        UI_MODE_TOGGLE_REQUESTED.swap(false, Ordering::SeqCst)
+    }
+
+    /// Check whether the plan-mode toggle key (F2) triggered the last
+    /// `Interrupted` error. The flag is consumed on read.
     pub fn was_mode_toggle_requested(&self) -> bool {
         MODE_TOGGLE_REQUESTED.swap(false, Ordering::SeqCst)
     }
