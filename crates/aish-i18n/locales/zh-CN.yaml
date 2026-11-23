@@ -310,6 +310,9 @@ status:
   instructions_none: "未加载"
   instructions_loaded: "已加载 {count} 个文件"
 shell:
+  delegate:
+    usage: "用法：/delegate <任务>"
+    started: "已把 {id} 交给调度器。"
   welcome2:
     header: ">_ AI Shell {version}"
     model_hint: "(输入 /model 切换模型)"
@@ -383,6 +386,7 @@ shell:
     instructions: "切换项目 AGENTS.md 指令加载（on/off/status；仅本会话）"
     mcp: "查看、重载并重连 MCP server 及其工具"
 
+    delegate: "在后台调度器中运行任务"
   slash_group:
     diagnostics: "诊断"
     sessions: "会话"

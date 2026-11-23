@@ -469,6 +469,31 @@ impl AiHandler {
         self.llm_session.set_audit_session_uuid(session_uuid);
     }
 
+    /// Run one detached sub-agent turn for the supervisor.
+    ///
+    /// The supervisor's workers are not part of the interactive turn, so they
+    /// need their own entry point: this clones a sub-session (own context, own
+    /// cancellation token) and runs the tool loop on it, returning the text.
+    pub async fn run_worker_turn(&self, prompt: &str, max_turns: u32) -> Result<String, String> {
+        use aish_llm::{ChatMessage, PromptContext, ToolLoopConfig};
+
+        // A sub-session has its own context and cancellation token, which is
+        // what lets several workers run without sharing conversation state.
+        let sub = self.llm_session.create_subsession();
+        let config = ToolLoopConfig {
+            max_turns,
+            system_message: None,
+            prompt_context: PromptContext::MainChat,
+            ..ToolLoopConfig::default()
+        };
+        let message = ChatMessage::user(prompt);
+        let outcome = aish_llm::run_tool_loop_until_done(&sub, &message, &[], &config).await;
+        match outcome.text {
+            text if text.is_empty() => Err(format!("worker ended with {:?}", outcome.status)),
+            text => Ok(text),
+        }
+    }
+
     /// Borrow the wrapped LLM session.
     ///
     /// Test-only: lets audit-propagation tests drive real tool executions

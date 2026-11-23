@@ -138,6 +138,8 @@ mod tests {
         }
     }
 
+    /// A ticket shaped like one the supervisor creates: `inputs[0]` is the ask
+    /// that created it, which is a task rather than a follow-up.
     fn ticket() -> Ticket {
         Ticket {
             id: "t1".to_string(),
@@ -147,7 +149,11 @@ mod tests {
             ended: false,
             attention: None,
             assignments: Vec::new(),
-            inputs: Vec::new(),
+            inputs: vec![TicketInput {
+                trigger_id: "creating-ask".to_string(),
+                text: "fix the thing".to_string(),
+                read: true,
+            }],
         }
     }
 
@@ -195,6 +201,7 @@ mod tests {
         let mut resumed = t.clone();
         resumed.inputs.push(TicketInput {
             trigger_id: "tr1".to_string(),
+            text: "here is more".to_string(),
             read: false,
         });
         assert_ne!(

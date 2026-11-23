@@ -246,6 +246,81 @@ kv(key PRIMARY KEY, value)
 | `Tab`/`Shift+Tab` | 切页 / 退出全屏 | 全部 |
 | `q` | 退出全屏 | 全部 |
 
+## 8b. 常驻调度 + 多子代理 + 对话（新增需求）
+
+前三节描述的是「被动监督一个正在跑的回合」。实际要的是一个**常驻调度器**：它不等用户输入，自己维持多路子代理在跑，用户随时能看、能插话、能叫停。
+
+### 8b.1 三条新增不变量
+
+| # | 不变量 | 违反后的症状 |
+|---|---|---|
+| 1 | **常驻循环必须存在**：无输入时 pass 仍按 tick 推进 | 子代理完成了没人处理，ticket 永久卡在 `Working` |
+| 2 | **每个并发子代理独占一个 worker 会话**：`create_subsession()` 返回 own 值，move 进任务 | 共享会话导致上下文串味、取消互相牵连 |
+| 3 | **对话不是新 Ticket**：对某个 worker 说话 = 向该 Ticket 投递 Input | 每次追问都新建工单，历史碎片化 |
+
+### 8b.2 常驻循环
+
+```
+            ┌──────────── 2s ticker ────────────┐
+            │                                    │
+            ▼                                    │
+   ┌────────────────┐   effect 非空    ┌─────────┴────────┐
+   │  Pass (串行)    │ ───────────────▶ │  Effect runner    │
+   │                 │                  │  Launch/Deliver/  │
+   │  1. 派发 effect  │ ◀─────────────── │  Cancel           │
+   │  2. Eval 超时重排 │   完成/失败       └─────────┬────────┘
+   │  3. 启动 pending  │                            │
+   └────────┬────────┘                             ▼
+            │                             ┌──────────────────┐
+            └────────────────────────────▶│ worker task      │
+                                          │ (own LlmSession) │
+                                          │ spawn → report   │
+                                          └──────────────────┘
+```
+
+关键点：**pass 与 worker 是异步的两层**。pass 只决定「谁该跑」，worker 在自己的 tokio 任务里跑并回传 `report`。
+
+### 8b.3 worker 生命周期
+
+```rust
+struct WorkerHandle {
+    ticket_id: String,
+    cancel: Arc<CancellationToken>,
+    join: JoinHandle<()>,
+}
+```
+
+- `Launch` effect → `parent.create_subsession()` → move 进 `tokio::spawn`；
+- worker 内部调 `spawn(...)`，把 `SpawnResult` 转成 `Report` 回传 supervisor；
+- `Cancel` effect → `cancel.cancel()`，等 join，回传 `Report{failed,"cancelled"}`；
+- worker 结束必然释放 slot，**panic 也要释放**（用 guard）。
+
+### 8b.4 对话模型
+
+| 用户动作 | 领域操作 | 效果 |
+|---|---|---|
+| 在主提示符输入 | `receive(Trigger::UserAsk)` | 新建 Ticket + Launch |
+| 在面板里对某个 worker 说话 | `receive(Trigger::UserAnswer{thread=ticket.thread})` | 追加 Input + Deliver |
+| 面板里 `a` 回答提问 | `answer(ticket_id, text)` | 清 attention + Deliver |
+| 面板里 `s` 停止 | `stop(ticket_id)` | Cancel + Ended |
+
+「对话」不等于「新任务」——同一个 Ticket 的 thread 上所有消息都走 `Deliver`，worker 的 `LlmSession` 保留自己的上下文。
+
+### 8b.5 多子代理显示
+
+面板的 `AGENTS` 页列出每个 worker：ticket 标题、agent 类型、已耗时、当前工具、最后一行输出。数据来自 worker 回传的 `Report` + supervisor 的 `TicketRow`，不额外开数据通道。
+
+### 8b.6 对落地阶段的修正
+
+原 S2 只说「接 create_subsession」，不够。修正为：
+
+| 阶段 | 内容 |
+|---|---|
+| **S2a** | 常驻 pass 循环（2s tick + on-demand），effect runner 空实现（只打日志） |
+| **S2b** | worker 真实执行：Launch → subsession → spawn → report 回传；Cancel |
+| **S2c** | 主提示符接线：AI 分支的提问调 `supervisor.receive()` |
+| **S2d** | 面板对话：`a` 回答 / `s` 停止 / 对选中 worker 追加消息 |
+
 ## 9. 落地阶段
 
 | 阶段 | 内容 | 验证 |

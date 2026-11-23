@@ -310,6 +310,9 @@ status:
   instructions_none: "none loaded"
   instructions_loaded: "{count} file(s) loaded"
 shell:
+  delegate:
+    usage: "Usage: /delegate <task>"
+    started: "Delegated {id} to the supervisor."
   welcome2:
     header: ">_ AI Shell {version}"
     model_hint: "(type /model to switch)"
@@ -383,6 +386,7 @@ shell:
     instructions: "Toggle project AGENTS.md instruction loading (on/off/status; this session)"
     mcp: "Inspect, reload and reconnect MCP servers and their tools"
 
+    delegate: "Run a task in the background supervisor"
   slash_group:
     diagnostics: "Diagnostics"
     sessions: "Sessions"

@@ -1061,11 +1061,14 @@ pub struct AishShell {
     pty: Arc<Mutex<aish_pty::PersistentPty>>,
     /// UUID for the current session, used to associate history entries.
     session_uuid: String,
-    /// Live agent/task state shared with the fullscreen front end.
+    /// Live ticket state shared with the fullscreen front end.
     ///
-    /// Every LLM event is forwarded here by the event callback, so the panel
-    /// reads one aggregated snapshot instead of re-deriving state per frame.
+    /// Commands on it come from the interactive path (a person's ask) and from
+    /// the resident pass loop, which also runs the workers.
     supervisor: Arc<aish_supervisor::Supervisor>,
+    /// The resident pass loop. `None` until `run()` creates it, because the
+    /// executor needs the shell's tokio runtime.
+    supervisor_runtime: Option<Arc<aish_supervisor::Runtime>>,
     /// Retarget handle for the append-only AI transcript (issue #530):
     /// updated on `/resume` and `/fork` so later appends follow the active
     /// session.
@@ -1138,6 +1141,31 @@ pub struct AishShell {
 
 impl AishShell {
     /// Show expand panel for browsing collapsed output history.
+    /// `/delegate <task>` — hand a task to the background supervisor.
+    ///
+    /// This is the only way to start persistent work: the interactive AI path
+    /// stays a single foreground turn, so nothing is ever run twice.
+    fn handle_delegate_command(&mut self, parts: &[&str]) {
+        let task = parts[1..].join(" ");
+        if task.trim().is_empty() {
+            println!("{}", t("shell.delegate.usage"));
+            return;
+        }
+        let trigger = aish_supervisor::domain::Trigger {
+            id: format!("delegate-{}", self.state.history.len()),
+            kind: aish_supervisor::domain::TriggerKind::UserAsk,
+            actor: aish_supervisor::domain::Actor::User,
+            text: task.clone(),
+            thread: aish_supervisor::domain::ThreadKey(format!("delegate-{}", self.session_uuid)),
+            at: 0,
+        };
+        self.supervisor.receive(&trigger);
+        let id = format!("tk-{}", trigger.id);
+        let mut args = std::collections::HashMap::new();
+        args.insert("id".to_string(), id);
+        println!("{}", t_with_args("shell.delegate.started", &args));
+    }
+
     /// Run the fullscreen supervisor UI until the user leaves it.
     ///
     /// The alternate screen is entered and left inside `aish_tui::run`, so the
@@ -2957,6 +2985,7 @@ impl AishShell {
             pty,
             session_uuid,
             supervisor,
+            supervisor_runtime: None,
             transcript_session: transcript_session.clone(),
             resumed_snapshot_for_seed: None,
             streamed_content,
@@ -3114,6 +3143,15 @@ impl AishShell {
         let autosuggest = Arc::new(Mutex::new(crate::autosuggest::AutoSuggest::new(5000)));
         let runtime_handle = runtime.handle().clone();
 
+        // The resident supervisor. Its pass runs inline at each prompt
+        // iteration rather than on a background thread: a worker turn borrows
+        // the shell's AI handler, which is neither `Send` nor `Sync`, and
+        // pretending otherwise would mean either a second session or unsafe
+        // sharing. Inline keeps one writer and one handler.
+        self.supervisor_runtime = Some(Arc::new(aish_supervisor::Runtime::new(Arc::clone(
+            &self.supervisor,
+        ))));
+
         let inline_ai: Option<Arc<crate::inline_completion::InlineCompleter>> = {
             let cfg = &self.config.inline_completion;
             if !cfg.enabled {
@@ -3215,6 +3253,38 @@ impl AishShell {
                         tracing::info!("Skill '{}' hot-reloaded", name);
                     }
                 }
+            }
+
+            // One resident pass per prompt iteration: drain effects, start or
+            // report workers, then read the next line. Running it here rather
+            // than on a background thread is what lets a worker borrow the AI
+            // handler, which is neither `Send` nor `Sync`.
+            if let Some(supervisor_runtime) = self.supervisor_runtime.clone() {
+                struct HandlerExecutor<'a> {
+                    handler: &'a AiHandler,
+                    runtime: &'a tokio::runtime::Runtime,
+                }
+                impl aish_supervisor::Executor for HandlerExecutor<'_> {
+                    fn run(
+                        &self,
+                        _ticket_id: &str,
+                        prompt: &str,
+                    ) -> Result<aish_supervisor::domain::Report, String> {
+                        let text = self
+                            .runtime
+                            .block_on(async { self.handler.run_worker_turn(prompt, 20).await })?;
+                        Ok(aish_supervisor::domain::Report {
+                            state: aish_supervisor::domain::ReportState::Ready,
+                            summary: text,
+                            question: None,
+                        })
+                    }
+                }
+                let executor = HandlerExecutor {
+                    handler: &self.ai_handler,
+                    runtime: &runtime,
+                };
+                supervisor_runtime.pass(&executor);
             }
 
             // Render prompt and read input via rustyline
@@ -4429,6 +4499,7 @@ impl AishShell {
             Some("/doctor") => self.handle_doctor_command(&parts),
             Some("/diagnose") => self.handle_failure_diagnose_command(),
             Some("/status") => self.handle_status_command(),
+            Some("/delegate") => self.handle_delegate_command(&parts),
             Some("/mcp") => self.handle_mcp_command(&parts),
             Some("/live_sessions") => self.handle_live_sessions_command(),
             Some("/kill_live_sessions") => self.handle_kill_live_sessions_command(&parts),

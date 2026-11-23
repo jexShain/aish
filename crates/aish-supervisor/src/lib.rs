@@ -10,6 +10,7 @@
 
 pub mod domain;
 pub mod engine;
+pub mod runtime;
 pub mod stage;
 
 use parking_lot::Mutex;
@@ -36,6 +37,8 @@ pub struct TicketRow {
     pub detail: String,
     /// The question blocking it, if any.
     pub question: Option<String>,
+    /// The thread its messages belong to, so the panel can address it.
+    pub thread: String,
 }
 
 /// The whole panel state, as data.
@@ -110,6 +113,8 @@ pub enum Refusal {
 }
 
 /// Maximum concurrent workers; one extra slot is reserved for the person.
+pub use runtime::{Executor, PassOutcome, Runtime};
+
 pub const MAX_WORKERS: usize = 3;
 
 #[derive(Debug)]
@@ -174,6 +179,7 @@ impl Supervisor {
                         let id = state.tickets[index].id.clone();
                         state.tickets[index].inputs.push(TicketInput {
                             trigger_id: trigger.id.clone(),
+                            text: trigger.text.clone(),
                             read: false,
                         });
                         state.queue.enqueue(Effect::Deliver { ticket_id: id });
@@ -188,7 +194,14 @@ impl Supervisor {
                         ended: false,
                         attention: None,
                         assignments: Vec::new(),
-                        inputs: Vec::new(),
+                        // The ask that created the ticket is its first input:
+                        // the worker needs the request itself, not just a
+                        // title, and `take_inputs` is the only way it gets it.
+                        inputs: vec![TicketInput {
+                            trigger_id: trigger.id.clone(),
+                            text: trigger.text.clone(),
+                            read: false,
+                        }],
                     };
                     let id = ticket.id.clone();
                     state.tickets.push(ticket);
@@ -210,6 +223,36 @@ impl Supervisor {
             Decision::Ignore(_) => {}
         }
         Some(decision)
+    }
+
+    /// Take in a person's message addressed at an existing ticket.
+    ///
+    /// This is the panel's "talk to this worker" path: the message reaches the
+    /// ticket that already owns the thread instead of starting new work, which
+    /// is what keeps a conversation in one place.
+    pub fn say(&self, ticket_id: &str, text: &str) -> Result<(), Refusal> {
+        let mut state = self.state.lock();
+        let index = state
+            .tickets
+            .iter()
+            .position(|t| t.id == ticket_id)
+            .ok_or_else(|| Refusal::UnknownTicket(ticket_id.to_string()))?;
+        if state.tickets[index].ended {
+            return Err(Refusal::AlreadyEnded(ticket_id.to_string()));
+        }
+        let trigger_id = format!("say-{ticket_id}-{}", state.tickets[index].inputs.len() + 1);
+        state.tickets[index].inputs.push(TicketInput {
+            trigger_id,
+            text: text.to_string(),
+            read: false,
+        });
+        // A person's message releases a blocked or failed ticket, as it does
+        // in the execution document: they are the one who can unblock it.
+        state.tickets[index].attention = None;
+        state.queue.enqueue(Effect::Deliver {
+            ticket_id: ticket_id.to_string(),
+        });
+        Ok(())
     }
 
     /// Record that a worker took the slot and started.
@@ -294,6 +337,7 @@ impl Supervisor {
         }
         ticket.inputs.push(TicketInput {
             trigger_id: format!("answer-{}", ticket.inputs.len() + 1),
+            text: answer.to_string(),
             read: false,
         });
         ticket.assignments.push(Assignment {
@@ -301,7 +345,6 @@ impl Supervisor {
             state: AssignmentState::Pending,
             report: None,
         });
-        let _ = answer;
         let id = ticket.id.clone();
         state.queue.enqueue(Effect::Deliver { ticket_id: id });
         Ok(())
@@ -320,6 +363,7 @@ impl Supervisor {
         }
         ticket.inputs.push(TicketInput {
             trigger_id: format!("retry-{}", ticket.inputs.len() + 1),
+            text: "retry".to_string(),
             read: false,
         });
         ticket.attention = None;
@@ -378,6 +422,7 @@ impl Supervisor {
                     .map(|r| r.summary.clone())
                     .unwrap_or_default(),
                 question: ticket.attention.clone(),
+                thread: ticket.thread.0.clone(),
             })
             .collect();
         // Needs-a-person first, then open work, then ended: the panel answers
@@ -392,6 +437,29 @@ impl Supervisor {
             rows,
             pending_effects: state.queue.len(),
         }
+    }
+
+    /// Unread inputs for a ticket, in order.
+    ///
+    /// The runtime turns these into the worker's prompt; the supervisor itself
+    /// never renders text.
+    pub fn take_inputs(&self, ticket_id: &str) -> Vec<String> {
+        let mut state = self.state.lock();
+        let Some(ticket) = state.tickets.iter_mut().find(|t| t.id == ticket_id) else {
+            return Vec::new();
+        };
+        let texts: Vec<String> = ticket
+            .inputs
+            .iter()
+            .filter(|input| !input.read)
+            .map(|input| input.text.clone())
+            .collect();
+        for input in &mut ticket.inputs {
+            if !input.read {
+                input.read = true;
+            }
+        }
+        texts
     }
 
     /// Number of live worker slots.
@@ -686,6 +754,79 @@ mod tests {
         let title = view.rows()[0].title.clone();
         assert!(!title.contains('\n'));
         assert!(title.chars().count() <= 73, "{title}");
+    }
+
+    #[test]
+    fn saying_something_reaches_the_existing_ticket_not_a_new_one() {
+        let supervisor = Supervisor::new();
+        supervisor.receive(&ask("fix it", "th1"));
+        let id = supervisor.view().rows()[0].id.clone();
+        let _ = supervisor.next_effect();
+
+        supervisor.say(&id, "also rename it").expect("said");
+        assert_eq!(
+            supervisor.view().rows().len(),
+            1,
+            "a message must not create a second ticket"
+        );
+        let effect = supervisor.next_effect().expect("deliver queued");
+        assert_eq!(effect.effect.kind(), "deliver");
+        assert!(matches!(
+            effect.effect,
+            crate::engine::Effect::Deliver { ref ticket_id } if *ticket_id == id
+        ));
+    }
+
+    #[test]
+    fn saying_something_releases_a_blocked_ticket() {
+        let supervisor = Supervisor::new();
+        supervisor.receive(&ask("fix it", "th1"));
+        let id = supervisor.view().rows()[0].id.clone();
+        supervisor.assignment_started(&id, false);
+        supervisor
+            .report(&id, report(ReportState::Blocked, None))
+            .unwrap();
+        assert_eq!(
+            supervisor.view().rows()[0].stage,
+            Stage::Person(PersonAction::Blocked)
+        );
+
+        supervisor.say(&id, "here is the missing piece").unwrap();
+        assert_ne!(
+            supervisor.view().rows()[0].stage,
+            Stage::Person(PersonAction::Blocked),
+            "a person's message is what unblocks it"
+        );
+    }
+
+    #[test]
+    fn saying_something_to_an_ended_ticket_is_refused() {
+        let supervisor = Supervisor::new();
+        supervisor.receive(&ask("fix it", "th1"));
+        let id = supervisor.view().rows()[0].id.clone();
+        supervisor.stop(&id).unwrap();
+        assert_eq!(
+            supervisor.say(&id, "hello?"),
+            Err(Refusal::AlreadyEnded(id))
+        );
+    }
+
+    #[test]
+    fn inputs_are_taken_once() {
+        let supervisor = Supervisor::new();
+        supervisor.receive(&ask("fix it", "th1"));
+        let id = supervisor.view().rows()[0].id.clone();
+        let first = supervisor.take_inputs(&id);
+        assert!(!first.is_empty(), "the creating ask is an input");
+        let second = supervisor.take_inputs(&id);
+        assert!(second.is_empty(), "inputs are consumed, not replayed");
+    }
+
+    #[test]
+    fn rows_expose_the_thread_for_panel_conversations() {
+        let supervisor = Supervisor::new();
+        supervisor.receive(&ask("fix it", "th-abc"));
+        assert_eq!(supervisor.view().rows()[0].thread, "th-abc");
     }
 
     #[test]

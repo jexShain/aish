@@ -186,6 +186,8 @@ pub struct Assignment {
 pub struct TicketInput {
     /// The trigger that carries it.
     pub trigger_id: String,
+    /// The text handed to the worker, as the actor wrote it.
+    pub text: String,
     /// Whether a worker has taken it up.
     pub read: bool,
 }
@@ -225,7 +227,9 @@ impl Ticket {
     /// Whether a report is waiting on a person and nobody has spoken since.
     ///
     /// A person's message returns the ticket to the worker, which is what makes
-    /// `blocked`/`failed` recoverable without a "restart" command.
+    /// `blocked`/`failed` recoverable without a "restart" command. The input
+    /// that created the ticket is *not* such a message: it is the task, not a
+    /// follow-up, so it is skipped by index rather than counted.
     pub fn waits_for_person(&self) -> bool {
         let Some(report) = self.latest_report() else {
             return false;
@@ -233,7 +237,7 @@ impl Ticket {
         if !matches!(report.state, ReportState::Blocked | ReportState::Failed) {
             return false;
         }
-        // Any unread input from a person counts as a newer follow-up.
-        !self.inputs.iter().any(|input| !input.read)
+        // `inputs[0]` is the creating ask; anything after it is a follow-up.
+        !self.inputs.iter().skip(1).any(|input| !input.read)
     }
 }

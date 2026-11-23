@@ -200,6 +200,13 @@ pub const SLASH_COMMANDS: &[SlashCommandMeta] = &[
         enter: EnterPolicy::Fill,
     },
     SlashCommandMeta {
+        name: "/delegate",
+        desc: "Run a task in the background supervisor",
+        group: SlashGroup::Sessions,
+        keywords: &["delegate", "background", "supervisor", "agent", "task"],
+        enter: EnterPolicy::Execute,
+    },
+    SlashCommandMeta {
         name: "/mcp",
         desc: "Inspect, reload and reconnect MCP servers and their tools",
         group: SlashGroup::Skills,
@@ -1104,7 +1111,7 @@ mod tests {
                 cmd.name
             );
         }
-        assert_eq!(SLASH_COMMANDS.len(), 28);
+        assert_eq!(SLASH_COMMANDS.len(), 29);
     }
 
     #[test]
