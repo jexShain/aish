@@ -493,10 +493,10 @@ mod tests {
         // and libtest writes its own progress from other threads, so the
         // redirect is neither empty nor escape-free by contract — only the
         // record's arrival is.)
+        let written = String::from_utf8_lossy(&written).into_owned();
         assert!(
-            String::from_utf8_lossy(&written).ends_with("WARN legacy: visible\n"),
-            "the legacy path must write the record straight to fd 1: {:?}",
-            String::from_utf8_lossy(&written)
+            written.contains("WARN legacy: visible\n"),
+            "the legacy path must write the record straight to fd 1: {written:?}"
         );
         // The wipe branch still ran, which is what the flag proves.
         assert!(

@@ -64,13 +64,13 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::caps::detect_caps;
 use crate::completion::{
-    common_prefix, token_range, Candidate, CompletionSource, SlashCommandSource, WordListSource,
-    MAX_CANDIDATES,
+    common_prefix, is_slash_token, token_range, Candidate, CompletionSource, SlashCommandSource,
+    WordListSource, MAX_CANDIDATES,
 };
 use crate::component::{render_lines_to_viewport, InputHandled, Interactive};
 use crate::editor::Editor;
 use crate::frame::{Frame, HistoryBatch};
-use crate::highlight::{DIM, RESET};
+use crate::highlight::{CURSOR_OFF, CURSOR_ON, DIM, RESET};
 use crate::hud::HudState;
 use crate::input::{InputEvent, InputParser, Key, ESCAPE_INACTIVITY};
 use crate::output::{OutputSink, QueueSink};
@@ -288,6 +288,12 @@ pub struct Repl<W: Write, R: Read> {
     auto_resize: bool,
     /// Candidates shown under the prompt until the next keystroke.
     menu: Vec<Candidate>,
+    /// Highlighted menu row; `None` while the list is informational (opened by
+    /// typing a bare `/`), `Some` once the user starts walking it with Up/Down.
+    menu_selected: Option<usize>,
+    /// Scroll offset of the menu window, so a selection past the visible rows
+    /// stays on screen.
+    menu_offset: usize,
     /// First Ctrl+C cleared the buffer; the next one exits.
     ctrl_c_armed: bool,
     /// Status row state; only painted while the configured provider returns a
@@ -350,6 +356,8 @@ impl<W: Write, R: Read> Repl<W, R> {
             pending_rows: Vec::new(),
             auto_resize: false,
             menu: Vec::new(),
+            menu_selected: None,
+            menu_offset: 0,
             ctrl_c_armed: false,
             hud: HudState::new(),
             panel: SupervisorPanel::new(),
@@ -858,7 +866,44 @@ impl<W: Write, R: Read> Repl<W, R> {
         F: FnMut(&str) -> ReplAction,
     {
         // Any keystroke dismisses the completion menu; Tab rebuilds it below.
+        // Up/Down/Enter navigate it first, exactly as the legacy popup does,
+        // so a picked command is one keystroke away instead of a retyped word.
+        if !self.menu.is_empty() {
+            match event {
+                InputEvent::Key(Key::Up | Key::CtrlUp) => {
+                    self.ctrl_c_armed = false;
+                    self.step_menu(-1);
+                    return Ok(false);
+                }
+                InputEvent::Key(Key::Down | Key::CtrlDown) => {
+                    self.ctrl_c_armed = false;
+                    self.step_menu(1);
+                    return Ok(false);
+                }
+                InputEvent::Key(Key::Tab) => {
+                    self.ctrl_c_armed = false;
+                    self.step_menu(1);
+                    return Ok(false);
+                }
+                InputEvent::Key(Key::Esc) => {
+                    self.ctrl_c_armed = false;
+                    self.menu.clear();
+                    self.menu_selected = None;
+                    return Ok(false);
+                }
+                InputEvent::Key(Key::Enter | Key::ShiftEnter | Key::AltEnter)
+                    if self.menu_selected.is_some() =>
+                {
+                    self.ctrl_c_armed = false;
+                    let line = self.accept_menu_selection();
+                    return self.submit(&line, on_submit);
+                }
+                _ => {}
+            }
+        }
         self.menu.clear();
+        self.menu_selected = None;
+        self.menu_offset = 0;
 
         match event {
             InputEvent::Key(Key::Ctrl('C')) => {
@@ -1059,12 +1104,24 @@ impl<W: Write, R: Read> Repl<W, R> {
     /// The ghost is the part of the best candidate beyond the token being
     /// typed, so accepting it (Right / Ctrl+F) appends exactly what was shown.
     fn refresh_ghost(&mut self) {
+        let buffer = self.editor.buffer().to_string();
+        let cursor = self.editor.cursor();
+        // The legacy shell pops the slash list the moment `/` is typed on an
+        // otherwise empty line, so `/help` is one Down away instead of two
+        // keystrokes. Mirror that: a bare slash token with the cursor at the
+        // end is a command being picked, not an argument being typed. This is
+        // not a suggestion, so it does not depend on `auto_suggest`.
+        if cursor == buffer.len() && is_slash_token(&buffer) {
+            self.editor.set_ghost(None);
+            if self.menu.is_empty() {
+                self.menu = self.gather(&buffer, cursor);
+            }
+            return;
+        }
         if !self.config.auto_suggest {
             self.editor.set_ghost(None);
             return;
         }
-        let buffer = self.editor.buffer().to_string();
-        let cursor = self.editor.cursor();
         // The open menu already lists every option; a ghost on top of it would
         // duplicate the first candidate.
         if buffer.is_empty() || cursor != buffer.len() || !self.menu.is_empty() {
@@ -1084,18 +1141,98 @@ impl<W: Write, R: Read> Repl<W, R> {
         self.editor.set_ghost(ghost);
     }
 
+    /// Move the menu highlight by `delta`, wrapping at both ends.
+    ///
+    /// The first press selects the first row rather than stepping past it, so
+    /// a list opened by typing `/` behaves like one opened by Tab.
+    fn step_menu(&mut self, delta: isize) {
+        if self.menu.is_empty() {
+            return;
+        }
+        let len = self.menu.len();
+        let current = match self.menu_selected {
+            Some(index) => index,
+            None if delta > 0 => {
+                // Down from an informational list selects the first row.
+                self.menu_selected = Some(0);
+                self.scroll_menu();
+                return;
+            }
+            None => 0,
+        };
+        let next = (current as isize + delta).rem_euclid(len as isize) as usize;
+        self.menu_selected = Some(next);
+        self.scroll_menu();
+    }
+
+    /// Keep the highlighted row inside the `MENU_ROWS` window.
+    fn scroll_menu(&mut self) {
+        let Some(selected) = self.menu_selected else {
+            self.menu_offset = 0;
+            return;
+        };
+        if selected < self.menu_offset {
+            self.menu_offset = selected;
+        } else if selected >= self.menu_offset + MENU_ROWS {
+            self.menu_offset = selected + 1 - MENU_ROWS;
+        }
+        // Never leave blank rows at the bottom of the window.
+        self.menu_offset = self
+            .menu_offset
+            .min(self.menu.len().saturating_sub(MENU_ROWS));
+    }
+
+    /// Replace the token under the cursor with the highlighted candidate and
+    /// return the resulting line, ready to submit.
+    ///
+    /// The editor is left empty, exactly as Enter through
+    /// [`Editor::handle_event`] would leave it: this path bypasses that method
+    /// (the menu consumed the key), so the reset has to happen here too.
+    fn accept_menu_selection(&mut self) -> String {
+        let Some(index) = self.menu_selected else {
+            return self.editor.take_buffer();
+        };
+        let Some(candidate) = self.menu.get(index) else {
+            return self.editor.take_buffer();
+        };
+        let replacement = candidate.replacement.clone();
+        let token = {
+            let buffer = self.editor.buffer().to_string();
+            let cursor = self.editor.cursor();
+            buffer[token_range(&buffer, cursor)].to_string()
+        };
+        if replacement != token {
+            self.replace_token(&token, &replacement);
+        }
+        self.menu.clear();
+        self.menu_selected = None;
+        self.menu_offset = 0;
+        self.editor.take_buffer()
+    }
+
     /// Dim rows listing the open completion menu.
     fn menu_rows(&self) -> Vec<String> {
         let mut rows = Vec::new();
-        for candidate in self.menu.iter().take(MENU_ROWS) {
-            let mut row = format!("  {DIM}{}{RESET}", candidate.display);
+        let end = (self.menu_offset + MENU_ROWS).min(self.menu.len());
+        for (index, candidate) in self
+            .menu
+            .iter()
+            .enumerate()
+            .take(end)
+            .skip(self.menu_offset)
+        {
+            let mut row = if self.menu_selected == Some(index) {
+                format!("{CURSOR_ON}  {} {CURSOR_OFF}", candidate.display)
+            } else {
+                format!("  {DIM}{}{RESET}", candidate.display)
+            };
             if let Some(description) = &candidate.description {
                 row.push_str(&format!("  {DIM}{description}{RESET}"));
             }
             rows.push(row);
         }
-        if self.menu.len() > MENU_ROWS {
-            rows.push(format!("  {DIM}… {}{RESET}", self.menu.len() - MENU_ROWS));
+        if self.menu.len() > end {
+            rows.push(format!("  {DIM}… {}{RESET}", self.menu.len() - end));
         }
         rows
     }
@@ -1588,6 +1725,117 @@ mod tests {
         let rows = repl.menu_rows();
         assert_eq!(rows.len(), MENU_ROWS + 1, "overflow hint missing");
         assert!(rows.last().unwrap().contains('…'));
+    }
+
+    #[test]
+    fn typing_slash_opens_the_menu_without_tab() {
+        // The legacy shell pops the list the moment `/` is typed; Tab alone
+        // would make `/help` two keystrokes instead of one.
+        let candidates = vec![
+            Candidate {
+                display: "/help".to_string(),
+                replacement: "/help".to_string(),
+                description: Some("Show help".to_string()),
+            },
+            Candidate {
+                display: "/model".to_string(),
+                replacement: "/model".to_string(),
+                description: Some("Switch model".to_string()),
+            },
+        ];
+        let source: Box<dyn CompletionSource> = Box::new(StaticSource(candidates));
+        let mut repl = repl(b"/", vec![source]);
+        run(&mut repl, |_| ReplAction::Continue);
+        let names: Vec<&str> = repl.menu().iter().map(|c| c.display.as_str()).collect();
+        assert_eq!(names, ["/help", "/model"], "menu did not auto-open");
+    }
+
+    #[test]
+    fn slash_with_arguments_does_not_open_the_menu() {
+        let candidates = vec![Candidate::new("/model")];
+        let source: Box<dyn CompletionSource> = Box::new(StaticSource(candidates));
+        let mut repl = repl(b"/model fast", vec![source]);
+        run(&mut repl, |_| ReplAction::Continue);
+        assert!(repl.menu().is_empty(), "menu opened for an argument");
+    }
+
+    #[test]
+    fn menu_down_selects_then_enter_submits_the_command() {
+        // `/`, Down (selects /help), Enter: the picked command is submitted
+        // without retyping it.
+        let candidates = vec![Candidate::new("/help"), Candidate::new("/model")];
+        let source: Box<dyn CompletionSource> = Box::new(StaticSource(candidates));
+        let mut repl = repl(b"/\x1b[B\r", vec![source]);
+        let submitted = run(&mut repl, |_| ReplAction::Continue);
+        assert_eq!(submitted, ["/help"], "Down+Enter did not pick a row");
+        // The editor must be empty afterwards, exactly as a plain Enter leaves
+        // it: the menu consumed the key, so the reset happens on the accept
+        // path. A stale buffer would concatenate the next typed line onto it.
+        assert_eq!(repl.editor().buffer(), "", "buffer survived the submit");
+    }
+
+    #[test]
+    fn menu_accept_then_typing_starts_a_fresh_line() {
+        // Reproduces `/help` + Down + Enter, then `echo Z1`: the second line
+        // must not be prefixed with the accepted command.
+        let candidates = vec![Candidate::new("/help"), Candidate::new("/model")];
+        let source: Box<dyn CompletionSource> = Box::new(StaticSource(candidates));
+        let mut repl = repl(b"/\x1b[B\recho Z1\r", vec![source]);
+        let submitted = run(&mut repl, |_| ReplAction::Continue);
+        assert_eq!(submitted, ["/help", "echo Z1"]);
+    }
+
+    #[test]
+    fn menu_enter_without_selection_types_a_literal_line() {
+        // Bare Enter on an informational list submits what was typed; only a
+        // selected row is accepted.
+        let candidates = vec![Candidate::new("/help"), Candidate::new("/model")];
+        let source: Box<dyn CompletionSource> = Box::new(StaticSource(candidates));
+        let mut repl = repl(b"/he\r", vec![source]);
+        let submitted = run(&mut repl, |_| ReplAction::Continue);
+        assert_eq!(submitted, ["/he"]);
+    }
+
+    #[test]
+    fn menu_selection_wraps_and_scrolls_into_view() {
+        let mut repl = repl(
+            b"/",
+            words(&[
+                "/cmd0", "/cmd1", "/cmd2", "/cmd3", "/cmd4", "/cmd5", "/cmd6", "/cmd7", "/cmd8",
+                "/cmd9", "/cmd10", "/cmd11",
+            ]),
+        );
+        run(&mut repl, |_| ReplAction::Continue);
+        // Twelve rows, ten visible: walking to the last one must scroll.
+        for _ in 0..12 {
+            repl.step_menu(1);
+        }
+        assert_eq!(repl.menu_selected, Some(11));
+        assert!(repl.menu_offset > 0, "selection left the window");
+        let rows = repl.menu_rows();
+        assert_eq!(rows.len(), MENU_ROWS);
+        assert!(
+            rows.iter().any(|row| row.contains("/cmd11")),
+            "selected row not painted: {rows:?}"
+        );
+        // One more step wraps to the top and scrolls back.
+        repl.step_menu(1);
+        assert_eq!(repl.menu_selected, Some(0));
+        assert_eq!(repl.menu_offset, 0);
+    }
+
+    /// Completion source returning a fixed list, for menu-shape tests.
+    struct StaticSource(Vec<Candidate>);
+
+    impl CompletionSource for StaticSource {
+        fn complete(&self, line: &str, cursor: usize) -> Vec<Candidate> {
+            let token = &line[token_range(line, cursor)];
+            self.0
+                .iter()
+                .filter(|c| c.replacement.starts_with(token))
+                .cloned()
+                .collect()
+        }
     }
 
     /// REPL whose product output goes to a [`QueueSink`] the test keeps.

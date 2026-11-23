@@ -84,7 +84,7 @@ aish `AgentState{Running,Completed,Failed,Cancelled}` + `prune_finished(3s)` 保
 | 子代理终态 | `spawn()` 在 `tokio::select!` 后 emit 一个 `OpEnd`（`source=sub_agent`、`reason` 按 outcome）；`AgentTracker` 接受带 `spawn_id` 无 `source` 的终态；负向对照：stub 掉 emit 后 4 个测试全失败 | `spawn.rs`、`agents.rs` |
 | PTY 输出 | `write_stdout_all` 先 `normalize_crlf`，`owns_screen()` 为真则走 sink | `persistent.rs:68` |
 | 回合期输出 | `Repl::park()`：清 live band → 装 `StdoutSink` → 恢复 OPOST\|ONLCR；`ParkGuard` 保证 panic 也 unpark | `repl.rs` |
-| slash 补全 | `SlashCommandSource`（28 命令）+ `path_words()`；菜单 10 行 + `… 18` | `completion.rs`、`readline.rs` |
+| slash 补全 | `SlashCommandSource`（28 命令）+ `path_words()`；输入 `/` 即弹菜单（与 legacy 一致），Up/Down 选中（`CURSOR_ON` 反显）、窗口随选中滚动、Enter 接受并提交、Esc 关闭；菜单 10 行 + `… 18` | `completion.rs`、`repl.rs` |
 | 光标宽度 | prompt 用 `visible_width`（ANSI 不计宽）；`wrap_logical` 仅宽字符换行；`render_with_cursor(width)` 不超宽 | `editor.rs`、`highlight.rs` |
 
 ### 3.2 未实现 / 差距

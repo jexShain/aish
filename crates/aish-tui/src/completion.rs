@@ -48,6 +48,18 @@ pub trait CompletionSource: Send + Sync {
     fn complete(&self, line: &str, cursor: usize) -> Vec<Candidate>;
 }
 
+/// Whether `line` is a bare slash command being typed.
+///
+/// True only for `/` followed by a run of non-whitespace with no further
+/// argument: `/mode` is a command being picked, `/model fast` is arguments and
+/// must not reopen the list.
+pub fn is_slash_token(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('/') else {
+        return false;
+    };
+    !rest.contains(char::is_whitespace)
+}
+
 /// Byte range of the whitespace-delimited token that ends at `cursor`.
 ///
 /// The token is the run of non-whitespace characters immediately before the
