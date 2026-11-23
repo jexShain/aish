@@ -52,6 +52,9 @@ pub struct PassOutcome {
 pub struct Runtime {
     supervisor: Arc<Supervisor>,
     workers: Arc<Mutex<HashMap<String, WorkerSlot>>>,
+    /// Called after every completed worker turn, so a report that lands while
+    /// the shell is blocked on input still reaches disk.
+    on_report: Arc<dyn Fn() + Send + Sync>,
 }
 
 #[derive(Debug, Default)]
@@ -65,7 +68,14 @@ impl Runtime {
         Self {
             supervisor,
             workers: Arc::new(Mutex::new(HashMap::new())),
+            on_report: Arc::new(|| {}),
         }
+    }
+
+    /// Install a callback that runs after every worker report.
+    pub fn with_report_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.on_report = hook;
+        self
     }
 
     /// The supervisor this runtime drives.
@@ -266,6 +276,7 @@ impl Runtime {
             let supervisor = Arc::clone(&self.supervisor);
             let workers = Arc::clone(&self.workers);
             let executor = Arc::clone(&executor);
+            let on_report = Arc::clone(&self.on_report);
             let ticket = ticket_id.clone();
             std::thread::spawn(move || {
                 let report = match executor.run(&ticket, &prompt) {
@@ -282,6 +293,9 @@ impl Runtime {
                 if let Err(refusal) = supervisor.report(&ticket, report) {
                     tracing::warn!(%ticket, ?refusal, "detached worker report rejected");
                 }
+                // The shell is usually blocked on input by now, so nothing else
+                // would save this state; the report callback is the only chance.
+                on_report();
             });
         }
         outcome

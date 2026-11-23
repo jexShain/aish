@@ -528,6 +528,46 @@ mod tests {
     }
 
     #[test]
+    fn a_report_that_ends_the_turn_is_persisted_as_ended() {
+        // The panel showed "running" forever because the assignment row kept
+        // its pre-report state.
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = Supervisor::new();
+        supervisor.receive(&ask("fix", "th1"));
+        let id = supervisor.view().rows()[0].id.clone();
+        supervisor.assignment_started(&id, false);
+
+        let store = temp_store(&dir);
+        store.save(&supervisor.export()).unwrap();
+        // A save before the report must show a running assignment.
+        assert_eq!(
+            store.load().tickets[0].assignments[0].state,
+            AssignmentState::Running
+        );
+
+        supervisor
+            .report(
+                &id,
+                Report {
+                    state: ReportState::Ready,
+                    summary: "done".to_string(),
+                    question: None,
+                },
+            )
+            .unwrap();
+        store.save(&supervisor.export()).unwrap();
+
+        let loaded = store.load();
+        let assignment = &loaded.tickets[0].assignments[0];
+        assert_eq!(assignment.state, AssignmentState::Ended);
+        assert_eq!(
+            assignment.report.as_ref().map(|r| r.state),
+            Some(ReportState::Ready)
+        );
+        assert_eq!(assignment.report.as_ref().unwrap().summary, "done");
+    }
+
+    #[test]
     fn a_restored_supervisor_keeps_its_stage() {
         // The point of persistence: a restart must not resurrect finished work
         // as if it were queued again, nor lose a blocked ticket's state.

@@ -77,7 +77,11 @@ impl aish_supervisor::Executor for DetachedExecutor {
         // executing anything.
         let config = aish_llm::SpawnConfig {
             max_turns: 20,
-            system_message: None,
+            // A `None` system message leaves the worker without the tool
+            // appendix, and the model then answers with tool-call *text*
+            // instead of calling anything. `spawn` normally supplies an agent
+            // prompt; a supervisor worker uses the main chat one.
+            system_message: Some(String::new()),
             prompt_context: PromptContext::MainChat,
             context_messages: Vec::new(),
         };
@@ -93,6 +97,16 @@ impl aish_supervisor::Executor for DetachedExecutor {
             })
             .await
         });
+        // A model that emits its tool call as text (`<bash>...</bash>`) did not
+        // execute anything. Reporting that as `ready` would tell the person the
+        // work is done when it never ran, so it is a failure the operator can
+        // retry.
+        if looks_like_unescaped_tool_call(&outcome.text) {
+            return Err(format!(
+                "the worker returned an unexecuted tool call instead of running it: {}",
+                truncate_for_report(&outcome.text)
+            ));
+        }
         if outcome.text.trim().is_empty() {
             return Err(format!("worker ended with {:?}", outcome.status));
         }
@@ -102,6 +116,27 @@ impl aish_supervisor::Executor for DetachedExecutor {
             question: None,
         })
     }
+}
+
+/// Whether a worker's answer is really an unexecuted tool call.
+///
+/// Some models occasionally answer with the call as text (`<bash>ls</bash>`)
+/// instead of invoking the tool. Treating that as a successful result would
+/// claim work that never happened, so it is detected and fails the turn.
+fn looks_like_unescaped_tool_call(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    const MARKERS: [&str; 5] = ["<bash>", "<grep", "<read_file", "<edit_file", "<agent>"];
+    MARKERS.iter().any(|marker| trimmed.starts_with(marker)) && !trimmed.contains("```")
+}
+
+/// Keep a failing report readable in one card row.
+fn truncate_for_report(text: &str) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = one_line.chars().take(160).collect();
+    if one_line.chars().count() > 160 {
+        out.push('…');
+    }
+    out
 }
 
 /// Make a ticket id safe as a single path component.
@@ -3434,18 +3469,8 @@ impl AishShell {
         let autosuggest = Arc::new(Mutex::new(crate::autosuggest::AutoSuggest::new(5000)));
         let runtime_handle = runtime.handle().clone();
 
-        // The resident supervisor. Its pass runs inline at each prompt
-        // iteration rather than on a background thread: a worker turn borrows
-        // the shell's AI handler, which is neither `Send` nor `Sync`, and
-        // pretending otherwise would mean either a second session or unsafe
-        // sharing. Inline keeps one writer and one handler.
-        self.supervisor_runtime = Some(Arc::new(aish_supervisor::Runtime::new(Arc::clone(
-            &self.supervisor,
-        ))));
-        self.tokio_runtime_for_ui = Some(runtime.handle().clone());
-
-        // Restore queued work before the first pass runs, so a launch that was
-        // decided before the last exit is attempted now rather than forgotten.
+        // Restore durable state first: the runtime's report hook needs the
+        // store, so the store has to exist before the runtime is built.
         if let Ok(store) = aish_supervisor::Location::default_file().open() {
             let restored = store.load();
             if !restored.tickets.is_empty() {
@@ -3462,12 +3487,33 @@ impl AishShell {
                 };
                 self.supervisor =
                     std::sync::Arc::new(aish_supervisor::Supervisor::from_persisted(merged));
-                self.supervisor_runtime = Some(Arc::new(aish_supervisor::Runtime::new(
-                    std::sync::Arc::clone(&self.supervisor),
-                )));
             }
             self.supervisor_store = Some(store);
         }
+
+        // The resident supervisor. A pass runs inline at each prompt iteration
+        // and on every panel tick, so persistent work advances whether or not
+        // the user types.
+        //
+        // The report hook saves whenever a worker finishes: the shell is
+        // blocked on input at that moment, so nothing else would, and a
+        // finished turn would otherwise sit in memory until the next keystroke.
+        let hook: Arc<dyn Fn() + Send + Sync> = {
+            let store_for_hook = self.supervisor_store.clone();
+            let supervisor_for_hook = std::sync::Arc::clone(&self.supervisor);
+            Arc::new(move || {
+                if let Some(store) = store_for_hook.as_ref() {
+                    if let Err(err) = supervisor_for_hook.save(store) {
+                        tracing::warn!(%err, "failed to persist after a worker report");
+                    }
+                }
+            })
+        };
+        self.supervisor_runtime = Some(Arc::new(
+            aish_supervisor::Runtime::new(std::sync::Arc::clone(&self.supervisor))
+                .with_report_hook(hook),
+        ));
+        self.tokio_runtime_for_ui = Some(runtime.handle().clone());
 
         let inline_ai: Option<Arc<crate::inline_completion::InlineCompleter>> = {
             let cfg = &self.config.inline_completion;
@@ -3577,44 +3623,16 @@ impl AishShell {
             // than on a background thread is what lets a worker borrow the AI
             // handler, which is neither `Send` nor `Sync`.
             if let Some(supervisor_runtime) = self.supervisor_runtime.clone() {
-                struct HandlerExecutor<'a> {
-                    handler: &'a AiHandler,
-                    runtime: &'a tokio::runtime::Runtime,
-                    supervisor: std::sync::Arc<aish_supervisor::Supervisor>,
-                    work_root: Option<std::path::PathBuf>,
-                }
-                impl aish_supervisor::Executor for HandlerExecutor<'_> {
-                    fn run(
-                        &self,
-                        ticket_id: &str,
-                        prompt: &str,
-                    ) -> Result<aish_supervisor::domain::Report, String> {
-                        // Each ticket works in its own directory so two workers
-                        // cannot overwrite each other's files.
-                        let work_dir = self
-                            .work_root
-                            .as_ref()
-                            .and_then(|root| self.supervisor.ticket_dir(ticket_id, root).ok());
-                        let handler = self.handler;
-                        let text = self.runtime.block_on(async move {
-                            handler
-                                .run_worker_turn(prompt, 20, work_dir.as_deref())
-                                .await
-                        })?;
-                        Ok(aish_supervisor::domain::Report {
-                            state: aish_supervisor::domain::ReportState::Ready,
-                            summary: text,
-                            question: None,
-                        })
-                    }
-                }
-                let executor = HandlerExecutor {
-                    handler: &self.ai_handler,
-                    runtime: &runtime,
-                    supervisor: std::sync::Arc::clone(&self.supervisor),
+                // Same executor as the panel: one code path means the
+                // unexecuted-tool-call check applies whether work was started
+                // from the prompt or from inside the fullscreen UI.
+                let executor: Arc<dyn aish_supervisor::Executor> = Arc::new(DetachedExecutor {
+                    base: Arc::new(self.ai_handler.worker_session()),
+                    tools: Arc::new(self.ai_handler.worker_tools_for_ui()),
+                    runtime: runtime.handle().clone(),
                     work_root: self.supervisor_work_root(),
-                };
-                supervisor_runtime.pass(&executor);
+                });
+                supervisor_runtime.pass_detached(executor);
             }
             self.persist_supervisor();
 
@@ -16527,6 +16545,42 @@ mod audit_args_tests {
         }
         // The summary must contain the count placeholder.
         assert!(mgr.t("shell.audit.summary").contains("{count}"));
+    }
+}
+
+#[cfg(test)]
+mod worker_text_tests {
+    use super::{looks_like_unescaped_tool_call, truncate_for_report};
+
+    #[test]
+    fn a_raw_tool_call_is_not_a_result() {
+        // Reporting this as success would claim work that never ran.
+        assert!(looks_like_unescaped_tool_call("<bash>\necho hi\n</bash>"));
+        assert!(looks_like_unescaped_tool_call(
+            "  <bash>\ncd /tmp && ls\n</bash>"
+        ));
+        assert!(looks_like_unescaped_tool_call("<grep path=\"x\">"));
+    }
+
+    #[test]
+    fn ordinary_answers_are_results() {
+        assert!(!looks_like_unescaped_tool_call("DIAG"));
+        assert!(!looks_like_unescaped_tool_call(
+            "I ran the command; the output was 42."
+        ));
+        // An answer that *mentions* a tool in a fenced block is prose, not a call.
+        assert!(!looks_like_unescaped_tool_call(
+            "<bash> is how you call it\n```sh\nls\n```"
+        ));
+    }
+
+    #[test]
+    fn a_failure_report_is_one_bounded_line() {
+        let long = "x".repeat(400);
+        let out = truncate_for_report(&format!("line one\n{long}"));
+        assert!(!out.contains('\n'), "must stay one line: {out}");
+        assert!(out.chars().count() <= 161, "too long: {}", out.len());
+        assert!(out.ends_with('…'));
     }
 }
 
