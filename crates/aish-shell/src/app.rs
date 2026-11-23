@@ -48,6 +48,20 @@ struct DetachedExecutor {
     work_root: Option<std::path::PathBuf>,
 }
 
+impl DetachedExecutor {
+    /// A PTY rooted at this ticket's directory.
+    ///
+    /// A worker must not inherit the shell's PTY: sharing one means its `cd`
+    /// moves the user's prompt and its relative paths land in the user's cwd.
+    fn worker_pty(&self, dir: Option<&std::path::Path>) -> Option<aish_tools::bash::PtySlot> {
+        let dir = dir?;
+        let pty = aish_pty::PersistentPty::start(&dir.to_string_lossy(), 24, 80).ok()?;
+        Some(Arc::new(std::sync::Mutex::new(Some(Arc::new(
+            std::sync::Mutex::new(pty),
+        )))))
+    }
+}
+
 impl aish_supervisor::Executor for DetachedExecutor {
     fn run(
         &self,
@@ -86,12 +100,26 @@ impl aish_supervisor::Executor for DetachedExecutor {
             context_messages: Vec::new(),
         };
         let tools = Arc::clone(&self.tools);
+        // A worker must not inherit the shell's PTY: sharing one means its `cd`
+        // moves the user's prompt and its relative paths land in the user's cwd
+        // (observed: `touch RELATIVE.txt` created the file in both places).
+        let worker_pty = self.worker_pty(dir.as_deref());
         let outcome = self.runtime.block_on(async {
             aish_llm::spawn(&self.base, &full_prompt, config, |sub| {
                 for tool in tools.iter() {
-                    let registered = tool
-                        .for_sub_session(sub)
-                        .unwrap_or_else(|| Arc::clone(tool));
+                    let registered = match (
+                        &worker_pty,
+                        needs_own_pty(tool.name(), worker_pty.is_some()),
+                    ) {
+                        (Some(slot), true) => {
+                            let mut fresh = aish_tools::bash::BashTool::new();
+                            fresh.set_pty_slot(Arc::clone(slot));
+                            std::sync::Arc::new(fresh) as std::sync::Arc<dyn aish_llm::Tool>
+                        }
+                        _ => tool
+                            .for_sub_session(sub)
+                            .unwrap_or_else(|| Arc::clone(tool)),
+                    };
                     sub.register_shared_tool(registered);
                 }
             })
@@ -123,6 +151,15 @@ impl aish_supervisor::Executor for DetachedExecutor {
 /// Some models occasionally answer with the call as text (`<bash>ls</bash>`)
 /// instead of invoking the tool. Treating that as a successful result would
 /// claim work that never happened, so it is detected and fails the turn.
+/// Which tool a worker should run with, given its own PTY.
+///
+/// Split out from the executor so the decision is testable without starting a
+/// real bash process: a `bash` tool must be rebound to the worker's PTY,
+/// everything else keeps whatever the parent allowed.
+fn needs_own_pty(tool_name: &str, has_worker_pty: bool) -> bool {
+    has_worker_pty && tool_name == "bash"
+}
+
 fn looks_like_unescaped_tool_call(text: &str) -> bool {
     let trimmed = text.trim_start();
     const MARKERS: [&str; 5] = ["<bash>", "<grep", "<read_file", "<edit_file", "<agent>"];
@@ -16550,7 +16587,21 @@ mod audit_args_tests {
 
 #[cfg(test)]
 mod worker_text_tests {
-    use super::{looks_like_unescaped_tool_call, truncate_for_report};
+    use super::{looks_like_unescaped_tool_call, needs_own_pty, truncate_for_report};
+
+    #[test]
+    fn only_bash_is_rebound_to_the_workers_own_pty() {
+        // The regression: a worker shared the shell's PTY, so `touch x` in the
+        // worker created the file in the user's cwd as well.
+        assert!(needs_own_pty("bash", true));
+        assert!(
+            !needs_own_pty("bash", false),
+            "no PTY means nothing to bind"
+        );
+        for other in ["grep", "read_file", "edit_file", "agent"] {
+            assert!(!needs_own_pty(other, true), "{other} must not be rebound");
+        }
+    }
 
     #[test]
     fn a_raw_tool_call_is_not_a_result() {
